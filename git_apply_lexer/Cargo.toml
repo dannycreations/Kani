@@ -1,0 +1,25 @@
+[package]
+name = "hit"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.51", features = ["derive"] }
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+
+[profile.release]
+codegen-units = 1
+incremental = true
+lto = true
+opt-level = 'z'
+split-debuginfo = "packed"
+debug = "line-tables-only"
+
+[[test]]
+name = "git_tests"
+path = "tests/git/mod.rs"
+
+[[test]]
+name = "hit_tests"
+path = "tests/hit/mod.rs"
