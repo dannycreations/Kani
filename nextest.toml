@@ -1,0 +1,7 @@
+[profile.default]
+fail-fast = false
+slow-timeout = { period = "10s", on-timeout = "fail" }
+status-level = "fail"
+final-status-level = "fail"
+success-output = "never"
+failure-output = "immediate"
