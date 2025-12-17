@@ -12,7 +12,7 @@ use crate::{
   fs::add_suffix,
 };
 
-pub fn process_file(file_path: &Path) {
+pub fn process_file(file_path: &Path, password: Option<&str>) {
   if !file_path.exists() {
     println!("[!] File not found: {}", file_path.display());
     return;
@@ -20,7 +20,7 @@ pub fn process_file(file_path: &Path) {
 
   let decrypted_path = add_suffix(file_path, "_decrypted");
 
-  match try_decrypt_and_save(file_path, &decrypted_path) {
+  match try_decrypt_and_save(file_path, &decrypted_path, password) {
     Ok(working_path) => {
       println!("[+] Processing file: {}", file_path.display());
       if let Err(e) = remove_protection_and_save(&working_path, file_path) {
@@ -40,6 +40,7 @@ pub fn process_file(file_path: &Path) {
 fn try_decrypt_and_save(
   input_path: &Path,
   output_path: &Path,
+  password: Option<&str>,
 ) -> Result<PathBuf> {
   let mut file = File::open(input_path).context("Failed to open input file")?;
   let mut buffer = Vec::new();
@@ -50,6 +51,24 @@ fn try_decrypt_and_save(
   }
 
   println!("[!] File is encrypted with a password-to-open.");
+
+  if let Some(pass) = password {
+    match decrypt_office_file(&buffer, pass) {
+      Ok(decrypted_data) => {
+        let mut out = File::create(output_path)?;
+        out.write_all(&decrypted_data)?;
+        println!(
+          "[+] File decrypted successfully with provided password: {}",
+          output_path.display()
+        );
+        return Ok(output_path.to_path_buf());
+      }
+      Err(e) => {
+        println!("[!] Provided password failed: {}", e);
+      }
+    }
+  }
+
   let max_attempts = 3;
 
   for attempt in 1..=max_attempts {
@@ -58,9 +77,12 @@ fn try_decrypt_and_save(
       attempt, max_attempts
     );
     io::stdout().flush()?;
-    let password = rpassword::read_password()?;
 
-    match decrypt_office_file(&buffer, &password) {
+    let mut password = String::new();
+    io::stdin().read_line(&mut password)?;
+    let password = password.trim();
+
+    match decrypt_office_file(&buffer, password) {
       Ok(decrypted_data) => {
         let mut out = File::create(output_path)?;
         out.write_all(&decrypted_data)?;
