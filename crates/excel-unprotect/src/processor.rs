@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use zip::ZipArchive;
 
 use crate::{
   cleaner::remove_protection_and_save,
@@ -98,6 +99,17 @@ fn attempt_decryption(
   match decrypt_file(file_clone, &mut writer, password) {
     Ok(_) => {
       writer.flush()?;
+
+      let verify_file = File::open(output_path)?;
+      if ZipArchive::new(verify_file).is_err() {
+        drop(writer);
+        let _ = fs::remove_file(output_path);
+        let e =
+          anyhow!("Decryption produced invalid Zip file (wrong password?)");
+        println!("[!] Password failed: {}", e);
+        return Err(e);
+      }
+
       println!("[+] File decrypted successfully: {}", output_path.display());
       Ok(output_path.to_path_buf())
     }

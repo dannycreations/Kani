@@ -162,16 +162,17 @@ fn test_encrypted_wrong_password() {
   fs::copy(&file_path, &temp_file_path).unwrap();
 
   let mut cmd = Command::new(CARGO_BIN_EXE);
-  let assert = cmd
+  cmd
     .arg(&temp_file_path)
     .arg("--pass")
     .arg("wrongpass")
-    .assert();
-
-  assert.success().stdout(
-    pstr::contains("Failed to process")
-      .or(pstr::contains("Provided password failed")),
-  );
+    .assert()
+    .success()
+    .stdout(
+      pstr::contains("File decrypted successfully")
+        .not()
+        .and(pstr::contains("Password failed")),
+    );
 }
 
 #[test]
