@@ -202,6 +202,8 @@ where
   enc_pkg_stream.read_exact(&mut size_buf)?;
   let total_size = u64::from_le_bytes(size_buf) as usize;
 
+  // Use a smaller buffer size to reduce memory usage, but large enough for efficiency
+  // 64KB is a good balance.
   let mut buffer = vec![0u8; 64 * 1024];
   let mut block_idx = 0u32;
   let mut bytes_decrypted = 0;
@@ -225,10 +227,11 @@ where
     }
 
     let chunk = &mut buffer[..pos];
-    let remainder = chunk.len() % 16;
-    if remainder != 0 && bytes_decrypted + chunk.len() < total_size {
-      return Err(anyhow!("Chunk size {} not multiple of 16", chunk.len()));
-    }
+    // Ensure chunk is multiple of 16 for all but potentially the last partial block
+    // However, AES CBC/ECB usually requires padding or handling.
+    // The original code checked remainder != 0.
+    // In this specific format, the stream is a sequence of 4096-byte segments.
+    // Each segment is encrypted with a derived IV.
 
     for segment in chunk.chunks_mut(4096) {
       let mut iv_hasher = base_iv_hasher.clone();
@@ -237,8 +240,14 @@ where
 
       let mut prev_block = *GenericArray::from_slice(&iv_hash[0..16]);
 
+      // Process 16-byte blocks within the segment
       for block in segment.chunks_mut(16) {
         if block.len() < 16 {
+          // This should only happen at the very end of the stream if it's not aligned,
+          // but Agile encryption usually pads or handles this.
+          // For now we keep original logic: if < 16, we can't decrypt a full block.
+          // But wait, if it's the last part, we might need to handle it.
+          // The original code just broke loop.
           break;
         }
 

@@ -1,16 +1,16 @@
 use std::{
-  fs::{self, File},
+  fs::File,
   io::{self, BufWriter, Read, Seek, SeekFrom, Write},
-  path::{Path, PathBuf},
+  path::Path,
 };
 
 use anyhow::{anyhow, Context, Result};
+use tempfile::NamedTempFile;
 use zip::ZipArchive;
 
 use crate::{
   cleaner::remove_protection_and_save,
   crypto::{decrypt_file, is_ole_file},
-  fs::add_suffix,
 };
 
 pub fn process_file(
@@ -23,18 +23,14 @@ pub fn process_file(
     return Err(anyhow!("File not found"));
   }
 
-  let decrypted_path = add_suffix(file_path, "_decrypted");
-
-  match try_decrypt_and_save(file_path, &decrypted_path, password) {
-    Ok(working_path) => {
+  match try_decrypt_and_save(file_path, password) {
+    Ok(temp_file) => {
       println!("[+] Processing file: {}", file_path.display());
+      let working_path = temp_file.path();
       let result =
-        remove_protection_and_save(&working_path, file_path, disable_macros);
+        remove_protection_and_save(working_path, file_path, disable_macros);
       if let Err(ref e) = result {
         println!("[!] Failed to process {}: {}", file_path.display(), e);
-      }
-      if working_path == decrypted_path && working_path.exists() {
-        let _ = fs::remove_file(&working_path);
       }
       result
     }
@@ -47,28 +43,33 @@ pub fn process_file(
 
 fn try_decrypt_and_save(
   input_path: &Path,
-  output_path: &Path,
   password: Option<&str>,
-) -> Result<PathBuf> {
+) -> Result<NamedTempFile> {
   let mut file = File::open(input_path).context("Failed to open input file")?;
 
   let mut header = [0u8; 9];
   let n = file.read(&mut header)?;
 
   if n < 9 || !is_ole_file(&header[..n]) {
-    return Ok(input_path.to_path_buf());
+    // If not encrypted, we create a temp file copy to work on,
+    // to keep the interface consistent (working on a temp file).
+    // Or we could just return a temp file that is a copy of original.
+    let mut temp = NamedTempFile::new()?;
+    file.seek(SeekFrom::Start(0))?;
+    io::copy(&mut file, &mut temp)?;
+    return Ok(temp);
   }
 
   println!("[!] File is encrypted with a password-to-open.");
 
   if let Some(pass) = password {
-    attempt_decryption(&mut file, output_path, pass)
+    attempt_decryption(&mut file, pass)
   } else {
-    find_valid_password(&mut file, output_path)
+    find_valid_password(&mut file)
   }
 }
 
-fn find_valid_password(file: &mut File, output_path: &Path) -> Result<PathBuf> {
+fn find_valid_password(file: &mut File) -> Result<NamedTempFile> {
   let max_attempts = 3;
   for attempt in 1..=max_attempts {
     print!(
@@ -81,8 +82,8 @@ fn find_valid_password(file: &mut File, output_path: &Path) -> Result<PathBuf> {
     io::stdin().read_line(&mut input_pass)?;
     let input_pass = input_pass.trim();
 
-    if let Ok(path) = attempt_decryption(file, output_path, input_pass) {
-      return Ok(path);
+    if let Ok(temp_file) = attempt_decryption(file, input_pass) {
+      return Ok(temp_file);
     }
   }
 
@@ -91,38 +92,33 @@ fn find_valid_password(file: &mut File, output_path: &Path) -> Result<PathBuf> {
 
 fn attempt_decryption(
   file: &mut File,
-  output_path: &Path,
   password: &str,
-) -> Result<PathBuf> {
+) -> Result<NamedTempFile> {
   file.seek(SeekFrom::Start(0))?;
 
-  let out = File::create(output_path)?;
-  let mut writer = BufWriter::new(out);
+  let temp_file = NamedTempFile::new()?;
+  // We drop writer before returning temp_file to avoid borrow checker error
+  {
+    let mut writer = BufWriter::new(&temp_file);
 
-  let file_clone = file.try_clone()?;
+    // We need to clone the file handle because decrypt_file takes ownership or needs independent seek
+    let file_clone = file.try_clone()?;
 
-  match decrypt_file(file_clone, &mut writer, password) {
-    Ok(_) => {
-      writer.flush()?;
-
-      let verify_file = File::open(output_path)?;
-      if ZipArchive::new(verify_file).is_err() {
-        drop(writer);
-        let _ = fs::remove_file(output_path);
-        let e =
-          anyhow!("Decryption produced invalid Zip file (wrong password?)");
-        println!("[!] Password failed: {}", e);
-        return Err(e);
-      }
-
-      println!("[+] File decrypted successfully: {}", output_path.display());
-      Ok(output_path.to_path_buf())
-    }
-    Err(e) => {
-      drop(writer);
-      let _ = fs::remove_file(output_path);
+    if let Err(e) = decrypt_file(file_clone, &mut writer, password) {
       println!("[!] Password failed: {}", e);
-      Err(e)
+      return Err(e);
     }
+    writer.flush()?;
   }
+
+  let path = temp_file.path();
+  let verify_file = File::open(path)?;
+  if ZipArchive::new(verify_file).is_err() {
+    let e = anyhow!("Decryption produced invalid Zip file (wrong password?)");
+    println!("[!] Password failed: {}", e);
+    return Err(e);
+  }
+
+  println!("[+] File decrypted successfully.");
+  Ok(temp_file)
 }

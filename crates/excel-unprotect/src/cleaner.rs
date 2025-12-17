@@ -3,7 +3,6 @@ use std::{
   fs::File,
   io::{self, BufReader, BufWriter, Read, Seek},
   path::Path,
-  str,
 };
 
 use anyhow::{anyhow, Result};
