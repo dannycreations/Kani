@@ -13,7 +13,11 @@ use crate::{
   fs::add_suffix,
 };
 
-pub fn process_file(file_path: &Path, password: Option<&str>) -> Result<()> {
+pub fn process_file(
+  file_path: &Path,
+  password: Option<&str>,
+  disable_macros: bool,
+) -> Result<()> {
   if !file_path.exists() {
     println!("[!] File not found: {}", file_path.display());
     return Err(anyhow!("File not found"));
@@ -24,7 +28,8 @@ pub fn process_file(file_path: &Path, password: Option<&str>) -> Result<()> {
   match try_decrypt_and_save(file_path, &decrypted_path, password) {
     Ok(working_path) => {
       println!("[+] Processing file: {}", file_path.display());
-      let result = remove_protection_and_save(&working_path, file_path);
+      let result =
+        remove_protection_and_save(&working_path, file_path, disable_macros);
       if let Err(ref e) = result {
         println!("[!] Failed to process {}: {}", file_path.display(), e);
       }

@@ -95,6 +95,7 @@ fn get_attr(e: &BytesStart, name: &[u8]) -> Option<String> {
 pub fn remove_protection_and_save(
   target_path: &Path,
   original_path: &Path,
+  disable_macros: bool,
 ) -> Result<()> {
   let file = File::open(target_path)?;
   let reader = BufReader::new(file);
@@ -113,6 +114,18 @@ pub fn remove_protection_and_save(
   for i in 0..archive.len() {
     let mut file = archive.by_index(i)?;
     let name = file.name().to_string();
+
+    let is_macro_file = name.contains("vbaProject.bin")
+      || name.contains("vbaProjectSignature.bin");
+
+    if is_macro_file {
+      if disable_macros {
+        println!("[+] Removed macro/VBA file: {}", name);
+        continue;
+      } else {
+        println!("[!] WARNING: Macro/VBA file preserved: {}", name);
+      }
+    }
 
     let options = FileOptions::<()>::default()
       .compression_method(file.compression())

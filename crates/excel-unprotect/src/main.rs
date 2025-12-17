@@ -13,6 +13,10 @@ struct Args {
   /// Password to use if Excel file is encrypted
   #[arg(long)]
   pass: Option<String>,
+
+  /// Keep macros (VBA scripts)
+  #[arg(long)]
+  keep_macros: bool,
 }
 
 fn main() -> Result<()> {
@@ -24,10 +28,12 @@ fn main() -> Result<()> {
   let mut has_error = false;
   let interactive = args.files.is_empty();
 
+  let disable_macros = !args.keep_macros;
+
   if !interactive {
     for file_path in &args.files {
       if let Ok(path) = normalize_path(file_path) {
-        if process_file(&path, args.pass.as_deref()).is_err() {
+        if process_file(&path, args.pass.as_deref(), disable_macros).is_err() {
           has_error = true;
         }
       } else {
@@ -42,7 +48,7 @@ fn main() -> Result<()> {
     io::stdin().read_line(&mut input)?;
 
     if let Ok(path) = normalize_path(input.trim()) {
-      if process_file(&path, args.pass.as_deref()).is_err() {
+      if process_file(&path, args.pass.as_deref(), disable_macros).is_err() {
         has_error = true;
       }
     } else {
