@@ -19,9 +19,14 @@ def create_plain(filename):
 
 def create_protected(filename):
     workbook = xlsxwriter.Workbook(filename)
-    worksheet = workbook.add_worksheet()
-    worksheet.write("A1", "Protected Sheet")
-    worksheet.protect("password")
+    worksheet = workbook.add_worksheet("MyProtectedSheet")
+    worksheet.write("A1", "Locked")
+    worksheet.protect("pass1")
+    worksheet = workbook.add_worksheet("MyUnprotectedSheet")
+    worksheet.write("A1", "Open")
+    worksheet = workbook.add_worksheet("AnotherProtected")
+    worksheet.write("A1", "LockedToo")
+    worksheet.protect("pass2")
     workbook.close()
     print(f"Created {filename}")
 

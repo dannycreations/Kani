@@ -83,11 +83,10 @@ fn test_protected() {
   );
 
   let mut cmd = Command::new(CARGO_BIN_EXE);
-  cmd
-    .arg(&temp_file_path)
-    .assert()
-    .success()
-    .stdout(pstr::contains("Sheet protection removed"));
+  cmd.arg(&temp_file_path).assert().success().stdout(
+    pstr::contains("Sheet protection removed: MyProtectedSheet")
+      .and(pstr::contains("Sheet protection removed: AnotherProtected")),
+  );
 
   assert!(
     clean_path.exists(),
@@ -139,14 +138,14 @@ fn test_encrypted_with_password() {
     "Clean file not created: {}",
     clean_path.display()
   );
+
   assert!(
-    decrypted_path.exists(),
-    "Decrypted file not found: {}",
+    !decrypted_path.exists(),
+    "Decrypted file should have been cleaned up: {}",
     decrypted_path.display()
   );
 
   verify_zip(&clean_path);
-  verify_zip(&decrypted_path);
 }
 
 #[test]
@@ -195,7 +194,7 @@ fn test_corrupt_file() {
     .arg(&temp_file_path)
     .assert()
     .success()
-    .stdout(pstr::contains("Failed to open as Zip archive"));
+    .stdout(pstr::contains("Failed to open Zip"));
 }
 
 #[test]

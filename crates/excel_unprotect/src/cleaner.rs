@@ -1,92 +1,114 @@
 use std::{
   collections::HashMap,
   fs::File,
-  io::{Read, Write},
+  io::{self, BufReader, BufWriter, Read, Seek},
   path::Path,
   str,
 };
 
-use anyhow::Result;
-use regex::Regex;
+use anyhow::{anyhow, Result};
+use quick_xml::{
+  events::{BytesStart, Event},
+  reader::Reader,
+  writer::Writer,
+};
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 use crate::fs::{add_suffix, safe_save_path};
+
+struct WorkbookMap {
+  sheet_map: HashMap<String, String>,
+}
+
+impl WorkbookMap {
+  fn new<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Self {
+    let mut rid_to_name = HashMap::new();
+    let mut sheet_map = HashMap::new();
+    let mut xml_buf = Vec::new();
+
+    if let Ok(wb) = archive.by_name("xl/workbook.xml") {
+      let mut reader = Reader::from_reader(BufReader::new(wb));
+      reader.config_mut().trim_text(true);
+
+      loop {
+        match reader.read_event_into(&mut xml_buf) {
+          Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+            if e.local_name().as_ref() == b"sheet" =>
+          {
+            if let (Some(name), Some(rid)) =
+              (get_attr(e, b"name"), get_attr(e, b"id"))
+            {
+              rid_to_name.insert(rid, name);
+            }
+          }
+          Ok(Event::Eof) => break,
+          _ => {}
+        }
+        xml_buf.clear();
+      }
+    }
+
+    if let Ok(rels) = archive.by_name("xl/_rels/workbook.xml.rels") {
+      let mut reader = Reader::from_reader(BufReader::new(rels));
+      reader.config_mut().trim_text(true);
+
+      loop {
+        match reader.read_event_into(&mut xml_buf) {
+          Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+            if e.local_name().as_ref() == b"Relationship" =>
+          {
+            if let (Some(id), Some(target)) =
+              (get_attr(e, b"Id"), get_attr(e, b"Target"))
+            {
+              if let Some(name) = rid_to_name.get(&id) {
+                let path = if target.starts_with('/') {
+                  target.trim_start_matches('/').to_string()
+                } else {
+                  format!("xl/{}", target)
+                };
+                sheet_map.insert(path, name.clone());
+              }
+            }
+          }
+          Ok(Event::Eof) => break,
+          _ => {}
+        }
+        xml_buf.clear();
+      }
+    }
+
+    Self { sheet_map }
+  }
+
+  fn get_sheet_name(&self, path: &str) -> Option<&str> {
+    self.sheet_map.get(path).map(|s| s.as_str())
+  }
+}
+
+fn get_attr(e: &BytesStart, name: &[u8]) -> Option<String> {
+  e.attributes()
+    .flatten()
+    .find(|a| a.key.local_name().as_ref() == name)
+    .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+}
 
 pub fn remove_protection_and_save(
   target_path: &Path,
   original_path: &Path,
 ) -> Result<()> {
   let file = File::open(target_path)?;
+  let reader = BufReader::new(file);
 
-  let mut archive = match ZipArchive::new(file) {
-    Ok(a) => a,
-    Err(e) => {
-      return Err(anyhow::anyhow!("Failed to open as Zip archive: {}", e));
-    }
-  };
-
-  // Build sheet name map
-  let mut sheet_map: HashMap<String, String> = HashMap::new();
-  let mut rid_to_name: HashMap<String, String> = HashMap::new();
-
-  // 1. Read workbook.xml to map r:id to sheet name
-  if let Ok(mut wb_file) = archive.by_name("xl/workbook.xml") {
-    let mut content = String::new();
-    if wb_file.read_to_string(&mut content).is_ok() {
-      let sheet_re =
-        Regex::new(r#"<sheet\s+[^>]*name="([^"]+)"\s+[^>]*r:id="([^"]+)""#)
-          .unwrap();
-      // Fallback for different order or namespaces
-      let sheet_re2 =
-        Regex::new(r#"<sheet\s+[^>]*r:id="([^"]+)"\s+[^>]*name="([^"]+)""#)
-          .unwrap();
-
-      for cap in sheet_re.captures_iter(&content) {
-        rid_to_name.insert(cap[2].to_string(), cap[1].to_string());
-      }
-      for cap in sheet_re2.captures_iter(&content) {
-        rid_to_name.insert(cap[1].to_string(), cap[2].to_string());
-      }
-    }
-  }
-
-  // 2. Read workbook.xml.rels to map r:id to target filename
-  if let Ok(mut rels_file) = archive.by_name("xl/_rels/workbook.xml.rels") {
-    let mut content = String::new();
-    if rels_file.read_to_string(&mut content).is_ok() {
-      let rel_re = Regex::new(
-        r#"<Relationship\s+[^>]*Id="([^"]+)"\s+[^>]*Target="([^"]+)""#,
-      )
-      .unwrap();
-      for cap in rel_re.captures_iter(&content) {
-        let rid = &cap[1];
-        let target = &cap[2];
-        if let Some(name) = rid_to_name.get(rid) {
-          // Target might be relative, e.g., "worksheets/sheet1.xml" or "/xl/worksheets/sheet1.xml"
-          // We need to match it with how ZipArchive lists files.
-          // ZipArchive usually has "xl/worksheets/sheet1.xml".
-          // Target in rels is usually relative to xl/ folder, so "worksheets/sheet1.xml".
-          // So full path is "xl/" + target.
-
-          let full_path = if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-          } else {
-            format!("xl/{}", target)
-          };
-          sheet_map.insert(full_path, name.clone());
-        }
-      }
-    }
-  }
+  let mut archive = ZipArchive::new(reader)
+    .map_err(|e| anyhow!("Failed to open Zip: {}", e))?;
+  let wb_map = WorkbookMap::new(&mut archive);
 
   let clean_path = add_suffix(original_path, "_clean");
   let final_path = safe_save_path(&clean_path);
   let out_file = File::create(&final_path)?;
-  let mut zip_writer = ZipWriter::new(out_file);
+  let mut zip_writer = ZipWriter::new(BufWriter::new(out_file));
 
-  let sheet_prot_regex = Regex::new(r"<sheetProtection[^>]*/>")?;
-  let workbook_prot_regex = Regex::new(r"<workbookProtection[^>]*/>")?;
-  let file_sharing_regex = Regex::new(r"<fileSharing[^>]*/>")?;
+  let mut xml_buf = Vec::new();
 
   for i in 0..archive.len() {
     let mut file = archive.by_index(i)?;
@@ -96,49 +118,41 @@ pub fn remove_protection_and_save(
       .compression_method(file.compression())
       .unix_permissions(file.unix_mode().unwrap_or(0o755));
 
-    let mut content = Vec::new();
-    file.read_to_end(&mut content)?;
+    zip_writer.start_file(&name, options)?;
 
-    let mut modified = false;
-    let mut new_content_str = String::new();
+    let is_worksheet =
+      name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml");
+    let is_workbook = name == "xl/workbook.xml";
 
-    if name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml") {
-      if let Ok(text) = str::from_utf8(&content) {
-        if sheet_prot_regex.is_match(text) {
-          new_content_str = sheet_prot_regex.replace(text, "").to_string();
-          modified = true;
+    if is_worksheet || is_workbook {
+      let mut reader = Reader::from_reader(BufReader::new(file));
+      let mut writer = Writer::new(&mut zip_writer);
 
-          let display_name = sheet_map
-            .get(&name)
-            .map(|s| s.as_str())
-            .unwrap_or(name.as_str());
-          println!("[+] Sheet protection removed: {}", display_name);
+      loop {
+        match reader.read_event_into(&mut xml_buf) {
+          Ok(Event::Start(ref e)) => {
+            if !should_remove(e, is_worksheet, &name, &wb_map) {
+              writer.write_event(Event::Start(e.clone()))?;
+            }
+          }
+          Ok(Event::Empty(ref e)) => {
+            if !should_remove(e, is_worksheet, &name, &wb_map) {
+              writer.write_event(Event::Empty(e.clone()))?;
+            }
+          }
+          Ok(Event::End(ref e)) => {
+            writer.write_event(Event::End(e.clone()))?;
+          }
+          Ok(Event::Eof) => break,
+          Ok(e) => {
+            writer.write_event(e)?;
+          }
+          Err(e) => return Err(anyhow!("XML parsing error: {}", e)),
         }
+        xml_buf.clear();
       }
-    } else if name == "xl/workbook.xml" {
-      if let Ok(text) = str::from_utf8(&content) {
-        let mut temp_text = text.to_string();
-        if workbook_prot_regex.is_match(&temp_text) {
-          temp_text = workbook_prot_regex.replace(&temp_text, "").to_string();
-          modified = true;
-          println!("[+] Workbook protection removed");
-        }
-        if file_sharing_regex.is_match(&temp_text) {
-          temp_text = file_sharing_regex.replace(&temp_text, "").to_string();
-          modified = true;
-          println!("[+] File sharing protection removed");
-        }
-        if modified {
-          new_content_str = temp_text;
-        }
-      }
-    }
-
-    zip_writer.start_file(name, options)?;
-    if modified {
-      zip_writer.write_all(new_content_str.as_bytes())?;
     } else {
-      zip_writer.write_all(&content)?;
+      io::copy(&mut file, &mut zip_writer)?;
     }
   }
 
@@ -146,4 +160,28 @@ pub fn remove_protection_and_save(
   println!("[+] Saved cleaned copy: {}", final_path.display());
 
   Ok(())
+}
+
+fn should_remove(
+  e: &BytesStart,
+  is_worksheet: bool,
+  name: &str,
+  wb_map: &WorkbookMap,
+) -> bool {
+  match e.local_name().as_ref() {
+    b"sheetProtection" if is_worksheet => {
+      let display_name = wb_map.get_sheet_name(name).unwrap_or(name);
+      println!("[+] Sheet protection removed: {}", display_name);
+      true
+    }
+    b"workbookProtection" => {
+      println!("[+] Workbook protection removed");
+      true
+    }
+    b"fileSharing" => {
+      println!("[+] File sharing protection removed");
+      true
+    }
+    _ => false,
+  }
 }

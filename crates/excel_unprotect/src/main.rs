@@ -21,20 +21,37 @@ fn main() -> Result<()> {
   })?;
 
   let args = Args::parse();
+  let mut has_error = false;
+  let interactive = args.files.is_empty();
 
-  if !args.files.is_empty() {
+  if !interactive {
     for file_path in &args.files {
-      let path = normalize_path(file_path)?;
-      process_file(&path, args.pass.as_deref());
+      if let Ok(path) = normalize_path(file_path) {
+        if process_file(&path, args.pass.as_deref()).is_err() {
+          has_error = true;
+        }
+      } else {
+        eprintln!("[!] Invalid path: {}", file_path);
+        has_error = true;
+      }
     }
   } else {
     print!("Enter or Drag Excel file path: ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    let path = normalize_path(input.trim())?;
-    process_file(&path, args.pass.as_deref());
 
+    if let Ok(path) = normalize_path(input.trim()) {
+      if process_file(&path, args.pass.as_deref()).is_err() {
+        has_error = true;
+      }
+    } else {
+      eprintln!("[!] Invalid path provided.");
+      has_error = true;
+    }
+  }
+
+  if interactive || has_error {
     print!("\nPress Enter to exit... ");
     io::stdout().flush()?;
     let mut _pause = String::new();

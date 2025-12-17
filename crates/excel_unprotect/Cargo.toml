@@ -13,13 +13,10 @@ doctest = false
 aes = "0.8.4"
 anyhow.workspace = true
 base64 = "0.22.1"
-byteorder = "1.5.0"
-cbc = "0.1.2"
 cfb = "0.12.1"
 clap = { workspace = true, features = ["derive"] }
 ctrlc.workspace = true
 quick-xml = "0.38.4"
-regex = "1.12.2"
 sha2 = "0.10.9"
 zip = "6.0.0"
 
