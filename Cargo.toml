@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/excel_unprotect"]
+members = ["crates/excel-unprotect"]
 
 [workspace.package]
 authors = ["dannycreations"]

@@ -9,14 +9,14 @@ use predicates::prelude::{predicate::str as pstr, *};
 use tempfile::TempDir;
 use zip::ZipArchive;
 
-const CARGO_BIN_EXE: &str = env!("CARGO_BIN_EXE_excel_unprotect");
+const CARGO_BIN_EXE: &str = env!("CARGO_BIN_EXE_excel-unprotect");
 
 fn get_fixtures_path() -> PathBuf {
   let root = env::current_dir().unwrap();
-  if root.ends_with("crates/excel_unprotect") {
+  if root.ends_with("crates/excel-unprotect") {
     root.join("tests/fixtures")
   } else {
-    root.join("crates/excel_unprotect/tests/fixtures")
+    root.join("crates/excel-unprotect/tests/fixtures")
   }
 }
 

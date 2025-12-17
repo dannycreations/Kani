@@ -80,7 +80,7 @@ def create_encrypted(filename, password="password"):
 
 
 def main():
-    output_dir = "crates/excel_unprotect/tests/fixtures"
+    output_dir = "crates/excel-unprotect/tests/fixtures"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
