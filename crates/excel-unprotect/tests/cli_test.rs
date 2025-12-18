@@ -207,5 +207,5 @@ fn test_non_existent_file() {
     .arg(file_path)
     .assert()
     .success()
-    .stdout(pstr::contains("File not found"));
+    .stderr(pstr::contains("Invalid path"));
 }

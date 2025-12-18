@@ -15,6 +15,8 @@ use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 use crate::fs::{add_suffix, safe_save_path};
 
+const XML_BUFFER_CAPACITY: usize = 8192;
+
 struct WorkbookMap {
   sheet_map: HashMap<String, String>,
 }
@@ -23,58 +25,64 @@ impl WorkbookMap {
   fn new<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Self {
     let mut rid_to_name = HashMap::new();
     let mut sheet_map = HashMap::new();
-    let mut xml_buf = Vec::new();
 
-    if let Ok(wb) = archive.by_name("xl/workbook.xml") {
-      let mut reader = Reader::from_reader(BufReader::new(wb));
-      reader.config_mut().trim_text(true);
-
-      loop {
-        match reader.read_event_into(&mut xml_buf) {
-          Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
-            if e.local_name().as_ref() == b"sheet" =>
-          {
-            if let (Some(name), Some(rid)) =
-              (get_attr(e, b"name"), get_attr(e, b"id"))
-            {
-              rid_to_name.insert(rid, name);
-            }
+    let mut read_xml = |name: &str, on_start: &mut dyn FnMut(&BytesStart)| {
+      if let Ok(file) = archive.by_name(name) {
+        let mut reader = Reader::from_reader(BufReader::new(file));
+        reader.config_mut().trim_text(true);
+        let mut buf = Vec::new();
+        loop {
+          match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => on_start(e),
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
           }
-          Ok(Event::Eof) => break,
-          _ => {}
+          buf.clear();
         }
-        xml_buf.clear();
       }
-    }
+    };
 
-    if let Ok(rels) = archive.by_name("xl/_rels/workbook.xml.rels") {
-      let mut reader = Reader::from_reader(BufReader::new(rels));
-      reader.config_mut().trim_text(true);
-
-      loop {
-        match reader.read_event_into(&mut xml_buf) {
-          Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
-            if e.local_name().as_ref() == b"Relationship" =>
-          {
-            if let (Some(id), Some(target)) =
-              (get_attr(e, b"Id"), get_attr(e, b"Target"))
-            {
-              if let Some(name) = rid_to_name.get(&id) {
-                let path = if target.starts_with('/') {
-                  target.trim_start_matches('/').to_string()
-                } else {
-                  format!("xl/{}", target)
-                };
-                sheet_map.insert(path, name.clone());
-              }
-            }
+    read_xml("xl/workbook.xml", &mut |e| {
+      if e.local_name().as_ref() == b"sheet" {
+        let (mut name, mut rid) = (None, None);
+        for a in e.attributes().flatten() {
+          match a.key.local_name().as_ref() {
+            b"name" => name = a.unescape_value().ok().map(|v| v.into_owned()),
+            b"id" => rid = a.unescape_value().ok().map(|v| v.into_owned()),
+            _ => {}
           }
-          Ok(Event::Eof) => break,
-          _ => {}
         }
-        xml_buf.clear();
+        if let (Some(n), Some(r)) = (name, rid) {
+          rid_to_name.insert(r, n);
+        }
       }
-    }
+    });
+
+    read_xml("xl/_rels/workbook.xml.rels", &mut |e| {
+      if e.local_name().as_ref() == b"Relationship" {
+        let (mut id, mut target) = (None, None);
+        for a in e.attributes().flatten() {
+          match a.key.local_name().as_ref() {
+            b"Id" => id = a.unescape_value().ok().map(|v| v.into_owned()),
+            b"Target" => {
+              target = a.unescape_value().ok().map(|v| v.into_owned())
+            }
+            _ => {}
+          }
+        }
+        if let (Some(id), Some(target)) = (id, target) {
+          if let Some(name) = rid_to_name.get(&id) {
+            let path = if target.starts_with('/') {
+              target.trim_start_matches('/').to_string()
+            } else {
+              format!("xl/{}", target)
+            };
+            sheet_map.insert(path, name.clone());
+          }
+        }
+      }
+    });
 
     Self { sheet_map }
   }
@@ -84,11 +92,11 @@ impl WorkbookMap {
   }
 }
 
-fn get_attr(e: &BytesStart, name: &[u8]) -> Option<String> {
-  e.attributes()
-    .flatten()
-    .find(|a| a.key.local_name().as_ref() == name)
-    .and_then(|a| a.unescape_value().ok().map(|v| v.into_owned()))
+fn is_vba_file(name: &str) -> bool {
+  name.contains("vbaProject.bin")
+    || name.contains("vbaProjectSignature.bin")
+    || name.contains("macrosheets")
+    || name.ends_with(".xlsm")
 }
 
 pub fn remove_protection_and_save(
@@ -108,16 +116,13 @@ pub fn remove_protection_and_save(
   let out_file = File::create(&final_path)?;
   let mut zip_writer = ZipWriter::new(BufWriter::new(out_file));
 
-  let mut xml_buf = Vec::new();
+  let mut xml_buf = Vec::with_capacity(XML_BUFFER_CAPACITY);
 
   for i in 0..archive.len() {
     let mut file = archive.by_index(i)?;
     let name = file.name().to_string();
 
-    let is_macro_file = name.contains("vbaProject.bin")
-      || name.contains("vbaProjectSignature.bin");
-
-    if is_macro_file {
+    if is_vba_file(&name) {
       if disable_macros {
         println!("[+] Removed macro/VBA file: {}", name);
         continue;

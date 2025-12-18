@@ -1,11 +1,26 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 
 pub fn normalize_path(user_input: &str) -> Result<PathBuf> {
   let cleaned = user_input.trim().trim_matches(|c| c == '"' || c == '\'');
+
+  if cleaned.is_empty() {
+    bail!("Path is empty");
+  }
+
+  if cleaned.contains('\0') {
+    bail!("Path contains null byte");
+  }
+
   let path = PathBuf::from(cleaned);
-  let canonical = path.canonicalize().unwrap_or(path);
+  let canonical = path
+    .canonicalize()
+    .map_err(|e| anyhow!("Invalid path: {}", e))?;
+
+  if canonical.parent().is_none() {
+    bail!("Cannot operate on root directory");
+  }
 
   #[cfg(windows)]
   {
@@ -20,18 +35,14 @@ pub fn normalize_path(user_input: &str) -> Result<PathBuf> {
 
 pub fn add_suffix(path: &Path, suffix: &str) -> PathBuf {
   let mut new_path = path.to_path_buf();
-  let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-  let extension = path.extension();
+  let stem = path.file_stem().unwrap_or_default();
 
-  let capacity =
-    stem.len() + suffix.len() + extension.map_or(0, |e| e.len() + 1);
-  let mut new_name = String::with_capacity(capacity);
-  new_name.push_str(&stem);
-  new_name.push_str(suffix);
+  let mut new_name = stem.to_os_string();
+  new_name.push(suffix);
 
-  if let Some(ext) = extension {
-    new_name.push('.');
-    new_name.push_str(&ext.to_string_lossy());
+  if let Some(ext) = path.extension() {
+    new_name.push(".");
+    new_name.push(ext);
   }
 
   new_path.set_file_name(new_name);
@@ -43,27 +54,25 @@ pub fn safe_save_path(target: &Path) -> PathBuf {
     return target.to_path_buf();
   }
 
-  let mut counter = 1;
-  let stem = target.file_stem().unwrap_or_default().to_string_lossy();
+  let stem = target.file_stem().unwrap_or_default();
   let extension = target.extension();
   let parent = target.parent().unwrap_or_else(|| Path::new("."));
 
-  loop {
-    let capacity = stem.len() + 5 + extension.map_or(0, |e| e.len() + 1);
-    let mut new_name = String::with_capacity(capacity);
-    new_name.push_str(&stem);
-    new_name.push('_');
-    new_name.push_str(&counter.to_string());
+  for counter in 1..=u32::MAX {
+    let mut new_name = stem.to_os_string();
+    new_name.push("_");
+    new_name.push(counter.to_string());
 
     if let Some(ext) = extension {
-      new_name.push('.');
-      new_name.push_str(&ext.to_string_lossy());
+      new_name.push(".");
+      new_name.push(ext);
     }
 
     let candidate = parent.join(new_name);
     if !candidate.exists() {
       return candidate;
     }
-    counter += 1;
   }
+
+  target.to_path_buf()
 }
