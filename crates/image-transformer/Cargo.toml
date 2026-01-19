@@ -1,0 +1,15 @@
+[package]
+name = "image-transformer"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+image = "0.25.9"
+oxipng = "10.0.0"
+rayon.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
