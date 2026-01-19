@@ -1,10 +1,11 @@
 use std::{
-  env, fs,
+  env,
+  fs::{self, File},
   path::{Path, PathBuf},
+  str,
 };
 
 use assert_cmd::Command;
-use fs::File;
 use predicates::prelude::{predicate::str as pstr, *};
 use tempfile::TempDir;
 use zip::ZipArchive;
@@ -122,7 +123,7 @@ fn test_encrypted_with_password() {
     .assert();
 
   let output = assert.get_output();
-  let stdout = std::str::from_utf8(&output.stdout).unwrap();
+  let stdout = str::from_utf8(&output.stdout).unwrap();
   println!("Stdout: {}", stdout);
 
   if !clean_path.exists() {

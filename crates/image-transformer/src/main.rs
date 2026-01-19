@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 use image_transformer::{run, Resolution, TransformerConfig};
 
@@ -33,7 +33,7 @@ struct Args {
   scale: Option<Resolution>,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
   let args = Args::parse();
 
   let config = TransformerConfig {
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
     scale: args.scale,
   };
 
-  run(config).context("Image transformation failed")?;
+  let _results = run(config);
 
   Ok(())
 }

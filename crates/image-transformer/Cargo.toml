@@ -7,8 +7,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["derive"] }
 image = "0.25.9"
+indicatif = { workspace = true, features = ["rayon"] }
 oxipng = "10.0.0"
 rayon.workspace = true
 thiserror.workspace = true
