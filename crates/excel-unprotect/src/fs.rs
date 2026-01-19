@@ -16,7 +16,7 @@ pub fn normalize_path(user_input: &str) -> Result<PathBuf> {
   let path = PathBuf::from(cleaned);
   let canonical = path
     .canonicalize()
-    .map_err(|e| anyhow!("Invalid path: {}", e))?;
+    .map_err(|e| anyhow!("Invalid path: {e}"))?;
 
   if canonical.parent().is_none() {
     bail!("Cannot operate on root directory");
@@ -33,6 +33,7 @@ pub fn normalize_path(user_input: &str) -> Result<PathBuf> {
   Ok(canonical)
 }
 
+#[must_use]
 pub fn add_suffix(path: &Path, suffix: &str) -> PathBuf {
   let mut new_path = path.to_path_buf();
   let stem = path.file_stem().unwrap_or_default();
@@ -49,6 +50,7 @@ pub fn add_suffix(path: &Path, suffix: &str) -> PathBuf {
   new_path
 }
 
+#[must_use]
 pub fn safe_save_path(target: &Path) -> PathBuf {
   if !target.exists() {
     return target.to_path_buf();

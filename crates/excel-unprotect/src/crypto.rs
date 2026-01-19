@@ -1,14 +1,14 @@
 use std::{
   io::{Read, Seek, Write},
-  str,
+  str::from_utf8,
 };
 
 use aes::{
-  cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit},
+  cipher::{generic_array::GenericArray, typenum::U32, BlockDecrypt, KeyInit},
   Aes256,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use cfb::CompoundFile;
 use quick_xml::{events::Event, reader::Reader};
 use sha2::{Digest, Sha512};
@@ -20,6 +20,7 @@ const MAX_ENCRYPTION_INFO_SIZE: usize = 10 * 1024 * 1024;
 const IO_BUFFER_SIZE: usize = 128 * 1024;
 const MAX_SPIN_COUNT: u32 = 10_000_000;
 
+#[must_use]
 pub fn is_ole_file(buffer: &[u8]) -> bool {
   buffer.len() >= 8 && &buffer[0..8] == OLE_HEADER
 }
@@ -89,7 +90,7 @@ impl AgileEncryptionInfo {
           }
         }
         Ok(Event::Eof) => break,
-        Err(e) => bail!("XML error: {}", e),
+        Err(e) => bail!("XML error: {e}"),
         _ => (),
       }
       buf.clear();
@@ -112,7 +113,7 @@ impl AgileEncryptionInfo {
   fn derive_key(
     &self,
     password: &str,
-  ) -> Result<(GenericArray<u8, aes::cipher::typenum::U32>, Vec<u8>)> {
+  ) -> Result<(GenericArray<u8, U32>, Vec<u8>)> {
     if self.spin_count > MAX_SPIN_COUNT {
       bail!("Spin count too high");
     }
@@ -202,10 +203,10 @@ where
   let v_minor = u16::from_le_bytes([enc_info_data[2], enc_info_data[3]]);
 
   if v_major != 4 || v_minor != 4 {
-    bail!("Unsupported encryption version: {}.{}", v_major, v_minor);
+    bail!("Unsupported encryption version: {v_major}.{v_minor}");
   }
 
-  let xml_str = str::from_utf8(&enc_info_data[8..])
+  let xml_str = from_utf8(&enc_info_data[8..])
     .context("EncryptionInfo data is not valid UTF-8")?;
   let info = AgileEncryptionInfo::from_xml(xml_str)?;
   let (content_key, pkg_salt) = info.derive_key(password)?;
@@ -280,9 +281,7 @@ where
 
   if bytes_decrypted < total_size {
     bail!(
-      "Decrypted size mismatch: expected {}, got {}",
-      total_size,
-      bytes_decrypted
+      "Decrypted size mismatch: expected {total_size}, got {bytes_decrypted}"
     );
   }
 

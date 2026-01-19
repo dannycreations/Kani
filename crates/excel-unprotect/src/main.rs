@@ -1,17 +1,26 @@
-use std::io::{self, Write};
+use std::{
+  io::{stdin, stdout, Write},
+  process::exit,
+};
 
 use anyhow::Result;
 use clap::Parser;
+use ctrlc::set_handler;
 use excel_unprotect::{fs::normalize_path, processor::process_file};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+  author,
+  version,
+  about = "Excel Protection Remover",
+  long_about = "A tool to remove sheet and workbook protection from Excel files (.xlsx, .xlsm)."
+)]
 struct Args {
   /// Input file paths
   files: Vec<String>,
 
   /// Password to use if file is encrypted
-  #[arg(long)]
+  #[arg(long, value_name = "PASSWORD")]
   pass: Option<String>,
 
   /// Keep macros (VBA scripts)
@@ -20,8 +29,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-  ctrlc::set_handler(move || {
-    std::process::exit(0);
+  set_handler(move || {
+    exit(0);
   })?;
 
   let args = Args::parse();
@@ -30,9 +39,9 @@ fn main() -> Result<()> {
 
   if interactive {
     print!("Drag Excel file path: ");
-    io::stdout().flush()?;
+    stdout().flush()?;
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
+    stdin().read_line(&mut input)?;
     let input = input.trim();
     if !input.is_empty() {
       paths.push(input.to_string());
@@ -50,7 +59,7 @@ fn main() -> Result<()> {
         }
       }
       Err(e) => {
-        eprintln!("[!] Invalid path '{}': {}", file_path, e);
+        eprintln!("[!] Invalid path '{file_path}': {e}");
         has_error = true;
       }
     }
@@ -58,9 +67,9 @@ fn main() -> Result<()> {
 
   if interactive || has_error {
     print!("\nPress Enter to exit... ");
-    io::stdout().flush()?;
+    stdout().flush()?;
     let mut _pause = String::new();
-    io::stdin().read_line(&mut _pause)?;
+    stdin().read_line(&mut _pause)?;
   }
 
   Ok(())

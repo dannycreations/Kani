@@ -19,6 +19,7 @@ ctrlc.workspace = true
 quick-xml = "0.39.0"
 sha2 = "0.10.9"
 tempfile.workspace = true
+thiserror.workspace = true
 zip = "7.1.0"
 
 [dev-dependencies]

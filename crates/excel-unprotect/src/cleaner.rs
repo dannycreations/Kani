@@ -1,7 +1,7 @@
 use std::{
   collections::HashMap,
   fs::File,
-  io::{self, BufReader, BufWriter, Read, Seek},
+  io::{copy, BufReader, BufWriter, Read, Seek},
   path::Path,
 };
 
@@ -35,7 +35,6 @@ impl WorkbookMap {
           match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => on_start(e),
             Ok(Event::Eof) => break,
-            Err(_) => break,
             _ => {}
           }
           buf.clear();
@@ -88,7 +87,7 @@ impl WorkbookMap {
   }
 
   fn get_sheet_name(&self, path: &str) -> Option<&str> {
-    self.sheet_map.get(path).map(|s| s.as_str())
+    self.sheet_map.get(path).map(String::as_str)
   }
 }
 
@@ -107,8 +106,8 @@ pub fn remove_protection_and_save(
   let file = File::open(target_path)?;
   let reader = BufReader::new(file);
 
-  let mut archive = ZipArchive::new(reader)
-    .map_err(|e| anyhow!("Failed to open Zip: {}", e))?;
+  let mut archive =
+    ZipArchive::new(reader).map_err(|e| anyhow!("Failed to open Zip: {e}"))?;
   let wb_map = WorkbookMap::new(&mut archive);
 
   let clean_path = add_suffix(original_path, "_clean");
@@ -124,10 +123,10 @@ pub fn remove_protection_and_save(
 
     if is_vba_file(&name) {
       if disable_macros {
-        println!("[+] Removed macro/VBA file: {}", name);
+        println!("[+] Removed macro/VBA file: {name}");
         continue;
       } else {
-        println!("[!] WARNING: Macro/VBA file preserved: {}", name);
+        println!("[!] WARNING: Macro/VBA file preserved: {name}");
       }
     }
 
@@ -164,12 +163,12 @@ pub fn remove_protection_and_save(
           Ok(e) => {
             writer.write_event(e)?;
           }
-          Err(e) => return Err(anyhow!("XML parsing error: {}", e)),
+          Err(e) => return Err(anyhow!("XML parsing error: {e}")),
         }
         xml_buf.clear();
       }
     } else {
-      io::copy(&mut file, &mut zip_writer)?;
+      copy(&mut file, &mut zip_writer)?;
     }
   }
 
@@ -188,7 +187,7 @@ fn should_remove(
   match e.local_name().as_ref() {
     b"sheetProtection" if is_worksheet => {
       let display_name = wb_map.get_sheet_name(name).unwrap_or(name);
-      println!("[+] Sheet protection removed: {}", display_name);
+      println!("[+] Sheet protection removed: {display_name}");
       true
     }
     b"workbookProtection" => {
