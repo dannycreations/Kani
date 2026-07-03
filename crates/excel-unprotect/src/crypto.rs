@@ -4,13 +4,13 @@ use std::{
 };
 
 use aes::{
-  cipher::{generic_array::GenericArray, typenum::U32, BlockDecrypt, KeyInit},
+  cipher::{typenum::U32, Array, BlockCipherDecrypt, KeyInit},
   Aes256,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cfb::CompoundFile;
-use quick_xml::{events::Event, reader::Reader};
+use quick_xml::{events::Event, reader::Reader, XmlVersion};
 use sha2::{Digest, Sha512};
 
 const BLOCK_KEY: [u8; 8] = [0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6];
@@ -54,7 +54,10 @@ impl AgileEncryptionInfo {
             b"keyData" => {
               for a in e.attributes().flatten() {
                 if a.key.local_name().as_ref() == b"saltValue" {
-                  let val = a.unescape_value()?;
+                  let val = a.decoded_and_normalized_value(
+                    XmlVersion::Implicit1_0,
+                    reader.decoder(),
+                  )?;
                   key_data_salt = Some(STANDARD.decode(val.as_bytes())?);
                 }
               }
@@ -63,23 +66,38 @@ impl AgileEncryptionInfo {
               for a in e.attributes().flatten() {
                 match a.key.local_name().as_ref() {
                   b"saltValue" => {
-                    let val = a.unescape_value()?;
+                    let val = a.decoded_and_normalized_value(
+                      XmlVersion::Implicit1_0,
+                      reader.decoder(),
+                    )?;
                     enc_key_salt = Some(STANDARD.decode(val.as_bytes())?);
                   }
                   b"spinCount" => {
-                    let val = a.unescape_value()?;
+                    let val = a.decoded_and_normalized_value(
+                      XmlVersion::Implicit1_0,
+                      reader.decoder(),
+                    )?;
                     spin_count = Some(val.parse()?);
                   }
                   b"keyBits" => {
-                    let val = a.unescape_value()?;
+                    let val = a.decoded_and_normalized_value(
+                      XmlVersion::Implicit1_0,
+                      reader.decoder(),
+                    )?;
                     key_bits = Some(val.parse()?);
                   }
                   b"hashAlgorithm" => {
-                    let val = a.unescape_value()?;
+                    let val = a.decoded_and_normalized_value(
+                      XmlVersion::Implicit1_0,
+                      reader.decoder(),
+                    )?;
                     alg_id = Some(val.into_owned());
                   }
                   b"encryptedKeyValue" => {
-                    let val = a.unescape_value()?;
+                    let val = a.decoded_and_normalized_value(
+                      XmlVersion::Implicit1_0,
+                      reader.decoder(),
+                    )?;
                     enc_key_value = Some(STANDARD.decode(val.as_bytes())?);
                   }
                   _ => {}
@@ -110,10 +128,7 @@ impl AgileEncryptionInfo {
     })
   }
 
-  fn derive_key(
-    &self,
-    password: &str,
-  ) -> Result<(GenericArray<u8, U32>, Vec<u8>)> {
+  fn derive_key(&self, password: &str) -> Result<(Array<u8, U32>, Vec<u8>)> {
     if self.spin_count > MAX_SPIN_COUNT {
       bail!("Spin count too high");
     }
@@ -147,17 +162,20 @@ impl AgileEncryptionInfo {
     let salt_len = self.enc_key_salt.len().min(16);
     iv[..salt_len].copy_from_slice(&self.enc_key_salt[..salt_len]);
 
-    let cipher = Aes256::new(GenericArray::from_slice(kek));
+    let key_array =
+      Array::try_from(kek).map_err(|e| anyhow!("Invalid key size: {e}"))?;
+    let cipher = Aes256::new(&key_array);
     let mut encrypted_key = self.encrypted_key_value.clone();
 
     if !encrypted_key.len().is_multiple_of(16) {
       bail!("Encrypted Key Value size not multiple of 16");
     }
 
-    let mut prev_block = *GenericArray::from_slice(&iv);
+    let mut prev_block = Array::from(iv);
 
     for block in encrypted_key.chunks_mut(16) {
-      let current_ciphertext = *GenericArray::from_slice(block);
+      let current_ciphertext = *<&Array<u8, _>>::try_from(&*block)
+        .map_err(|e| anyhow!("Invalid block size: {e}"))?;
       let mut state = current_ciphertext;
 
       cipher.decrypt_block(&mut state);
@@ -171,10 +189,9 @@ impl AgileEncryptionInfo {
     }
 
     let actual_key = &encrypted_key[0..32];
-    Ok((
-      GenericArray::clone_from_slice(actual_key),
-      self.key_data_salt.clone(),
-    ))
+    let actual_key_array = Array::try_from(actual_key)
+      .map_err(|e| anyhow!("Invalid actual key size: {e}"))?;
+    Ok((actual_key_array, self.key_data_salt.clone()))
   }
 }
 
@@ -245,14 +262,16 @@ where
       iv_hasher.update(block_idx.to_le_bytes());
       let iv_hash = iv_hasher.finalize();
 
-      let mut prev_block = *GenericArray::from_slice(&iv_hash[0..16]);
+      let mut prev_block = *<&Array<u8, _>>::try_from(&iv_hash[0..16])
+        .map_err(|e| anyhow!("Invalid IV block size: {e}"))?;
 
       for block in segment.chunks_mut(16) {
         if block.len() < 16 {
           break;
         }
 
-        let current_ciphertext = *GenericArray::from_slice(block);
+        let current_ciphertext = *<&Array<u8, _>>::try_from(&*block)
+          .map_err(|e| anyhow!("Invalid block size: {e}"))?;
         let mut state = current_ciphertext;
 
         cipher.decrypt_block(&mut state);

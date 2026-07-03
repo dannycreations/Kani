@@ -10,17 +10,17 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-aes = "0.8.4"
+aes = "0.9.1"
 anyhow.workspace = true
 base64 = "0.22.1"
-cfb = "0.12.1"
+cfb = "0.14.0"
 clap = { workspace = true, features = ["derive"] }
 ctrlc.workspace = true
-quick-xml = "0.39.0"
-sha2 = "0.10.9"
+quick-xml = "0.41.0"
+sha2 = "0.11.0"
 tempfile.workspace = true
 thiserror.workspace = true
-zip = "7.1.0"
+zip = "8.6.0"
 
 [dev-dependencies]
 assert_cmd.workspace = true

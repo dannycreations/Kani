@@ -8,9 +8,9 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-image = "0.25.9"
+image = "0.25.10"
 indicatif = { workspace = true, features = ["rayon"] }
-oxipng = "10.0.0"
+oxipng = "10.1.1"
 rayon.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true

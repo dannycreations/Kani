@@ -10,6 +10,7 @@ use quick_xml::{
   events::{BytesStart, Event},
   reader::Reader,
   writer::Writer,
+  XmlVersion,
 };
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
@@ -26,62 +27,100 @@ impl WorkbookMap {
     let mut rid_to_name = HashMap::new();
     let mut sheet_map = HashMap::new();
 
-    let mut read_xml = |name: &str, on_start: &mut dyn FnMut(&BytesStart)| {
-      if let Ok(file) = archive.by_name(name) {
-        let mut reader = Reader::from_reader(BufReader::new(file));
-        reader.config_mut().trim_text(true);
-        let mut buf = Vec::new();
-        loop {
-          match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => on_start(e),
-            Ok(Event::Eof) => break,
-            _ => {}
-          }
-          buf.clear();
-        }
-      }
-    };
-
-    read_xml("xl/workbook.xml", &mut |e| {
-      if e.local_name().as_ref() == b"sheet" {
-        let (mut name, mut rid) = (None, None);
-        for a in e.attributes().flatten() {
-          match a.key.local_name().as_ref() {
-            b"name" => name = a.unescape_value().ok().map(|v| v.into_owned()),
-            b"id" => rid = a.unescape_value().ok().map(|v| v.into_owned()),
-            _ => {}
-          }
-        }
-        if let (Some(n), Some(r)) = (name, rid) {
-          rid_to_name.insert(r, n);
-        }
-      }
-    });
-
-    read_xml("xl/_rels/workbook.xml.rels", &mut |e| {
-      if e.local_name().as_ref() == b"Relationship" {
-        let (mut id, mut target) = (None, None);
-        for a in e.attributes().flatten() {
-          match a.key.local_name().as_ref() {
-            b"Id" => id = a.unescape_value().ok().map(|v| v.into_owned()),
-            b"Target" => {
-              target = a.unescape_value().ok().map(|v| v.into_owned())
+    if let Ok(file) = archive.by_name("xl/workbook.xml") {
+      let mut reader = Reader::from_reader(BufReader::new(file));
+      reader.config_mut().trim_text(true);
+      let mut buf = Vec::new();
+      loop {
+        match reader.read_event_into(&mut buf) {
+          Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            if e.local_name().as_ref() == b"sheet" {
+              let (mut name, mut rid) = (None, None);
+              for a in e.attributes().flatten() {
+                match a.key.local_name().as_ref() {
+                  b"name" => {
+                    name = a
+                      .decoded_and_normalized_value(
+                        XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                      )
+                      .ok()
+                      .map(|v| v.into_owned());
+                  }
+                  b"id" => {
+                    rid = a
+                      .decoded_and_normalized_value(
+                        XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                      )
+                      .ok()
+                      .map(|v| v.into_owned());
+                  }
+                  _ => {}
+                }
+              }
+              if let (Some(n), Some(r)) = (name, rid) {
+                rid_to_name.insert(r, n);
+              }
             }
-            _ => {}
           }
+          Ok(Event::Eof) => break,
+          _ => {}
         }
-        if let (Some(id), Some(target)) = (id, target) {
-          if let Some(name) = rid_to_name.get(&id) {
-            let path = if target.starts_with('/') {
-              target.trim_start_matches('/').to_string()
-            } else {
-              format!("xl/{}", target)
-            };
-            sheet_map.insert(path, name.clone());
-          }
-        }
+        buf.clear();
       }
-    });
+    }
+
+    if let Ok(file) = archive.by_name("xl/_rels/workbook.xml.rels") {
+      let mut reader = Reader::from_reader(BufReader::new(file));
+      reader.config_mut().trim_text(true);
+      let mut buf = Vec::new();
+      loop {
+        match reader.read_event_into(&mut buf) {
+          Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+            if e.local_name().as_ref() == b"Relationship" {
+              let (mut id, mut target) = (None, None);
+              for a in e.attributes().flatten() {
+                match a.key.local_name().as_ref() {
+                  b"Id" => {
+                    id = a
+                      .decoded_and_normalized_value(
+                        XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                      )
+                      .ok()
+                      .map(|v| v.into_owned());
+                  }
+                  b"Target" => {
+                    target = a
+                      .decoded_and_normalized_value(
+                        XmlVersion::Implicit1_0,
+                        reader.decoder(),
+                      )
+                      .ok()
+                      .map(|v| v.into_owned());
+                  }
+                  _ => {}
+                }
+              }
+              if let (Some(id), Some(target)) = (id, target) {
+                if let Some(name) = rid_to_name.get(&id) {
+                  let path = if target.starts_with('/') {
+                    target.trim_start_matches('/').to_string()
+                  } else {
+                    format!("xl/{}", target)
+                  };
+                  sheet_map.insert(path, name.clone());
+                }
+              }
+            }
+          }
+          Ok(Event::Eof) => break,
+          _ => {}
+        }
+        buf.clear();
+      }
+    }
 
     Self { sheet_map }
   }
