@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/excel-unprotect", "crates/image-transformer"]
+members = [
+    "crates/excel-unprotect",
+    "crates/image-transformer",
+    "crates/vol-level-lock",
+  ]
 
 [workspace.package]
 authors = ["dannycreations"]
