@@ -43,77 +43,71 @@ impl Config {
     let mut output_paused = None;
     let mut is_corrupted = false;
 
-    for line in content.lines() {
-      let line = line.trim();
-      if line.is_empty() {
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+      let Some((key, val)) = line.split_once('=') else {
+        is_corrupted = true;
         continue;
-      }
-      let parts: Vec<&str> = line.split('=').collect();
-      if parts.len() == 2 {
-        let key = parts[0].trim();
-        let val = parts[1].trim();
-        match key {
-          "input_target" => {
-            if let Ok(v) = val.parse::<u32>() {
-              if (1..=100).contains(&v) {
-                input_target = Some(v);
-              } else {
-                is_corrupted = true;
-              }
-            } else {
-              is_corrupted = true;
-            }
-          }
-          "output_target" => {
-            if let Ok(v) = val.parse::<u32>() {
-              if (1..=100).contains(&v) {
-                output_target = Some(v);
-              } else {
-                is_corrupted = true;
-              }
-            } else {
-              is_corrupted = true;
-            }
-          }
-          "input_paused" => {
-            if let Ok(v) = val.parse::<bool>() {
-              input_paused = Some(v);
-            } else {
-              is_corrupted = true;
-            }
-          }
-          "output_paused" => {
-            if let Ok(v) = val.parse::<bool>() {
-              output_paused = Some(v);
-            } else {
-              is_corrupted = true;
-            }
-          }
-          _ => {
+      };
+      let key = key.trim();
+      let val = val.trim();
+
+      match key {
+        "input_target" => {
+          if let Some(v) =
+            val.parse::<u32>().ok().filter(|&v| (1..=100).contains(&v))
+          {
+            input_target = Some(v);
+          } else {
             is_corrupted = true;
           }
         }
-      } else {
-        is_corrupted = true;
+        "output_target" => {
+          if let Some(v) =
+            val.parse::<u32>().ok().filter(|&v| (1..=100).contains(&v))
+          {
+            output_target = Some(v);
+          } else {
+            is_corrupted = true;
+          }
+        }
+        "input_paused" => {
+          if let Ok(v) = val.parse::<bool>() {
+            input_paused = Some(v);
+          } else {
+            is_corrupted = true;
+          }
+        }
+        "output_paused" => {
+          if let Ok(v) = val.parse::<bool>() {
+            output_paused = Some(v);
+          } else {
+            is_corrupted = true;
+          }
+        }
+        _ => {
+          is_corrupted = true;
+        }
       }
     }
 
-    if is_corrupted
-      || input_target.is_none()
-      || output_target.is_none()
-      || input_paused.is_none()
-      || output_paused.is_none()
-    {
-      let _ = fs::remove_file(path);
-      let _ = default_config.save_to_path(path);
-      Ok(default_config)
-    } else {
-      Ok(Self {
-        input_target: input_target.unwrap_or(100),
-        output_target: output_target.unwrap_or(100),
-        input_paused: input_paused.unwrap_or(false),
-        output_paused: output_paused.unwrap_or(false),
-      })
+    match (
+      is_corrupted,
+      input_target,
+      output_target,
+      input_paused,
+      output_paused,
+    ) {
+      (false, Some(in_t), Some(out_t), Some(in_p), Some(out_p)) => Ok(Self {
+        input_target: in_t,
+        output_target: out_t,
+        input_paused: in_p,
+        output_paused: out_p,
+      }),
+      _ => {
+        let _ = fs::remove_file(path);
+        let _ = default_config.save_to_path(path);
+        Ok(default_config)
+      }
     }
   }
 

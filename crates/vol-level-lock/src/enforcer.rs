@@ -42,6 +42,7 @@ pub struct AudioEnforcer {
   enabled: bool,
   context_guid: GUID,
   event_tx: Sender<EnforcerEvent>,
+  main_thread_id: u32,
 }
 
 struct AudioBinding {
@@ -49,11 +50,26 @@ struct AudioBinding {
   callback: IAudioEndpointVolumeCallback,
 }
 
+impl Drop for AudioBinding {
+  fn drop(&mut self) {
+    unsafe {
+      let _ = self.endpoint.UnregisterControlChangeNotify(&self.callback);
+    }
+  }
+}
+
+impl Drop for AudioEnforcer {
+  fn drop(&mut self) {
+    let _ = self.disable();
+  }
+}
+
 impl AudioEnforcer {
   pub fn new(
     flow: AudioFlow,
     target: Arc<AtomicU32>,
     event_tx: Sender<EnforcerEvent>,
+    main_thread_id: u32,
   ) -> Result<Self> {
     let enumerator: IMMDeviceEnumerator = unsafe {
       CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)?
@@ -68,6 +84,7 @@ impl AudioEnforcer {
       enabled: false,
       context_guid,
       event_tx,
+      main_thread_id,
     })
   }
 
@@ -77,8 +94,11 @@ impl AudioEnforcer {
     }
 
     // Setup device notification client to detect default device changes
-    let client =
-      DeviceNotificationClient::new(self.flow, self.event_tx.clone());
+    let client = DeviceNotificationClient::new(
+      self.flow,
+      self.event_tx.clone(),
+      self.main_thread_id,
+    );
     let client_interface: IMMNotificationClient = client.into();
     unsafe {
       self
@@ -111,39 +131,38 @@ impl AudioEnforcer {
     }
     self.notification_client = None;
 
-    // Clear all bindings
-    for (_, binding) in self.bindings_and_roles.drain(..) {
-      unsafe {
-        let _ = binding
-          .endpoint
-          .UnregisterControlChangeNotify(&binding.callback);
-      }
-    }
+    // Clear all bindings (will trigger Drop for each AudioBinding)
+    self.bindings_and_roles.clear();
 
     self.enabled = false;
     Ok(())
   }
 
+  fn flow_to_win_flow(
+    flow: AudioFlow,
+  ) -> windows::Win32::Media::Audio::EDataFlow {
+    match flow {
+      AudioFlow::Input => eCapture,
+      AudioFlow::Output => eRender,
+    }
+  }
+
+  fn target_to_scalar(target: &AtomicU32) -> f32 {
+    (target.load(Ordering::SeqCst) as f32 / 100.0).clamp(0.0, 1.0)
+  }
+
   pub fn bind_role(&mut self, role: ERole) -> Result<()> {
-    // Remove existing binding if any
+    // Remove existing binding if any (triggers Drop)
     if let Some(pos) = self
       .bindings_and_roles
       .iter()
       .position(|(r, _)| r.0 == role.0)
     {
-      let (_, binding) = self.bindings_and_roles.remove(pos);
-      unsafe {
-        let _ = binding
-          .endpoint
-          .UnregisterControlChangeNotify(&binding.callback);
-      }
+      self.bindings_and_roles.remove(pos);
     }
 
     unsafe {
-      let win_flow = match self.flow {
-        AudioFlow::Input => eCapture,
-        AudioFlow::Output => eRender,
-      };
+      let win_flow = Self::flow_to_win_flow(self.flow);
       let default_device =
         self.enumerator.GetDefaultAudioEndpoint(win_flow, role)?;
 
@@ -173,8 +192,7 @@ impl AudioEnforcer {
   }
 
   pub fn force_to_target(&self) {
-    let val = self.target.load(Ordering::SeqCst) as f32 / 100.0;
-    let val = val.clamp(0.0, 1.0);
+    let val = Self::target_to_scalar(&self.target);
     for (_, binding) in &self.bindings_and_roles {
       unsafe {
         let _ = binding
@@ -220,8 +238,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
       return Ok(());
     }
 
-    let target_val = self.target.load(Ordering::SeqCst) as f32 / 100.0;
-    let target_val = target_val.clamp(0.0, 1.0);
+    let target_val = AudioEnforcer::target_to_scalar(&self.target);
 
     if (data.fMasterVolume - target_val).abs() > 0.005 {
       unsafe {
@@ -239,11 +256,20 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
 struct DeviceNotificationClient {
   flow: AudioFlow,
   event_tx: Sender<EnforcerEvent>,
+  main_thread_id: u32,
 }
 
 impl DeviceNotificationClient {
-  fn new(flow: AudioFlow, event_tx: Sender<EnforcerEvent>) -> Self {
-    Self { flow, event_tx }
+  fn new(
+    flow: AudioFlow,
+    event_tx: Sender<EnforcerEvent>,
+    main_thread_id: u32,
+  ) -> Self {
+    Self {
+      flow,
+      event_tx,
+      main_thread_id,
+    }
   }
 }
 
@@ -273,14 +299,19 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     role: ERole,
     _default_device_id_ptr: &PCWSTR,
   ) -> windows_core::Result<()> {
-    let target_flow = match self.flow {
-      AudioFlow::Input => eCapture,
-      AudioFlow::Output => eRender,
-    };
+    let target_flow = AudioEnforcer::flow_to_win_flow(self.flow);
     if flow == target_flow {
       let _ = self
         .event_tx
         .send(EnforcerEvent::RebindRole(self.flow, role));
+      unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+          self.main_thread_id,
+          crate::WM_WAKEUP,
+          windows::Win32::Foundation::WPARAM(0),
+          windows::Win32::Foundation::LPARAM(0),
+        );
+      }
     }
     Ok(())
   }

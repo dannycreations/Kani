@@ -5,6 +5,7 @@ mod enforcer;
 mod instance;
 mod registry;
 mod tray;
+mod utils;
 
 use std::{
   sync::{
@@ -36,9 +37,11 @@ use windows::{
   Win32::System::ProcessStatus::EmptyWorkingSet,
   Win32::System::Threading::GetCurrentProcess,
   Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PostThreadMessageW, MSG, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, MSG, WM_QUIT,
   },
 };
+
+pub const WM_WAKEUP: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
 
 /// Lock default input and output volumes at fixed target levels.
 #[derive(Parser, Debug)]
@@ -152,6 +155,7 @@ fn run_enforcer(config: Config) -> Result<()> {
     config.input_paused,
     config.output_target,
     config.output_paused,
+    main_thread_id,
   )?;
 
   // Setup CTRL-C handler to exit cleanly
@@ -181,11 +185,13 @@ fn run_enforcer(config: Config) -> Result<()> {
     AudioFlow::Input,
     input_target.clone(),
     event_tx.clone(),
+    main_thread_id,
   )?;
   let mut output_enforcer = AudioEnforcer::new(
     AudioFlow::Output,
     output_target.clone(),
     event_tx.clone(),
+    main_thread_id,
   )?;
 
   if !config.input_paused {
@@ -205,181 +211,193 @@ fn run_enforcer(config: Config) -> Result<()> {
   let output_paused_clone = output_paused.clone();
   let event_tx_clone = event_tx.clone();
   thread::spawn(move || {
+    let mut last_modified = None;
     let mut last_input_target = input_target_clone.load(Ordering::SeqCst);
     let mut last_output_target = output_target_clone.load(Ordering::SeqCst);
     let mut last_input_paused = input_paused_clone.load(Ordering::SeqCst);
     let mut last_output_paused = output_paused_clone.load(Ordering::SeqCst);
+    let config_path = Config::get_path().ok();
+
     loop {
       thread::sleep(Duration::from_millis(1500));
-      if let Ok(cfg) = Config::load() {
-        if cfg.input_target != last_input_target
-          || cfg.output_target != last_output_target
-          || cfg.input_paused != last_input_paused
-          || cfg.output_paused != last_output_paused
-        {
-          last_input_target = cfg.input_target;
-          last_output_target = cfg.output_target;
-          last_input_paused = cfg.input_paused;
-          last_output_paused = cfg.output_paused;
+      if let Some(ref path) = config_path {
+        let current_modified =
+          std::fs::metadata(path).and_then(|m| m.modified()).ok();
 
-          input_target_clone.store(cfg.input_target, Ordering::SeqCst);
-          output_target_clone.store(cfg.output_target, Ordering::SeqCst);
-          input_paused_clone.store(cfg.input_paused, Ordering::SeqCst);
-          output_paused_clone.store(cfg.output_paused, Ordering::SeqCst);
+        if current_modified.is_none() || current_modified != last_modified {
+          last_modified = current_modified;
+          if let Ok(cfg) = Config::load() {
+            if cfg.input_target != last_input_target
+              || cfg.output_target != last_output_target
+              || cfg.input_paused != last_input_paused
+              || cfg.output_paused != last_output_paused
+            {
+              last_input_target = cfg.input_target;
+              last_output_target = cfg.output_target;
+              last_input_paused = cfg.input_paused;
+              last_output_paused = cfg.output_paused;
 
-          let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
+              input_target_clone.store(cfg.input_target, Ordering::SeqCst);
+              output_target_clone.store(cfg.output_target, Ordering::SeqCst);
+              input_paused_clone.store(cfg.input_paused, Ordering::SeqCst);
+              output_paused_clone.store(cfg.output_paused, Ordering::SeqCst);
+
+              let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
+              unsafe {
+                let _ = PostThreadMessageW(
+                  main_thread_id,
+                  WM_WAKEUP,
+                  WPARAM(0),
+                  LPARAM(0),
+                );
+              }
+            }
+          }
         }
       }
     }
   });
 
-  unsafe {
-    let mut msg = MSG::default();
-    let mut exit_loop = false;
-    while !exit_loop {
-      // 1. Process all pending queue events (volume watcher updates, default device modifications)
-      while let Ok(event) = event_rx.try_recv() {
-        match event {
-          EnforcerEvent::RebindRole(flow, role) => match flow {
-            AudioFlow::Input => {
-              if !input_paused.load(Ordering::SeqCst) {
-                let _ = input_enforcer.bind_role(role);
-                input_enforcer.force_to_target();
-              }
-            }
-            AudioFlow::Output => {
-              if !output_paused.load(Ordering::SeqCst) {
-                let _ = output_enforcer.bind_role(role);
-                output_enforcer.force_to_target();
-              }
-            }
-          },
-          EnforcerEvent::VolumeFileChanged => {
-            let in_paused = input_paused.load(Ordering::SeqCst);
-            let out_paused = output_paused.load(Ordering::SeqCst);
-
-            if in_paused {
-              let _ = input_enforcer.disable();
-            } else {
-              let _ = input_enforcer.enable();
+  let mut msg = MSG::default();
+  let mut exit_loop = false;
+  while !exit_loop {
+    // 1. Process all pending queue events (volume watcher updates, default device modifications)
+    while let Ok(event) = event_rx.try_recv() {
+      match event {
+        EnforcerEvent::RebindRole(flow, role) => match flow {
+          AudioFlow::Input => {
+            if !input_paused.load(Ordering::SeqCst) {
+              let _ = input_enforcer.bind_role(role);
               input_enforcer.force_to_target();
             }
-
-            if out_paused {
-              let _ = output_enforcer.disable();
-            } else {
-              let _ = output_enforcer.enable();
+          }
+          AudioFlow::Output => {
+            if !output_paused.load(Ordering::SeqCst) {
+              let _ = output_enforcer.bind_role(role);
               output_enforcer.force_to_target();
             }
-
-            tray_app.update_toggle_input_text(in_paused);
-            tray_app.update_toggle_output_text(out_paused);
-            let _ = tray_app.update_icon(in_paused, out_paused);
-            tray_app.update_tooltip(
-              input_target.load(Ordering::SeqCst),
-              in_paused,
-              output_target.load(Ordering::SeqCst),
-              out_paused,
-            );
           }
+        },
+        EnforcerEvent::VolumeFileChanged => {
+          let in_paused = input_paused.load(Ordering::SeqCst);
+          let out_paused = output_paused.load(Ordering::SeqCst);
+
+          if in_paused {
+            let _ = input_enforcer.disable();
+          } else {
+            let _ = input_enforcer.enable();
+            input_enforcer.force_to_target();
+          }
+
+          if out_paused {
+            let _ = output_enforcer.disable();
+          } else {
+            let _ = output_enforcer.enable();
+            output_enforcer.force_to_target();
+          }
+
+          tray_app.update_toggle_input_text(in_paused);
+          tray_app.update_toggle_output_text(out_paused);
+          let _ = tray_app.update_icon(in_paused, out_paused);
+          tray_app.update_tooltip(
+            input_target.load(Ordering::SeqCst),
+            in_paused,
+            output_target.load(Ordering::SeqCst),
+            out_paused,
+          );
         }
       }
+    }
 
-      // 2. Process pending tray interaction events
-      while let Some(action) = tray_app.handle_events() {
-        match action {
-          TrayAction::ToggleInput => {
-            let currently_paused = input_paused.load(Ordering::SeqCst);
-            let next_paused = !currently_paused;
-            input_paused.store(next_paused, Ordering::SeqCst);
-            if next_paused {
-              let _ = input_enforcer.disable();
-            } else {
-              let _ = input_enforcer.enable();
-              input_enforcer.force_to_target();
-            }
-            tray_app.update_toggle_input_text(next_paused);
-            let _ = tray_app
-              .update_icon(next_paused, output_paused.load(Ordering::SeqCst));
-            tray_app.update_tooltip(
-              input_target.load(Ordering::SeqCst),
-              next_paused,
-              output_target.load(Ordering::SeqCst),
-              output_paused.load(Ordering::SeqCst),
-            );
-            if let Ok(mut cfg) = Config::load() {
-              cfg.input_paused = next_paused;
-              let _ = cfg.save();
-            }
+    // 2. Process pending tray interaction events
+    while let Some(action) = tray_app.handle_events() {
+      match action {
+        TrayAction::ToggleInput => {
+          let currently_paused = input_paused.load(Ordering::SeqCst);
+          let next_paused = !currently_paused;
+          input_paused.store(next_paused, Ordering::SeqCst);
+          if next_paused {
+            let _ = input_enforcer.disable();
+          } else {
+            let _ = input_enforcer.enable();
+            input_enforcer.force_to_target();
           }
-          TrayAction::ToggleOutput => {
-            let currently_paused = output_paused.load(Ordering::SeqCst);
-            let next_paused = !currently_paused;
-            output_paused.store(next_paused, Ordering::SeqCst);
-            if next_paused {
-              let _ = output_enforcer.disable();
-            } else {
-              let _ = output_enforcer.enable();
-              output_enforcer.force_to_target();
-            }
-            tray_app.update_toggle_output_text(next_paused);
-            let _ = tray_app
-              .update_icon(input_paused.load(Ordering::SeqCst), next_paused);
-            tray_app.update_tooltip(
-              input_target.load(Ordering::SeqCst),
-              input_paused.load(Ordering::SeqCst),
-              output_target.load(Ordering::SeqCst),
-              next_paused,
-            );
-            if let Ok(mut cfg) = Config::load() {
-              cfg.output_paused = next_paused;
-              let _ = cfg.save();
-            }
-          }
-          TrayAction::PromptSetTarget => {
-            if let Ok(path) = Config::get_path() {
-              if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-              }
-              if !path.exists() {
-                let _ = std::fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
-              }
-              let _ =
-                std::process::Command::new("notepad.exe").arg(&path).spawn();
-            }
-          }
-          TrayAction::ToggleAutorun => {
-            if is_autorun_registered() {
-              let _ = deregister_autorun();
-            } else {
-              let _ = register_autorun();
-            }
-            tray_app.refresh_autorun_menu();
-          }
-          TrayAction::Exit => {
-            exit_loop = true;
+          tray_app.update_toggle_input_text(next_paused);
+          let _ = tray_app
+            .update_icon(next_paused, output_paused.load(Ordering::SeqCst));
+          tray_app.update_tooltip(
+            input_target.load(Ordering::SeqCst),
+            next_paused,
+            output_target.load(Ordering::SeqCst),
+            output_paused.load(Ordering::SeqCst),
+          );
+          if let Ok(mut cfg) = Config::load() {
+            cfg.input_paused = next_paused;
+            let _ = cfg.save();
           }
         }
-      }
-
-      // 3. Process Windows window messages in a non-blocking check
-      while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
-        &mut msg,
-        None,
-        0,
-        0,
-        windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
-      )
-      .as_bool()
-      {
-        if msg.message == WM_QUIT {
+        TrayAction::ToggleOutput => {
+          let currently_paused = output_paused.load(Ordering::SeqCst);
+          let next_paused = !currently_paused;
+          output_paused.store(next_paused, Ordering::SeqCst);
+          if next_paused {
+            let _ = output_enforcer.disable();
+          } else {
+            let _ = output_enforcer.enable();
+            output_enforcer.force_to_target();
+          }
+          tray_app.update_toggle_output_text(next_paused);
+          let _ = tray_app
+            .update_icon(input_paused.load(Ordering::SeqCst), next_paused);
+          tray_app.update_tooltip(
+            input_target.load(Ordering::SeqCst),
+            input_paused.load(Ordering::SeqCst),
+            output_target.load(Ordering::SeqCst),
+            next_paused,
+          );
+          if let Ok(mut cfg) = Config::load() {
+            cfg.output_paused = next_paused;
+            let _ = cfg.save();
+          }
+        }
+        TrayAction::PromptSetTarget => {
+          if let Ok(path) = Config::get_path() {
+            if let Some(parent) = path.parent() {
+              let _ = std::fs::create_dir_all(parent);
+            }
+            if !path.exists() {
+              let _ = std::fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
+            }
+            let _ =
+              std::process::Command::new("notepad.exe").arg(&path).spawn();
+          }
+        }
+        TrayAction::ToggleAutorun => {
+          if is_autorun_registered() {
+            let _ = deregister_autorun();
+          } else {
+            let _ = register_autorun();
+          }
+          tray_app.refresh_autorun_menu();
+        }
+        TrayAction::Exit => {
           exit_loop = true;
+        }
+      }
+    }
+
+    if exit_loop {
+      break;
+    }
+
+    // 3. Block until a message is received
+    unsafe {
+      if GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        if msg.message == WM_QUIT {
           break;
         }
         let _ = DispatchMessageW(&msg);
       }
-
-      thread::sleep(Duration::from_millis(10));
     }
   }
 

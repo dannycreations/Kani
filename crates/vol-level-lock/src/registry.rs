@@ -12,12 +12,15 @@ use windows_core::PCWSTR;
 const REG_RUN_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const REG_VALUE_NAME: &str = "VolLevelLock";
 
+use crate::utils::to_wide;
+
 pub fn register_autorun() -> Result<()> {
   let executable_path = env::current_exe()?;
   let command_line =
     format!("\"{}\" --hidden", executable_path.to_string_lossy());
-  let mut subkey_utf16: Vec<u16> = REG_RUN_PATH.encode_utf16().collect();
-  subkey_utf16.push(0);
+  let subkey_utf16 = to_wide(REG_RUN_PATH);
+  let value_name_utf16 = to_wide(REG_VALUE_NAME);
+  let command_utf16 = to_wide(&command_line);
 
   unsafe {
     let mut key_handle = windows::Win32::System::Registry::HKEY::default();
@@ -37,11 +40,6 @@ pub fn register_autorun() -> Result<()> {
       return Err(anyhow!("Failed to create/open registry key for autorun"));
     }
 
-    let mut value_name_utf16: Vec<u16> =
-      REG_VALUE_NAME.encode_utf16().collect();
-    value_name_utf16.push(0);
-
-    let command_utf16: Vec<u16> = command_line.encode_utf16().collect();
     let status_val = RegSetValueExW(
       key_handle,
       PCWSTR(value_name_utf16.as_ptr()),
@@ -61,7 +59,7 @@ pub fn register_autorun() -> Result<()> {
   }
 
   // Also attempt to start the command in the background
-  let child_path = executable_path.clone();
+  let child_path = executable_path;
   let _ = thread::spawn(move || {
     let _ = std::process::Command::new(child_path)
       .arg("--hidden")
@@ -72,8 +70,8 @@ pub fn register_autorun() -> Result<()> {
 }
 
 pub fn deregister_autorun() -> Result<()> {
-  let mut subkey_utf16: Vec<u16> = REG_RUN_PATH.encode_utf16().collect();
-  subkey_utf16.push(0);
+  let subkey_utf16 = to_wide(REG_RUN_PATH);
+  let value_name_utf16 = to_wide(REG_VALUE_NAME);
 
   unsafe {
     let mut key_handle = windows::Win32::System::Registry::HKEY::default();
@@ -89,10 +87,6 @@ pub fn deregister_autorun() -> Result<()> {
       return Ok(()); // Key doesn't exist, we are good
     }
 
-    let mut value_name_utf16: Vec<u16> =
-      REG_VALUE_NAME.encode_utf16().collect();
-    value_name_utf16.push(0);
-
     let _ = RegDeleteValueW(key_handle, PCWSTR(value_name_utf16.as_ptr()));
     let _ = windows::Win32::System::Registry::RegCloseKey(key_handle);
   }
@@ -101,8 +95,8 @@ pub fn deregister_autorun() -> Result<()> {
 }
 
 pub fn is_autorun_registered() -> bool {
-  let mut subkey_utf16: Vec<u16> = REG_RUN_PATH.encode_utf16().collect();
-  subkey_utf16.push(0);
+  let subkey_utf16 = to_wide(REG_RUN_PATH);
+  let value_name_utf16 = to_wide(REG_VALUE_NAME);
 
   unsafe {
     let mut key_handle = windows::Win32::System::Registry::HKEY::default();
@@ -117,10 +111,6 @@ pub fn is_autorun_registered() -> bool {
     if status.is_err() {
       return false;
     }
-
-    let mut value_name_utf16: Vec<u16> =
-      REG_VALUE_NAME.encode_utf16().collect();
-    value_name_utf16.push(0);
 
     let mut value_type = REG_VALUE_TYPE::default();
     let mut data_len = 0u32;

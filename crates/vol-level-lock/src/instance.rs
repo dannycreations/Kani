@@ -11,6 +11,8 @@ use windows::Win32::{
 };
 use windows_core::PCWSTR;
 
+use crate::utils::to_wide;
+
 const MUTEX_PREFIX: &str = "Local\\VolLevelLock-";
 
 pub struct InstanceGuard(pub HANDLE);
@@ -28,8 +30,7 @@ pub fn acquire_single_instance_guard() -> Result<Option<InstanceGuard>> {
   let username =
     env::var("USERNAME").unwrap_or_else(|_| "UnknownUser".to_string());
   let mutex_name = format!("{}{}", MUTEX_PREFIX, username);
-  let mut mutex_name_utf16: Vec<u16> = mutex_name.encode_utf16().collect();
-  mutex_name_utf16.push(0);
+  let mutex_name_utf16 = to_wide(&mutex_name);
 
   unsafe {
     // Try opening first to see if it already exists
