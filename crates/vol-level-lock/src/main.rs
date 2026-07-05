@@ -20,7 +20,7 @@ use anyhow::Result;
 use clap::Parser;
 use config::Config;
 #[cfg(windows)]
-use enforcer::{AudioEnforcer, EnforcerEvent};
+use enforcer::{AudioEnforcer, AudioFlow, EnforcerEvent};
 #[cfg(windows)]
 use instance::acquire_single_instance_guard;
 #[cfg(windows)]
@@ -40,13 +40,24 @@ use windows::{
   },
 };
 
-/// Lock default volume at a fixed target level.
+/// Lock default input and output volumes at fixed target levels.
 #[derive(Parser, Debug)]
-#[command(name = "vol-level-lock", about = "Locks volume level")]
+#[command(
+  name = "vol-level-lock",
+  about = "Locks input and output volume levels"
+)]
 struct Args {
-  /// Level to lock the volume at (1-100)
+  /// Level to lock both input and output volume at (1-100)
   #[arg(short, long)]
   level: Option<u32>,
+
+  /// Level to lock input volume at (1-100)
+  #[arg(short = 'i', long)]
+  input_level: Option<u32>,
+
+  /// Level to lock output volume at (1-100)
+  #[arg(short = 'o', long)]
+  output_level: Option<u32>,
 
   /// Install application to autorun registry
   #[arg(long)]
@@ -91,7 +102,18 @@ fn proceed(args: Args) -> Result<()> {
   let mut config = Config::load()?;
 
   if let Some(target) = args.level {
-    config.target_percent = target.clamp(1, 100);
+    config.input_target = target.clamp(1, 100);
+    config.output_target = target.clamp(1, 100);
+    config.save()?;
+  }
+
+  if let Some(target) = args.input_level {
+    config.input_target = target.clamp(1, 100);
+    config.save()?;
+  }
+
+  if let Some(target) = args.output_level {
+    config.output_target = target.clamp(1, 100);
     config.save()?;
   }
 
@@ -117,13 +139,20 @@ fn run_enforcer(config: Config) -> Result<()> {
     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
   }
 
-  let target_percent = Arc::new(AtomicU32::new(config.target_percent));
-  let is_paused = Arc::new(AtomicBool::new(false));
+  let input_target = Arc::new(AtomicU32::new(config.input_target));
+  let output_target = Arc::new(AtomicU32::new(config.output_target));
+  let input_paused = Arc::new(AtomicBool::new(config.input_paused));
+  let output_paused = Arc::new(AtomicBool::new(config.output_paused));
   let main_thread_id =
     unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
 
   // Setup System Tray icon
-  let tray_app = TrayApp::new(config.target_percent, false)?;
+  let tray_app = TrayApp::new(
+    config.input_target,
+    config.input_paused,
+    config.output_target,
+    config.output_paused,
+  )?;
 
   // Setup CTRL-C handler to exit cleanly
   let main_thread_id_clone = main_thread_id;
@@ -147,24 +176,57 @@ fn run_enforcer(config: Config) -> Result<()> {
 
   let (event_tx, event_rx) = channel::<EnforcerEvent>();
 
-  // Enforcer Core state
-  let target_percent_clone = target_percent.clone();
-  let mut enforcer =
-    AudioEnforcer::new(target_percent_clone, event_tx.clone())?;
-  enforcer.enable()?;
-  enforcer.force_to_target();
+  // Enforcer Core states
+  let mut input_enforcer = AudioEnforcer::new(
+    AudioFlow::Input,
+    input_target.clone(),
+    event_tx.clone(),
+  )?;
+  let mut output_enforcer = AudioEnforcer::new(
+    AudioFlow::Output,
+    output_target.clone(),
+    event_tx.clone(),
+  )?;
+
+  if !config.input_paused {
+    input_enforcer.enable()?;
+    input_enforcer.force_to_target();
+  }
+
+  if !config.output_paused {
+    output_enforcer.enable()?;
+    output_enforcer.force_to_target();
+  }
 
   // Spawn config file monitor to update target volume dynamically if config.txt changes
-  let target_percent_clone2 = target_percent.clone();
+  let input_target_clone = input_target.clone();
+  let output_target_clone = output_target.clone();
+  let input_paused_clone = input_paused.clone();
+  let output_paused_clone = output_paused.clone();
   let event_tx_clone = event_tx.clone();
   thread::spawn(move || {
-    let mut last_percent = target_percent_clone2.load(Ordering::SeqCst);
+    let mut last_input_target = input_target_clone.load(Ordering::SeqCst);
+    let mut last_output_target = output_target_clone.load(Ordering::SeqCst);
+    let mut last_input_paused = input_paused_clone.load(Ordering::SeqCst);
+    let mut last_output_paused = output_paused_clone.load(Ordering::SeqCst);
     loop {
       thread::sleep(Duration::from_millis(1500));
       if let Ok(cfg) = Config::load() {
-        if cfg.target_percent != last_percent {
-          last_percent = cfg.target_percent;
-          target_percent_clone2.store(last_percent, Ordering::SeqCst);
+        if cfg.input_target != last_input_target
+          || cfg.output_target != last_output_target
+          || cfg.input_paused != last_input_paused
+          || cfg.output_paused != last_output_paused
+        {
+          last_input_target = cfg.input_target;
+          last_output_target = cfg.output_target;
+          last_input_paused = cfg.input_paused;
+          last_output_paused = cfg.output_paused;
+
+          input_target_clone.store(cfg.input_target, Ordering::SeqCst);
+          output_target_clone.store(cfg.output_target, Ordering::SeqCst);
+          input_paused_clone.store(cfg.input_paused, Ordering::SeqCst);
+          output_paused_clone.store(cfg.output_paused, Ordering::SeqCst);
+
           let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
         }
       }
@@ -178,17 +240,47 @@ fn run_enforcer(config: Config) -> Result<()> {
       // 1. Process all pending queue events (volume watcher updates, default device modifications)
       while let Ok(event) = event_rx.try_recv() {
         match event {
-          EnforcerEvent::RebindRole(role) => {
-            if !is_paused.load(Ordering::SeqCst) {
-              let _ = enforcer.bind_role(role);
-              enforcer.force_to_target();
+          EnforcerEvent::RebindRole(flow, role) => match flow {
+            AudioFlow::Input => {
+              if !input_paused.load(Ordering::SeqCst) {
+                let _ = input_enforcer.bind_role(role);
+                input_enforcer.force_to_target();
+              }
             }
-          }
+            AudioFlow::Output => {
+              if !output_paused.load(Ordering::SeqCst) {
+                let _ = output_enforcer.bind_role(role);
+                output_enforcer.force_to_target();
+              }
+            }
+          },
           EnforcerEvent::VolumeFileChanged => {
-            if !is_paused.load(Ordering::SeqCst) {
-              enforcer.force_to_target();
+            let in_paused = input_paused.load(Ordering::SeqCst);
+            let out_paused = output_paused.load(Ordering::SeqCst);
+
+            if in_paused {
+              let _ = input_enforcer.disable();
+            } else {
+              let _ = input_enforcer.enable();
+              input_enforcer.force_to_target();
             }
-            tray_app.update_tooltip(target_percent.load(Ordering::SeqCst));
+
+            if out_paused {
+              let _ = output_enforcer.disable();
+            } else {
+              let _ = output_enforcer.enable();
+              output_enforcer.force_to_target();
+            }
+
+            tray_app.update_toggle_input_text(in_paused);
+            tray_app.update_toggle_output_text(out_paused);
+            let _ = tray_app.update_icon(in_paused, out_paused);
+            tray_app.update_tooltip(
+              input_target.load(Ordering::SeqCst),
+              in_paused,
+              output_target.load(Ordering::SeqCst),
+              out_paused,
+            );
           }
         }
       }
@@ -196,18 +288,53 @@ fn run_enforcer(config: Config) -> Result<()> {
       // 2. Process pending tray interaction events
       while let Some(action) = tray_app.handle_events() {
         match action {
-          TrayAction::ToggleEnforcement => {
-            let currently_paused = is_paused.load(Ordering::SeqCst);
+          TrayAction::ToggleInput => {
+            let currently_paused = input_paused.load(Ordering::SeqCst);
             let next_paused = !currently_paused;
-            is_paused.store(next_paused, Ordering::SeqCst);
+            input_paused.store(next_paused, Ordering::SeqCst);
             if next_paused {
-              let _ = enforcer.disable();
+              let _ = input_enforcer.disable();
             } else {
-              let _ = enforcer.enable();
-              enforcer.force_to_target();
+              let _ = input_enforcer.enable();
+              input_enforcer.force_to_target();
             }
-            tray_app.update_toggle_text(next_paused);
-            let _ = tray_app.update_icon(next_paused);
+            tray_app.update_toggle_input_text(next_paused);
+            let _ = tray_app
+              .update_icon(next_paused, output_paused.load(Ordering::SeqCst));
+            tray_app.update_tooltip(
+              input_target.load(Ordering::SeqCst),
+              next_paused,
+              output_target.load(Ordering::SeqCst),
+              output_paused.load(Ordering::SeqCst),
+            );
+            if let Ok(mut cfg) = Config::load() {
+              cfg.input_paused = next_paused;
+              let _ = cfg.save();
+            }
+          }
+          TrayAction::ToggleOutput => {
+            let currently_paused = output_paused.load(Ordering::SeqCst);
+            let next_paused = !currently_paused;
+            output_paused.store(next_paused, Ordering::SeqCst);
+            if next_paused {
+              let _ = output_enforcer.disable();
+            } else {
+              let _ = output_enforcer.enable();
+              output_enforcer.force_to_target();
+            }
+            tray_app.update_toggle_output_text(next_paused);
+            let _ = tray_app
+              .update_icon(input_paused.load(Ordering::SeqCst), next_paused);
+            tray_app.update_tooltip(
+              input_target.load(Ordering::SeqCst),
+              input_paused.load(Ordering::SeqCst),
+              output_target.load(Ordering::SeqCst),
+              next_paused,
+            );
+            if let Ok(mut cfg) = Config::load() {
+              cfg.output_paused = next_paused;
+              let _ = cfg.save();
+            }
           }
           TrayAction::PromptSetTarget => {
             if let Ok(path) = Config::get_path() {
@@ -215,7 +342,7 @@ fn run_enforcer(config: Config) -> Result<()> {
                 let _ = std::fs::create_dir_all(parent);
               }
               if !path.exists() {
-                let _ = std::fs::write(&path, "100");
+                let _ = std::fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
               }
               let _ =
                 std::process::Command::new("notepad.exe").arg(&path).spawn();
@@ -257,7 +384,8 @@ fn run_enforcer(config: Config) -> Result<()> {
   }
 
   trimmer_running.store(false, Ordering::Relaxed);
-  enforcer.disable()?;
+  input_enforcer.disable()?;
+  output_enforcer.disable()?;
   unsafe {
     CoUninitialize();
   }

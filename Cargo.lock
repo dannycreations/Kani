@@ -1990,6 +1990,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "tempfile",
  "tray-icon",
  "windows",
  "windows-core",

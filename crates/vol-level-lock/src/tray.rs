@@ -9,7 +9,8 @@ use tray_icon::{
 use crate::registry::is_autorun_registered;
 
 pub enum TrayAction {
-  ToggleEnforcement,
+  ToggleInput,
+  ToggleOutput,
   PromptSetTarget,
   ToggleAutorun,
   Exit,
@@ -17,7 +18,8 @@ pub enum TrayAction {
 
 pub struct TrayApp {
   tray_icon: TrayIcon,
-  menu_item_toggle: MenuItem,
+  menu_item_toggle_input: MenuItem,
+  menu_item_toggle_output: MenuItem,
   menu_item_set_target: MenuItem,
   menu_item_autorun: MenuItem,
   menu_item_exit: MenuItem,
@@ -55,31 +57,45 @@ const fn generate_circle_icon(r: u8, g: u8, b: u8) -> [u8; BUFFER_LEN] {
 }
 
 const RED_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(220, 20, 60);
+const ORANGE_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(255, 165, 0);
 const GRAY_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(128, 128, 128);
 
 impl TrayApp {
-  pub fn new(target_percent: u32, is_paused: bool) -> Result<Self> {
-    let rgba = if is_paused {
-      &GRAY_ICON_RGBA
-    } else {
-      &RED_ICON_RGBA
+  pub fn new(
+    input_target: u32,
+    input_paused: bool,
+    output_target: u32,
+    output_paused: bool,
+  ) -> Result<Self> {
+    let rgba = match (input_paused, output_paused) {
+      (true, true) => &GRAY_ICON_RGBA,
+      (false, false) => &RED_ICON_RGBA,
+      _ => &ORANGE_ICON_RGBA,
     };
     let icon = Icon::from_rgba(rgba.to_vec(), WIDTH, HEIGHT)?;
 
     let tray_menu = Menu::new();
 
-    // 1. Pause/Resume enforcement item
-    let toggle_text = if is_paused {
-      "Resume enforcement"
+    // 1. Input enforcement item
+    let toggle_input_text = if input_paused {
+      "Resume input enforcement"
     } else {
-      "Pause enforcement"
+      "Pause input enforcement"
     };
-    let menu_item_toggle = MenuItem::new(toggle_text, true, None);
+    let menu_item_toggle_input = MenuItem::new(toggle_input_text, true, None);
 
-    // 2. Set target volume
-    let menu_item_set_target = MenuItem::new("Set target volume", true, None);
+    // 2. Output enforcement item
+    let toggle_output_text = if output_paused {
+      "Resume output enforcement"
+    } else {
+      "Pause output enforcement"
+    };
+    let menu_item_toggle_output = MenuItem::new(toggle_output_text, true, None);
 
-    // 3. Install/Remove autorun item
+    // 3. Set target volume
+    let menu_item_set_target = MenuItem::new("Edit settings", true, None);
+
+    // 4. Install/Remove autorun item
     let is_installed = is_autorun_registered();
     let autorun_text = if is_installed {
       "Remove autorun"
@@ -88,51 +104,83 @@ impl TrayApp {
     };
     let menu_item_autorun = MenuItem::new(autorun_text, true, None);
 
-    // 4. Exit item
+    // 5. Exit item
     let menu_item_exit = MenuItem::new("Exit", true, None);
 
-    let _ = tray_menu.append(&menu_item_toggle);
+    let _ = tray_menu.append(&menu_item_toggle_input);
+    let _ = tray_menu.append(&menu_item_toggle_output);
     let _ = tray_menu.append(&menu_item_set_target);
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&menu_item_autorun);
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&menu_item_exit);
 
+    let input_status = if input_paused { "Paused" } else { "Active" };
+    let output_status = if output_paused { "Paused" } else { "Active" };
+    let tooltip = format!(
+      "Input: {}% ({})\nOutput: {}% ({})",
+      input_target, input_status, output_target, output_status
+    );
+
     let tray_icon = TrayIconBuilder::new()
       .with_menu(Box::new(tray_menu))
-      .with_tooltip(format!("VolLevelLock: {}%", target_percent))
+      .with_tooltip(tooltip)
       .with_icon(icon)
       .build()?;
 
     Ok(Self {
       tray_icon,
-      menu_item_toggle,
+      menu_item_toggle_input,
+      menu_item_toggle_output,
       menu_item_set_target,
       menu_item_autorun,
       menu_item_exit,
     })
   }
 
-  pub fn update_tooltip(&self, target_percent: u32) {
-    let _ = self
-      .tray_icon
-      .set_tooltip(Some(format!("VolLevelLock: {}%", target_percent)));
+  pub fn update_tooltip(
+    &self,
+    input_target: u32,
+    input_paused: bool,
+    output_target: u32,
+    output_paused: bool,
+  ) {
+    let input_status = if input_paused { "Paused" } else { "Active" };
+    let output_status = if output_paused { "Paused" } else { "Active" };
+    let tooltip = format!(
+      "Input: {}% ({})\nOutput: {}% ({})",
+      input_target, input_status, output_target, output_status
+    );
+    let _ = self.tray_icon.set_tooltip(Some(tooltip));
   }
 
-  pub fn update_toggle_text(&self, is_paused: bool) {
+  pub fn update_toggle_input_text(&self, is_paused: bool) {
     let text = if is_paused {
-      "Resume enforcement"
+      "Resume input enforcement"
     } else {
-      "Pause enforcement"
+      "Pause input enforcement"
     };
-    self.menu_item_toggle.set_text(text);
+    self.menu_item_toggle_input.set_text(text);
   }
 
-  pub fn update_icon(&self, is_paused: bool) -> Result<()> {
-    let rgba = if is_paused {
-      &GRAY_ICON_RGBA
+  pub fn update_toggle_output_text(&self, is_paused: bool) {
+    let text = if is_paused {
+      "Resume output enforcement"
     } else {
-      &RED_ICON_RGBA
+      "Pause output enforcement"
+    };
+    self.menu_item_toggle_output.set_text(text);
+  }
+
+  pub fn update_icon(
+    &self,
+    input_paused: bool,
+    output_paused: bool,
+  ) -> Result<()> {
+    let rgba = match (input_paused, output_paused) {
+      (true, true) => &GRAY_ICON_RGBA,
+      (false, false) => &RED_ICON_RGBA,
+      _ => &ORANGE_ICON_RGBA,
     };
     let icon = Icon::from_rgba(rgba.to_vec(), WIDTH, HEIGHT)?;
     self.tray_icon.set_icon(Some(icon))?;
@@ -151,8 +199,10 @@ impl TrayApp {
 
   pub fn handle_events(&self) -> Option<TrayAction> {
     if let Ok(event) = MenuEvent::receiver().try_recv() {
-      if event.id == self.menu_item_toggle.id() {
-        return Some(TrayAction::ToggleEnforcement);
+      if event.id == self.menu_item_toggle_input.id() {
+        return Some(TrayAction::ToggleInput);
+      } else if event.id == self.menu_item_toggle_output.id() {
+        return Some(TrayAction::ToggleOutput);
       } else if event.id == self.menu_item_set_target.id() {
         return Some(TrayAction::PromptSetTarget);
       } else if event.id == self.menu_item_autorun.id() {

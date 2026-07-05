@@ -10,7 +10,7 @@ use anyhow::Result;
 use windows::Win32::{
   Foundation::PROPERTYKEY,
   Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, ERole,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, ERole,
     Endpoints::{
       IAudioEndpointVolume, IAudioEndpointVolumeCallback,
       IAudioEndpointVolumeCallback_Impl,
@@ -22,12 +22,19 @@ use windows::Win32::{
 };
 use windows_core::{implement, GUID, PCWSTR};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFlow {
+  Input,
+  Output,
+}
+
 pub enum EnforcerEvent {
-  RebindRole(ERole),
+  RebindRole(AudioFlow, ERole),
   VolumeFileChanged,
 }
 
 pub struct AudioEnforcer {
+  flow: AudioFlow,
   target: Arc<AtomicU32>,
   enumerator: IMMDeviceEnumerator,
   notification_client: Option<IMMNotificationClient>,
@@ -44,6 +51,7 @@ struct AudioBinding {
 
 impl AudioEnforcer {
   pub fn new(
+    flow: AudioFlow,
     target: Arc<AtomicU32>,
     event_tx: Sender<EnforcerEvent>,
   ) -> Result<Self> {
@@ -52,6 +60,7 @@ impl AudioEnforcer {
     };
     let context_guid = GUID::new()?;
     Ok(Self {
+      flow,
       target,
       enumerator,
       notification_client: None,
@@ -68,7 +77,8 @@ impl AudioEnforcer {
     }
 
     // Setup device notification client to detect default device changes
-    let client = DeviceNotificationClient::new(self.event_tx.clone());
+    let client =
+      DeviceNotificationClient::new(self.flow, self.event_tx.clone());
     let client_interface: IMMNotificationClient = client.into();
     unsafe {
       self
@@ -77,7 +87,7 @@ impl AudioEnforcer {
     }
     self.notification_client = Some(client_interface);
 
-    // Bind existing active capture endpoints
+    // Bind existing active endpoints
     for role in &[eConsole, eMultimedia, eCommunications] {
       let _ = self.bind_role(*role);
     }
@@ -130,8 +140,12 @@ impl AudioEnforcer {
     }
 
     unsafe {
+      let win_flow = match self.flow {
+        AudioFlow::Input => eCapture,
+        AudioFlow::Output => eRender,
+      };
       let default_device =
-        self.enumerator.GetDefaultAudioEndpoint(eCapture, role)?;
+        self.enumerator.GetDefaultAudioEndpoint(win_flow, role)?;
 
       // Let's activate using standard COM interface retrieval
       let endpoint_volume_obj: IAudioEndpointVolume =
@@ -223,12 +237,13 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
 
 #[implement(IMMNotificationClient)]
 struct DeviceNotificationClient {
+  flow: AudioFlow,
   event_tx: Sender<EnforcerEvent>,
 }
 
 impl DeviceNotificationClient {
-  fn new(event_tx: Sender<EnforcerEvent>) -> Self {
-    Self { event_tx }
+  fn new(flow: AudioFlow, event_tx: Sender<EnforcerEvent>) -> Self {
+    Self { flow, event_tx }
   }
 }
 
@@ -258,8 +273,14 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     role: ERole,
     _default_device_id_ptr: &PCWSTR,
   ) -> windows_core::Result<()> {
-    if flow == eCapture {
-      let _ = self.event_tx.send(EnforcerEvent::RebindRole(role));
+    let target_flow = match self.flow {
+      AudioFlow::Input => eCapture,
+      AudioFlow::Output => eRender,
+    };
+    if flow == target_flow {
+      let _ = self
+        .event_tx
+        .send(EnforcerEvent::RebindRole(self.flow, role));
     }
     Ok(())
   }
