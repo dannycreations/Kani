@@ -138,7 +138,7 @@ impl Config {
           .map(|p| PathBuf::from(p).join("AppData").join("Local"))
       })
       .map_err(|_| anyhow!("Could not determine local app data directory"))?;
-    Ok(local_app_data.join("VolLevelLock").join("config.txt"))
+    Ok(local_app_data.join("VolumeLevelLock").join("config.txt"))
   }
 }
 

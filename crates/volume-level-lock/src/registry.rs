@@ -10,7 +10,7 @@ use windows::Win32::System::Registry::{
 use windows_core::PCWSTR;
 
 const REG_RUN_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-const REG_VALUE_NAME: &str = "VolLevelLock";
+const REG_VALUE_NAME: &str = "VolumeLevelLock";
 
 use crate::utils::to_wide;
 

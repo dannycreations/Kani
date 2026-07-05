@@ -13,7 +13,7 @@ use windows_core::PCWSTR;
 
 use crate::utils::to_wide;
 
-const MUTEX_PREFIX: &str = "Local\\VolLevelLock-";
+const MUTEX_PREFIX: &str = "Local\\VolumeLevelLock-";
 
 pub struct InstanceGuard(pub HANDLE);
 

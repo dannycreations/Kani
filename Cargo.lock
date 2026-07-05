@@ -1984,7 +1984,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vol-level-lock"
+name = "volume-level-lock"
 version = "0.1.0"
 dependencies = [
  "anyhow",

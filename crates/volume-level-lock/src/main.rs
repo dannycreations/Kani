@@ -46,7 +46,7 @@ pub const WM_WAKEUP: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
 /// Lock default input and output volumes at fixed target levels.
 #[derive(Parser, Debug)]
 #[command(
-  name = "vol-level-lock",
+  name = "volume-level-lock",
   about = "Locks input and output volume levels"
 )]
 struct Args {
