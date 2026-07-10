@@ -23,9 +23,14 @@ format:
 check: format
 	cargo +nightly clippy --all-features --all-targets --fix --allow-dirty -- -D warnings
 
+ifeq ($(firstword $(MAKECMDGOALS)),test)
+  TEST_ARGS := $(filter-out test,$(MAKECMDGOALS))
+  $(eval $(TEST_ARGS):;@:)
+endif
+
 .PHONY: test
 test: check
-	cargo nextest run --config-file nextest.toml $(filter-out $@,$(MAKECMDGOALS))
+	cargo nextest run --config-file nextest.toml $(TEST_ARGS)
 
 .PHONY: bench
 bench: check
