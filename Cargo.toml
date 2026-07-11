@@ -4,6 +4,7 @@ members = [
     "crates/excel-unprotect",
     "crates/image-transformer",
     "crates/volume-level-lock",
+    "crates/youtube-render",
 ]
 
 [workspace.package]
