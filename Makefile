@@ -1,5 +1,12 @@
 BINSTALL := $(shell command -v cargo-binstall 2> /dev/null)
 
+SUPPORTED_ARG_TARGETS := test check
+FIRST_WORD := $(firstword $(MAKECMDGOALS))
+ifneq ($(filter $(FIRST_WORD),$(SUPPORTED_ARG_TARGETS)),)
+  CMD_ARGS := $(filter-out $(FIRST_WORD),$(MAKECMDGOALS))
+  $(eval $(CMD_ARGS):;@:)
+endif
+
 .PHONY: setup-binstall
 setup-binstall:
 ifndef BINSTALL
@@ -21,16 +28,11 @@ format:
 
 .PHONY: check
 check: format
-	cargo +nightly clippy --all-features --all-targets --fix --allow-dirty -- -D warnings
-
-ifeq ($(firstword $(MAKECMDGOALS)),test)
-  TEST_ARGS := $(filter-out test,$(MAKECMDGOALS))
-  $(eval $(TEST_ARGS):;@:)
-endif
+	cargo +nightly clippy $(filter-out --,$(CMD_ARGS)) --all-features --all-targets --fix --allow-dirty -- -D warnings
 
 .PHONY: test
 test: check
-	cargo nextest run --config-file nextest.toml $(TEST_ARGS)
+	cargo nextest run --config-file nextest.toml $(CMD_ARGS)
 
 .PHONY: bench
 bench: check
