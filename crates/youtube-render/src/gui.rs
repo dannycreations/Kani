@@ -20,7 +20,6 @@ use gpui_component::{
   input::{Input, InputEvent, InputState},
   progress::Progress,
   scroll::ScrollableElement as _,
-  slider::{Slider, SliderEvent, SliderState, SliderValue},
   tab::{Tab, TabBar},
   theme::ActiveTheme as _,
   v_flex, Disableable as _, IconName, Selectable,
@@ -37,13 +36,12 @@ pub enum ConfigTab {
   Global,
 }
 
-pub struct TrackSliderState {
-  pub slider_state: Entity<SliderState>,
+pub struct TrackInputState {
   pub input_state: Entity<InputState>,
 }
 
-pub struct ItemSliderStates {
-  pub tracks: Vec<TrackSliderState>,
+pub struct ItemInputStates {
+  pub tracks: Vec<TrackInputState>,
 }
 
 pub struct YtRenderApp {
@@ -52,11 +50,8 @@ pub struct YtRenderApp {
   expanded_job_id: Option<usize>,
   active_tab: ConfigTab,
 
-  // Per-video config slider states mapped by job ID
-  item_sliders: Vec<(usize, ItemSliderStates)>,
-
-  // Track which item sliders have their layout bounds resolved to avoid blinks
-  sliders_ready: HashSet<usize>,
+  // Per-video config input states mapped by job ID
+  item_inputs: Vec<(usize, ItemInputStates)>,
 
   // Global config input state
   ffmpeg_path_state: Entity<InputState>,
@@ -83,36 +78,35 @@ impl YtRenderApp {
       selected_job_id: None,
       expanded_job_id: None,
       active_tab: ConfigTab::Global,
-      item_sliders: Vec::new(),
-      sliders_ready: HashSet::new(),
+      item_inputs: Vec::new(),
       ffmpeg_path_state,
     }
   }
 
-  fn get_sliders(&self, id: usize) -> Option<&ItemSliderStates> {
+  fn get_inputs(&self, id: usize) -> Option<&ItemInputStates> {
     self
-      .item_sliders
+      .item_inputs
       .iter()
       .find(|(k, _)| *k == id)
       .map(|(_, v)| v)
   }
 
-  fn has_sliders(&self, id: usize) -> bool {
-    self.item_sliders.iter().any(|(k, _)| *k == id)
+  fn has_inputs(&self, id: usize) -> bool {
+    self.item_inputs.iter().any(|(k, _)| *k == id)
   }
 
-  fn remove_sliders(&mut self, id: usize) {
-    self.item_sliders.retain(|(k, _)| *k != id);
+  fn remove_inputs(&mut self, id: usize) {
+    self.item_inputs.retain(|(k, _)| *k != id);
   }
 
-  fn ensure_slider_states(
+  fn ensure_input_states(
     &mut self,
     id: usize,
     settings: &AudioSettings,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    if self.has_sliders(id) {
+    if self.has_inputs(id) {
       return;
     }
 
@@ -120,60 +114,9 @@ impl YtRenderApp {
 
     for (track_idx, track_config) in settings.tracks.iter().enumerate() {
       let val = track_config.offset;
-      let slider_state = cx.new(|_| {
-        SliderState::new()
-          .min(-30.0)
-          .max(0.0)
-          .step(1.0)
-          .default_value(val)
-      });
       let input_state = cx.new(|cx| {
         InputState::new(window, cx).default_value(format!("{:.0}", val))
       });
-
-      // Subscribe to slider changes
-      cx.subscribe_in(
-        &slider_state,
-        window,
-        move |this, _, event, window, cx| {
-          if let SliderEvent::Change(SliderValue::Single(val)) = event {
-            let mut val = *val;
-            if val == 0.0 {
-              val = 0.0;
-            }
-            let mut state = this.state.lock().unwrap();
-            if let Some(item) =
-              state.queue.iter_mut().find(|item| item.id == id)
-            {
-              if let Some(tc) = item.settings.tracks.get_mut(track_idx) {
-                tc.offset = val;
-              }
-            }
-            if let Some(sliders) = this.get_sliders(id) {
-              if let Some(track_slider) = sliders.tracks.get(track_idx) {
-                let input_val = track_slider.input_state.read(cx).value();
-                let needs_update = match input_val.parse::<f32>() {
-                  Ok(parsed) => {
-                    let mut parsed_norm = parsed;
-                    if parsed_norm == 0.0 {
-                      parsed_norm = 0.0;
-                    }
-                    (parsed_norm - val).abs() > 0.001
-                  }
-                  Err(_) => true,
-                };
-                if needs_update {
-                  track_slider.input_state.update(cx, |input, cx| {
-                    input.set_value(format!("{:.0}", val), window, cx);
-                  });
-                }
-              }
-            }
-            cx.notify();
-          }
-        },
-      )
-      .detach();
 
       // Capture default offset for the blur/reset fallback
       let default_offset = val;
@@ -182,34 +125,17 @@ impl YtRenderApp {
       cx.subscribe_in(
         &input_state,
         window,
-        move |this, input_entity, event, window, cx| match event {
+        move |this, input_entity, event, _window, cx| match event {
           InputEvent::Change => {
             let val_str = input_entity.read(cx).value();
             if let Ok(val) = val_str.parse::<f32>() {
-              let mut clamped_val = val.clamp(-30.0, 0.0);
-              if clamped_val == 0.0 {
-                clamped_val = 0.0;
-              }
+              let clamped_val = val.clamp(-30.0, 0.0);
               let mut state = this.state.lock().unwrap();
               if let Some(item) =
                 state.queue.iter_mut().find(|item| item.id == id)
               {
                 if let Some(tc) = item.settings.tracks.get_mut(track_idx) {
                   tc.offset = clamped_val;
-                }
-              }
-              if let Some(sliders) = this.get_sliders(id) {
-                if let Some(track_slider) = sliders.tracks.get(track_idx) {
-                  let mut slider_val =
-                    track_slider.slider_state.read(cx).value().start();
-                  if slider_val == 0.0 {
-                    slider_val = 0.0;
-                  }
-                  if (slider_val - clamped_val).abs() > 0.001 {
-                    track_slider.slider_state.update(cx, |slider, cx| {
-                      slider.set_value(clamped_val, window, cx);
-                    });
-                  }
                 }
               }
               cx.notify();
@@ -226,13 +152,14 @@ impl YtRenderApp {
                 }
               }
             }
-            if current_offset == 0.0 {
-              current_offset = 0.0;
-            }
-            if let Some(sliders) = this.get_sliders(id) {
-              if let Some(track_slider) = sliders.tracks.get(track_idx) {
-                track_slider.input_state.update(cx, |input, cx| {
-                  input.set_value(format!("{:.0}", current_offset), window, cx);
+            if let Some(inputs) = this.get_inputs(id) {
+              if let Some(track_input) = inputs.tracks.get(track_idx) {
+                track_input.input_state.update(cx, |input, cx| {
+                  input.set_value(
+                    format!("{:.0}", current_offset),
+                    _window,
+                    cx,
+                  );
                 });
               }
             }
@@ -243,15 +170,12 @@ impl YtRenderApp {
       )
       .detach();
 
-      tracks_vec.push(TrackSliderState {
-        slider_state,
-        input_state,
-      });
+      tracks_vec.push(TrackInputState { input_state });
     }
 
     self
-      .item_sliders
-      .push((id, ItemSliderStates { tracks: tracks_vec }));
+      .item_inputs
+      .push((id, ItemInputStates { tracks: tracks_vec }));
   }
 }
 
@@ -430,8 +354,7 @@ impl Render for YtRenderApp {
                 .iter()
                 .map(|item| item.id)
                 .collect();
-              this.item_sliders.retain(|(id, _)| queue_ids.contains(id));
-              this.sliders_ready.retain(|id| queue_ids.contains(id));
+              this.item_inputs.retain(|(id, _)| queue_ids.contains(id));
               if let Some(expanded_id) = this.expanded_job_id {
                 if !queue_ids.contains(&expanded_id) {
                   this.expanded_job_id = None;
@@ -454,8 +377,7 @@ impl Render for YtRenderApp {
         if let Some(view) = view.upgrade() {
           view.update(cx, |this, cx| {
             this.state.lock().unwrap().clear_all();
-            this.item_sliders.clear();
-            this.sliders_ready.clear();
+            this.item_inputs.clear();
             this.expanded_job_id = None;
             this.selected_job_id = None;
             cx.notify();
@@ -491,12 +413,10 @@ impl Render for YtRenderApp {
         let state_arc_down = Arc::clone(&self.state);
 
         let item_settings_panel = if is_expanded {
-          let sliders = self.get_sliders(id).unwrap();
+          let inputs = self.get_inputs(id).unwrap();
           let single_track = item_settings.single_track;
-          let sliders_disabled =
+          let controls_disabled =
             is_running || !matches!(item.status, QueueItemStatus::Pending);
-          let is_ready = self.sliders_ready.contains(&id);
-          let slider_opacity = if is_ready { 1.0 } else { 0.0 };
 
           // Preset selector buttons
           let builtins = Preset::builtins();
@@ -516,7 +436,7 @@ impl Render for YtRenderApp {
               .label(preset_name)
               .compact()
               .when(is_active_preset, |b| b.primary())
-              .disabled(sliders_disabled)
+              .disabled(controls_disabled)
               .on_click(move |_, window, cx| {
                 if let Some(view) = item_view_preset.upgrade() {
                   view.update(cx, |this, cx| {
@@ -531,9 +451,8 @@ impl Render for YtRenderApp {
                         );
                       }
                     }
-                    // Rebuild sliders for the new preset's track layout
-                    this.remove_sliders(id);
-                    this.sliders_ready.remove(&id);
+                    // Rebuild inputs for the new preset's track layout
+                    this.remove_inputs(id);
                     let new_settings = {
                       let state = this.state.lock().unwrap();
                       state
@@ -543,8 +462,7 @@ impl Render for YtRenderApp {
                         .map(|item| item.settings.clone())
                     };
                     if let Some(settings) = new_settings {
-                      this.ensure_slider_states(id, &settings, window, cx);
-                      this.sliders_ready.insert(id);
+                      this.ensure_input_states(id, &settings, window, cx);
                     }
                     cx.notify();
                   });
@@ -559,7 +477,7 @@ impl Render for YtRenderApp {
             Button::new(SharedString::from(format!("export_{}", id)))
               .icon(IconName::ExternalLink)
               .compact()
-              .disabled(sliders_disabled)
+              .disabled(controls_disabled)
               .on_click(move |_, _, cx| {
                 let ini_content = settings_for_export.to_ini();
                 cx.spawn(|_: &mut AsyncApp| async move {
@@ -581,7 +499,7 @@ impl Render for YtRenderApp {
             Button::new(SharedString::from(format!("import_{}", id)))
               .icon(IconName::FolderOpen)
               .compact()
-              .disabled(sliders_disabled)
+              .disabled(controls_disabled)
               .on_click(move |_, _, cx| {
                 let view = item_view_import.clone();
                 cx.spawn(move |cx: &mut AsyncApp| {
@@ -609,11 +527,10 @@ impl Render for YtRenderApp {
                               item.settings = new_settings;
                             }
                           }
-                          // Invalidate sliders and collapse panel so they
-                          // are recreated on next expand (slider creation
+                          // Invalidate inputs and collapse panel so they
+                          // are recreated on next expand (input creation
                           // requires a Window reference unavailable here).
-                          this.remove_sliders(id);
-                          this.sliders_ready.remove(&id);
+                          this.remove_inputs(id);
                           if this.expanded_job_id == Some(id) {
                             this.expanded_job_id = None;
                           }
@@ -627,35 +544,114 @@ impl Render for YtRenderApp {
               }),
           );
 
-          // Track offset sliders (dynamic from settings.tracks)
+          // Track list with reorder buttons and offset inputs
+          let track_count = item_settings.tracks.len();
           let mut tracks_container = v_flex().gap_1();
           for (track_idx, track_config) in
             item_settings.tracks.iter().enumerate()
           {
-            if let Some(track_slider) = sliders.tracks.get(track_idx) {
-              tracks_container = tracks_container.child(
-                h_flex()
-                  .gap_2()
-                  .items_center()
-                  .child(div().w(px(180.0)).text_xs().child(format!(
-                    "{} track offset (dB):",
-                    &*track_config.name
-                  )))
-                  .child(
-                    div().flex_grow().child(
-                      Slider::new(&track_slider.slider_state)
-                        .disabled(sliders_disabled)
-                        .opacity(slider_opacity),
-                    ),
-                  )
-                  .child(
-                    div().w(px(50.0)).child(
-                      Input::new(&track_slider.input_state)
-                        .disabled(sliders_disabled),
-                    ),
-                  ),
+            let is_first = track_idx == 0;
+            let is_last = track_idx == track_count - 1;
+            let item_view_track_up = item_view.clone();
+            let item_view_track_down = item_view.clone();
+
+            let mut row = h_flex().gap_2().items_center().child(
+              div()
+                .w(px(180.0))
+                .text_xs()
+                .child(format!("{} track offset (dB):", &*track_config.name,)),
+            );
+
+            if let Some(track_input) = inputs.tracks.get(track_idx) {
+              row = row.child(
+                div().w(px(50.0)).child(
+                  Input::new(&track_input.input_state)
+                    .disabled(controls_disabled),
+                ),
               );
             }
+
+            row = row
+              .child(
+                Button::new(SharedString::from(format!(
+                  "track_up_{}_{}",
+                  id, track_idx
+                )))
+                .icon(IconName::ArrowUp)
+                .compact()
+                .disabled(controls_disabled || is_first)
+                .on_click(move |_, window, cx| {
+                  if let Some(view) = item_view_track_up.upgrade() {
+                    view.update(cx, |this, cx| {
+                      {
+                        let mut state = this.state.lock().unwrap();
+                        if let Some(item) =
+                          state.queue.iter_mut().find(|item| item.id == id)
+                        {
+                          if track_idx > 0 {
+                            item.settings.tracks.swap(track_idx, track_idx - 1);
+                          }
+                        }
+                      }
+                      // Rebuild inputs to match the new track order
+                      this.remove_inputs(id);
+                      let new_settings = {
+                        let state = this.state.lock().unwrap();
+                        state
+                          .queue
+                          .iter()
+                          .find(|item| item.id == id)
+                          .map(|item| item.settings.clone())
+                      };
+                      if let Some(settings) = new_settings {
+                        this.ensure_input_states(id, &settings, window, cx);
+                      }
+                      cx.notify();
+                    });
+                  }
+                }),
+              )
+              .child(
+                Button::new(SharedString::from(format!(
+                  "track_down_{}_{}",
+                  id, track_idx
+                )))
+                .icon(IconName::ArrowDown)
+                .compact()
+                .disabled(controls_disabled || is_last)
+                .on_click(move |_, window, cx| {
+                  if let Some(view) = item_view_track_down.upgrade() {
+                    view.update(cx, |this, cx| {
+                      {
+                        let mut state = this.state.lock().unwrap();
+                        if let Some(item) =
+                          state.queue.iter_mut().find(|item| item.id == id)
+                        {
+                          if track_idx + 1 < item.settings.tracks.len() {
+                            item.settings.tracks.swap(track_idx, track_idx + 1);
+                          }
+                        }
+                      }
+                      // Rebuild inputs to match the new track order
+                      this.remove_inputs(id);
+                      let new_settings = {
+                        let state = this.state.lock().unwrap();
+                        state
+                          .queue
+                          .iter()
+                          .find(|item| item.id == id)
+                          .map(|item| item.settings.clone())
+                      };
+                      if let Some(settings) = new_settings {
+                        this.ensure_input_states(id, &settings, window, cx);
+                      }
+                      cx.notify();
+                    });
+                  }
+                }),
+              );
+
+            tracks_container = tracks_container.child(row);
           }
 
           Some(
@@ -671,7 +667,7 @@ impl Render for YtRenderApp {
                 Checkbox::new(("single_track", id))
                   .checked(single_track)
                   .label("Single Audio Track (Loudnorm Only)")
-                  .disabled(sliders_disabled)
+                  .disabled(controls_disabled)
                   .on_click({
                     let item_view = item_view.clone();
                     move |checked, _, cx| {
@@ -803,47 +799,18 @@ impl Render for YtRenderApp {
                         let item_settings = item_settings.clone();
                         move |_, window, cx| {
                           if let Some(view) = item_view.upgrade() {
-                            let mut is_expanding = false;
                             view.update(cx, |this, cx| {
                               if this.expanded_job_id == Some(id) {
                                 this.expanded_job_id = None;
                               } else {
                                 let settings = item_settings.clone();
-                                this.ensure_slider_states(
+                                this.ensure_input_states(
                                   id, &settings, window, cx,
                                 );
                                 this.expanded_job_id = Some(id);
-                                is_expanding = true;
                               }
                               cx.notify();
                             });
-
-                            if is_expanding {
-                              let has_ready = view.update(cx, |this, _| {
-                                this.sliders_ready.contains(&id)
-                              });
-
-                              if !has_ready {
-                                let view_clone = item_view.clone();
-                                cx.spawn(move |app: &mut AsyncApp| {
-                                  let app = app.clone();
-                                  let view_clone = view_clone.clone();
-                                  async move {
-                                    Timer::after(Duration::from_millis(50))
-                                      .await;
-                                    let _ = app.update(|cx| {
-                                      if let Some(view) = view_clone.upgrade() {
-                                        view.update(cx, |this, cx| {
-                                          this.sliders_ready.insert(id);
-                                          cx.notify();
-                                        });
-                                      }
-                                    });
-                                  }
-                                })
-                                .detach();
-                              }
-                            }
                           }
                         }
                       }),
@@ -865,8 +832,7 @@ impl Render for YtRenderApp {
                               if this.expanded_job_id == Some(id) {
                                 this.expanded_job_id = None;
                               }
-                              this.remove_sliders(id);
-                              this.sliders_ready.remove(&id);
+                              this.remove_inputs(id);
                               cx.notify();
                             });
                           }

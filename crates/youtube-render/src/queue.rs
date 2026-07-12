@@ -345,13 +345,13 @@ mod tests {
     assert_eq!(&*state.queue[1].input_path, "file2.mkv");
     assert_eq!(&*state.queue[2].input_path, "file3.mkv");
 
-    // Per-item settings default check (from default preset)
+    // Per-item settings default check (from default preset, sorted by index)
     assert!(!state.queue[0].settings.single_track);
     assert_eq!(state.queue[0].settings.tracks.len(), 3);
-    assert_eq!(&*state.queue[0].settings.tracks[0].name, "Mic");
-    assert_eq!(state.queue[0].settings.tracks[0].offset, -2.0);
-    assert_eq!(&*state.queue[0].settings.tracks[2].name, "Game");
-    assert_eq!(state.queue[0].settings.tracks[2].offset, -16.0);
+    assert_eq!(&*state.queue[0].settings.tracks[0].name, "Game");
+    assert_eq!(state.queue[0].settings.tracks[0].offset, -16.0);
+    assert_eq!(&*state.queue[0].settings.tracks[2].name, "Discord");
+    assert_eq!(state.queue[0].settings.tracks[2].offset, -6.0);
 
     // Test output_path uniqueness/incrementing logic (assuming files don't exist on disk)
     assert_eq!(&*state.queue[0].output_path, "file1.mp4");

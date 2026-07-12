@@ -20,17 +20,19 @@ pub struct AudioSettings {
 
 impl AudioSettings {
   pub fn from_preset(preset: &Preset) -> Self {
+    let mut tracks: Vec<TrackConfig> = preset
+      .tracks
+      .iter()
+      .map(|t| TrackConfig {
+        name: Arc::clone(&t.name),
+        index: t.index,
+        offset: t.default_offset,
+      })
+      .collect();
+    tracks.sort_by_key(|t| t.index);
     Self {
       single_track: false,
-      tracks: preset
-        .tracks
-        .iter()
-        .map(|t| TrackConfig {
-          name: Arc::clone(&t.name),
-          index: t.index,
-          offset: t.default_offset,
-        })
-        .collect(),
+      tracks,
     }
   }
 
