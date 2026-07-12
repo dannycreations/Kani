@@ -109,7 +109,13 @@ impl ProgressInfo {
       }
       false
     } else if let Some(val) = line.strip_prefix("out_time=") {
-      self.out_time = Some(Arc::from(val.trim()));
+      let trimmed = val.trim();
+      let formatted_time = if let Some(dot_idx) = trimmed.find('.') {
+        &trimmed[..dot_idx]
+      } else {
+        trimmed
+      };
+      self.out_time = Some(Arc::from(formatted_time));
       false
     } else if let Some(val) = line.strip_prefix("speed=") {
       self.speed = Some(Arc::from(val.trim()));

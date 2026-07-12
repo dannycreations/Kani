@@ -15,7 +15,6 @@ use gpui_component::{
   button::{Button, ButtonVariants as _},
   checkbox::Checkbox,
   divider::Divider,
-  group_box::{GroupBox, GroupBoxVariants as _},
   h_flex,
   input::{Input, InputEvent, InputState},
   progress::Progress,
@@ -32,8 +31,9 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigTab {
-  Global,
+pub enum AppTab {
+  Queue,
+  Settings,
 }
 
 pub struct TrackInputState {
@@ -48,13 +48,14 @@ pub struct YtRenderApp {
   state: Arc<Mutex<AppState>>,
   selected_job_id: Option<usize>,
   expanded_job_id: Option<usize>,
-  active_tab: ConfigTab,
+  active_tab: AppTab,
 
   // Per-video config input states mapped by job ID
   item_inputs: Vec<(usize, ItemInputStates)>,
 
   // Global config input state
   ffmpeg_path_state: Entity<InputState>,
+  parallel_jobs_state: Entity<InputState>,
 }
 
 impl YtRenderApp {
@@ -73,13 +74,30 @@ impl YtRenderApp {
     })
     .detach();
 
+    let parallel_jobs_state =
+      cx.new(|cx| InputState::new(window, cx).default_value("2"));
+
+    cx.subscribe(&parallel_jobs_state, move |this, entity, event, cx| {
+      if let InputEvent::Change = event {
+        let val = entity.read(cx).value();
+        if let Ok(jobs) = val.parse::<usize>() {
+          if jobs > 0 {
+            this.state.lock().unwrap().parallel_jobs = jobs;
+          }
+        }
+        cx.notify();
+      }
+    })
+    .detach();
+
     Self {
       state,
       selected_job_id: None,
       expanded_job_id: None,
-      active_tab: ConfigTab::Global,
+      active_tab: AppTab::Queue,
       item_inputs: Vec::new(),
       ffmpeg_path_state,
+      parallel_jobs_state,
     }
   }
 
@@ -201,55 +219,55 @@ impl Render for YtRenderApp {
 
     let view = cx.entity().downgrade();
 
-    // Render configuration settings tabs
-    let config_tab_bar = TabBar::new("config_tabs").underline().child(
-      Tab::new()
-        .label("Global Settings")
-        .selected(self.active_tab == ConfigTab::Global)
-        .on_click({
-          let view = view.clone();
-          move |_, _, cx| {
-            if let Some(view) = view.upgrade() {
-              view.update(cx, |this, cx| {
-                this.active_tab = ConfigTab::Global;
-                cx.notify();
-              });
-            }
-          }
-        }),
-    );
-
-    let config_content = match self.active_tab {
-      ConfigTab::Global => v_flex().gap_2().child(
-        h_flex()
-          .gap_4()
-          .items_center()
-          .child(div().child("ffmpeg executable path:"))
-          .child(
-            div()
-              .flex_grow()
-              .child(Input::new(&self.ffmpeg_path_state).disabled(is_running)),
+    let enable_parallel = state.enable_parallel;
+    let settings_panel =
+      v_flex()
+        .gap_4()
+        .flex_grow()
+        .h_full()
+        .child(
+          v_flex().gap_2().child(
+            h_flex()
+              .gap_4()
+              .items_center()
+              .child(div().child("ffmpeg executable path:"))
+              .child(div().flex_grow().child(
+                Input::new(&self.ffmpeg_path_state).disabled(is_running),
+              )),
           ),
-      ),
-    };
-
-    let top_panel = v_flex().child(
-      GroupBox::new()
-        .outline()
-        .title(
-          h_flex()
-            .w_full()
-            .justify_between()
-            .items_center()
-            .child("Configuration Settings")
-            .child(if is_running {
-              div().text_color(cx.theme().info).child("Running")
-            } else {
-              div().text_color(cx.theme().muted_foreground).child("Idle")
-            }),
         )
-        .child(v_flex().gap_4().child(config_tab_bar).child(config_content)),
-    );
+        .child(
+          h_flex()
+            .gap_4()
+            .items_center()
+            .child(
+              Checkbox::new("enable_parallel")
+                .checked(enable_parallel)
+                .label("Enable parallel rendering")
+                .disabled(is_running)
+                .on_click({
+                  let view = view.clone();
+                  move |checked, _, cx| {
+                    if let Some(view) = view.upgrade() {
+                      view.update(cx, |this, cx| {
+                        this.state.lock().unwrap().enable_parallel = *checked;
+                        cx.notify();
+                      });
+                    }
+                  }
+                }),
+            )
+            .child(h_flex().gap_2().items_center().when(
+              enable_parallel,
+              |this| {
+                this.child(div().child("Parallel jobs:")).child(
+                  div().w(px(60.0)).child(
+                    Input::new(&self.parallel_jobs_state).disabled(is_running),
+                  ),
+                )
+              },
+            )),
+        );
 
     let start_stop_btn = if is_running {
       Button::new("stop").danger().label("Stop").on_click({
@@ -395,7 +413,7 @@ impl Render for YtRenderApp {
           .into_any_element(),
       );
     } else {
-      for item in &state.queue {
+      for (item_idx, item) in state.queue.iter().enumerate() {
         let is_selected = self.selected_job_id == Some(item.id);
         let is_expanded = self.expanded_job_id == Some(item.id);
         let id = item.id;
@@ -407,6 +425,7 @@ impl Render for YtRenderApp {
           .and_then(|f| f.to_str())
           .unwrap_or(&item.input_path)
           .to_string();
+        let display_name = format!("{}. {}", item_idx + 1, filename);
 
         let item_view = view.clone();
         let state_arc_up = Arc::clone(&self.state);
@@ -556,10 +575,10 @@ impl Render for YtRenderApp {
             let item_view_track_down = item_view.clone();
 
             let mut row = h_flex().gap_2().items_center().child(
-              div()
-                .w(px(180.0))
-                .text_xs()
-                .child(format!("{} track offset (dB):", &*track_config.name,)),
+              div().w(px(180.0)).text_xs().child(format!(
+                "{}. {} track offset (dB):",
+                track_idx, &*track_config.name,
+              )),
             );
 
             if let Some(track_input) = inputs.tracks.get(track_idx) {
@@ -715,7 +734,7 @@ impl Render for YtRenderApp {
                   .cursor_pointer()
                   .flex_1()
                   .text_sm()
-                  .child(filename.clone())
+                  .child(display_name.clone())
                   .on_click({
                     let item_view = item_view.clone();
                     move |_, _, cx| {
@@ -862,10 +881,9 @@ impl Render for YtRenderApp {
                   )
                   .child(
                     h_flex()
-                      .justify_between()
+                      .justify_end()
                       .text_xs()
                       .text_color(cx.theme().muted_foreground)
-                      .child(format!("{:.0}%", percent * 100.0))
                       .child(
                         h_flex()
                           .gap_2()
@@ -910,7 +928,13 @@ impl Render for YtRenderApp {
           .children(queue_items_elements),
       );
 
-    let target_id = self.selected_job_id.or(state.current_job_id);
+    let target_id = self.selected_job_id.or_else(|| {
+      if state.active_processes.is_empty() {
+        None
+      } else {
+        Some(state.active_processes[0].0)
+      }
+    });
     let display_job = target_id
       .and_then(|id| state.queue.iter().find(|item| item.id == id).cloned());
 
@@ -921,7 +945,7 @@ impl Render for YtRenderApp {
         div()
           .font_weight(FontWeight::BOLD)
           .text_lg()
-          .child("Job Logs & Output Info"),
+          .child("Job Logs"),
       )
       .child(Divider::horizontal())
       .child(
@@ -944,7 +968,6 @@ impl Render for YtRenderApp {
                 )
               },
             )
-            .child(div().text_sm().child("Processing logs:"))
             .child(
               v_flex()
                 .flex_grow()
@@ -982,47 +1005,96 @@ impl Render for YtRenderApp {
         }
       );
 
-    v_flex()
-      .p_4()
-      .gap_4()
-      .size_full()
-      .child(top_panel)
-      .child(Divider::horizontal())
-      .child(if use_two_columns {
-        div()
-          .flex()
-          .flex_row()
-          .w_full()
-          .flex_grow()
-          .h_full()
-          .gap_4()
-          .child(div().flex().flex_col().flex_1().h_full().child(left_col))
-          .child(div().flex().flex_col().flex_1().h_full().child(right_col))
-      } else {
-        div()
-          .flex()
-          .flex_col()
-          .w_full()
-          .flex_grow()
-          .h_full()
-          .gap_4()
+    let status_indicator = if is_running {
+      div().text_color(cx.theme().info).child("Running")
+    } else {
+      div().text_color(cx.theme().muted_foreground).child("Idle")
+    };
+
+    let app_tab_bar = h_flex()
+      .w_full()
+      .justify_between()
+      .items_center()
+      .child(
+        TabBar::new("app_tabs")
+          .underline()
           .child(
-            div()
-              .flex()
-              .flex_col()
-              .w_full()
-              .h(px(250.0))
-              .child(left_col),
+            Tab::new()
+              .label("Render Queue")
+              .selected(self.active_tab == AppTab::Queue)
+              .on_click({
+                let view = view.clone();
+                move |_, _, cx| {
+                  if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| {
+                      this.active_tab = AppTab::Queue;
+                      cx.notify();
+                    });
+                  }
+                }
+              }),
           )
           .child(
-            div()
-              .flex()
-              .flex_col()
-              .w_full()
-              .flex_grow()
-              .h_full()
-              .child(right_col),
-          )
-      })
+            Tab::new()
+              .label("Settings")
+              .selected(self.active_tab == AppTab::Settings)
+              .on_click({
+                let view = view.clone();
+                move |_, _, cx| {
+                  if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| {
+                      this.active_tab = AppTab::Settings;
+                      cx.notify();
+                    });
+                  }
+                }
+              }),
+          ),
+      )
+      .child(status_indicator);
+
+    let queue_panel = if use_two_columns {
+      div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .flex_grow()
+        .h_full()
+        .gap_4()
+        .child(div().flex().flex_col().flex_1().h_full().child(left_col))
+        .child(div().flex().flex_col().flex_1().h_full().child(right_col))
+    } else {
+      div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .flex_grow()
+        .h_full()
+        .gap_4()
+        .child(
+          div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(250.0))
+            .child(left_col),
+        )
+        .child(
+          div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .flex_grow()
+            .h_full()
+            .child(right_col),
+        )
+    };
+
+    v_flex().p_4().gap_4().size_full().child(app_tab_bar).child(
+      match self.active_tab {
+        AppTab::Queue => queue_panel.into_any_element(),
+        AppTab::Settings => settings_panel.into_any_element(),
+      },
+    )
   }
 }
