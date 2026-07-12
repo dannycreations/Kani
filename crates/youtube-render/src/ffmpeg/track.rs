@@ -1,45 +1,4 @@
-use std::collections::HashMap;
-
-use serde::{Deserialize, Serialize};
-
-use super::settings::AudioSettings;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AudioTrack {
-  Mic,
-  Discord,
-  Game,
-}
-
-impl AudioTrack {
-  pub fn all() -> &'static [Self] {
-    &[Self::Mic, Self::Discord, Self::Game]
-  }
-
-  pub fn display_name(&self) -> &'static str {
-    match self {
-      Self::Mic => "Mic",
-      Self::Discord => "Discord",
-      Self::Game => "Game",
-    }
-  }
-
-  pub fn default_offset(&self) -> f32 {
-    match self {
-      Self::Mic => -2.0,
-      Self::Discord => -6.0,
-      Self::Game => -16.0,
-    }
-  }
-
-  pub fn index(&self) -> usize {
-    match self {
-      Self::Mic => 1,
-      Self::Discord => 2,
-      Self::Game => 0,
-    }
-  }
-}
+use super::settings::{AudioSettings, TrackConfig};
 
 #[derive(Debug, Default, Clone)]
 pub struct TrackStats {
@@ -58,16 +17,16 @@ pub fn clamp(val: f32, min: f32, max: f32) -> f32 {
 }
 
 pub fn build_mix_filter_complex(
-  tracks: &[AudioTrack],
-  computed_vols: &HashMap<AudioTrack, f32>,
+  tracks: &[TrackConfig],
+  volumes: &[f32],
   loudnorm_suffix: &str,
 ) -> String {
   let mut filter_parts = Vec::new();
   let mut amix_inputs = Vec::new();
-  for track in tracks {
-    let idx = track.index();
-    let label = track.display_name().to_lowercase();
-    let vol = computed_vols.get(track).copied().unwrap_or(0.0);
+  for (i, track) in tracks.iter().enumerate() {
+    let idx = track.index;
+    let label = track.name.to_lowercase();
+    let vol = volumes.get(i).copied().unwrap_or(0.0);
     filter_parts.push(format!("[0:a:{idx}]volume={vol:.1}dB[{label}]"));
     amix_inputs.push(format!("[{label}]"));
   }
@@ -86,53 +45,55 @@ pub fn build_mix_filter_complex(
 
 pub fn compute_mix_volumes(
   settings: &AudioSettings,
-  tracks: &[TrackStats],
-) -> Option<HashMap<AudioTrack, f32>> {
-  let mut computed_vols = HashMap::new();
-  let mut ref_posts = HashMap::new();
+  track_stats: &[TrackStats],
+) -> Option<Vec<f32>> {
+  let tracks = &settings.tracks;
+  if tracks.is_empty() {
+    return None;
+  }
+
   let threshold = -45.0;
 
-  let all_means_present = AudioTrack::all().iter().all(|t| {
-    let idx = t.index();
-    idx < tracks.len() && tracks[idx].mean.is_some()
-  });
+  let all_means_present = tracks
+    .iter()
+    .enumerate()
+    .all(|(i, _)| i < track_stats.len() && track_stats[i].mean.is_some());
 
   if !all_means_present {
     return None;
   }
 
-  let priority_chain = AudioTrack::all(); // [Mic, Discord, Game]
-  if !priority_chain.is_empty() {
-    let first = priority_chain[0];
-    let offset = settings.get_offset(first);
-    let vol = clamp(offset, -100.0, 30.0);
-    let mean = tracks[first.index()].mean.unwrap();
-    let ref_post = if mean >= threshold {
-      mean + vol
-    } else {
-      -20.0 + vol
-    };
-    computed_vols.insert(first, vol);
-    ref_posts.insert(first, ref_post);
+  let mut computed_vols = vec![0.0_f32; tracks.len()];
+  let mut ref_posts = vec![0.0_f32; tracks.len()];
 
-    for idx in 1..priority_chain.len() {
-      let track = priority_chain[idx];
-      let prev_track = priority_chain[idx - 1];
-      let offset = settings.get_offset(track);
-      let prev_offset = settings.get_offset(prev_track);
-      let prev_ref_post = ref_posts[&prev_track];
-      let mean = tracks[track.index()].mean.unwrap();
-      let target = prev_ref_post + (offset - prev_offset);
-      let (vol, ref_post) = if mean >= threshold {
-        let v = clamp(target - mean, -100.0, 30.0);
-        (v, mean + v)
-      } else {
-        let v = clamp(offset, -100.0, 30.0);
-        (v, target)
-      };
-      computed_vols.insert(track, vol);
-      ref_posts.insert(track, ref_post);
-    }
+  // First track: apply its offset directly
+  let first_offset = tracks[0].offset;
+  let vol = clamp(first_offset, -100.0, 30.0);
+  let mean = track_stats[0].mean.unwrap();
+  let ref_post = if mean >= threshold {
+    mean + vol
+  } else {
+    -20.0 + vol
+  };
+  computed_vols[0] = vol;
+  ref_posts[0] = ref_post;
+
+  // Remaining tracks: each relative to the previous
+  for i in 1..tracks.len() {
+    let offset = tracks[i].offset;
+    let prev_offset = tracks[i - 1].offset;
+    let prev_ref_post = ref_posts[i - 1];
+    let mean = track_stats[i].mean.unwrap();
+    let target = prev_ref_post + (offset - prev_offset);
+    let (vol, ref_post) = if mean >= threshold {
+      let v = clamp(target - mean, -100.0, 30.0);
+      (v, mean + v)
+    } else {
+      let v = clamp(offset, -100.0, 30.0);
+      (v, target)
+    };
+    computed_vols[i] = vol;
+    ref_posts[i] = ref_post;
   }
 
   Some(computed_vols)

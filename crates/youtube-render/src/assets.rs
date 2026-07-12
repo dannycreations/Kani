@@ -23,6 +23,12 @@ impl AssetSource for EmbedAssets {
       "icons/delete.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
         "../assets/icons/delete.svg"
       )))),
+      "icons/external-link.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+        "../assets/icons/external-link.svg"
+      )))),
+      "icons/folder-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!(
+        "../assets/icons/folder-open.svg"
+      )))),
       _ => Ok(None),
     }
   }
@@ -34,6 +40,8 @@ impl AssetSource for EmbedAssets {
       "icons/arrow-up.svg".into(),
       "icons/arrow-down.svg".into(),
       "icons/delete.svg".into(),
+      "icons/external-link.svg".into(),
+      "icons/folder-open.svg".into(),
     ])
   }
 }

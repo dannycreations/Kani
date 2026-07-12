@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::ffmpeg::{
-  AudioSettings, JobProgress, RenderProcess, RenderSettings, StepType,
+  AudioSettings, JobProgress, Preset, RenderProcess, RenderSettings, StepType,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +62,7 @@ pub struct QueueItem {
   pub id: usize,
   pub input_path: Arc<str>,
   pub output_path: Arc<str>,
+  pub preset_index: usize,
   pub settings: AudioSettings,
   pub status: QueueItemStatus,
   pub logs: Vec<Arc<str>>,
@@ -96,11 +97,13 @@ impl AppState {
       .map(|item| Arc::clone(&item.output_path))
       .collect();
     let output_path = compute_output_path(&path, &existing_outputs);
+    let preset_index = Preset::default_index();
     self.queue.push(QueueItem {
       id: self.next_id,
       input_path: Arc::from(path),
       output_path: Arc::from(output_path),
-      settings: AudioSettings::default(),
+      preset_index,
+      settings: AudioSettings::from_preset(&Preset::builtins()[preset_index]),
       status: QueueItemStatus::Pending,
       logs: Vec::new(),
     });
@@ -342,12 +345,15 @@ mod tests {
     assert_eq!(&*state.queue[1].input_path, "file2.mkv");
     assert_eq!(&*state.queue[2].input_path, "file3.mkv");
 
-    // Per-item settings default check
+    // Per-item settings default check (from default preset)
     assert!(!state.queue[0].settings.single_track);
-    assert_eq!(state.queue[0].settings.game_offset, -16.0);
+    assert_eq!(state.queue[0].settings.tracks.len(), 3);
+    assert_eq!(&*state.queue[0].settings.tracks[0].name, "Mic");
+    assert_eq!(state.queue[0].settings.tracks[0].offset, -2.0);
+    assert_eq!(&*state.queue[0].settings.tracks[2].name, "Game");
+    assert_eq!(state.queue[0].settings.tracks[2].offset, -16.0);
 
     // Test output_path uniqueness/incrementing logic (assuming files don't exist on disk)
-    // Wait, the tests don't have these files on disk, so file1.mkv gets file1.mp4, file2.mkv gets file2.mp4, file3.mkv gets file3.mp4
     assert_eq!(&*state.queue[0].output_path, "file1.mp4");
     assert_eq!(&*state.queue[1].output_path, "file2.mp4");
     assert_eq!(&*state.queue[2].output_path, "file3.mp4");
@@ -359,14 +365,7 @@ mod tests {
     assert_eq!(&*state.queue[1].input_path, "file1.mkv");
 
     // Test move_down
-    // second_id is the ID of "file2.mkv" (since we added it second, next_id was 2).
-    // Let's trace IDs: file1 -> id=1, file2 -> id=2, file3 -> id=3.
-    // At start: pos 0 is id=1 (file1), pos 1 is id=2 (file2).
-    // move_up(2) swaps pos 1 (id=2) and pos 0 (id=1).
-    // Now: pos 0 is id=2 (file2), pos 1 is id=1 (file1).
-    // Let's move id=2 down:
     state.move_down(2);
-    // Now: pos 0 is id=1 (file1), pos 1 is id=2 (file2).
     assert_eq!(&*state.queue[0].input_path, "file1.mkv");
     assert_eq!(&*state.queue[1].input_path, "file2.mkv");
 

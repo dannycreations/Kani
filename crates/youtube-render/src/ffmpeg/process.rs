@@ -1,6 +1,5 @@
 use std::{
   borrow::Cow,
-  collections::HashMap,
   io::{BufRead, BufReader},
   path::Path,
   process::{Child, Command, Stdio},
@@ -17,10 +16,7 @@ use super::{
     LoudnormResult, ProgressInfo, StepType,
   },
   settings::RenderSettings,
-  track::{
-    build_mix_filter_complex, clamp, compute_mix_volumes, AudioTrack,
-    TrackStats,
-  },
+  track::{build_mix_filter_complex, clamp, compute_mix_volumes, TrackStats},
 };
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
@@ -237,30 +233,38 @@ impl RenderProcess {
     input_file: &str,
     settings: &RenderSettings,
     tx: &Sender<JobProgress>,
-  ) -> Result<(f32, f32, f32)> {
+  ) -> Result<Vec<f32>> {
     let _ = tx.send(JobProgress::Starting(StepType::MixComputation));
     let _ = tx.send(JobProgress::Log(Arc::from(
       "Starting Step [1/3]: Mix Computation...",
     )));
 
-    let mix_args = vec![
+    let audio_tracks = &settings.audio.tracks;
+    let track_count = audio_tracks.len();
+
+    // Build volumedetect filter chain dynamically from preset tracks
+    let filter = audio_tracks
+      .iter()
+      .enumerate()
+      .map(|(i, t)| format!("[0:a:{}]volumedetect[a{}]", t.index, i))
+      .collect::<Vec<_>>()
+      .join(";");
+
+    let mut mix_args = vec![
       "-i".to_string(),
       input_file.to_string(),
       "-filter_complex".to_string(),
-      "[0:a:0]volumedetect[a0];[0:a:1]volumedetect[a1];[0:a:2]volumedetect[a2]"
-        .to_string(),
-      "-map".to_string(),
-      "[a0]".to_string(),
-      "-map".to_string(),
-      "[a1]".to_string(),
-      "-map".to_string(),
-      "[a2]".to_string(),
-      "-f".to_string(),
-      "null".to_string(),
-      "-".to_string(),
+      filter,
     ];
+    for i in 0..track_count {
+      mix_args.push("-map".to_string());
+      mix_args.push(format!("[a{}]", i));
+    }
+    mix_args.push("-f".to_string());
+    mix_args.push("null".to_string());
+    mix_args.push("-".to_string());
 
-    let mut tracks = vec![TrackStats::default(); 3];
+    let mut track_stats = vec![TrackStats::default(); track_count];
     let res = self.run_command(
       &settings.ffmpeg_path,
       &mix_args,
@@ -268,11 +272,11 @@ impl RenderProcess {
       tx,
       &mut |line| {
         if let Some((idx, is_mean, val)) = parse_volume_detect(line) {
-          if idx < tracks.len() {
+          if idx < track_stats.len() {
             if is_mean {
-              tracks[idx].mean = Some(val);
+              track_stats[idx].mean = Some(val);
             } else {
-              tracks[idx].peak = Some(val);
+              track_stats[idx].peak = Some(val);
             }
           }
         }
@@ -288,8 +292,8 @@ impl RenderProcess {
     }
 
     // Print parsed values
-    let labels = ["game", "mic", "discord"];
-    for (i, t) in tracks.iter().enumerate() {
+    for (i, t) in track_stats.iter().enumerate() {
+      let name = &audio_tracks[i].name;
       let mean_str = t
         .mean
         .map(|v| format!("{:.1} dBFS", v))
@@ -300,50 +304,37 @@ impl RenderProcess {
         .unwrap_or_else(|| "-".to_string());
       let _ = tx.send(JobProgress::Log(Arc::from(format!(
         "  {}  mean: {}   peak: {}",
-        labels[i], mean_str, peak_str
+        name, mean_str, peak_str
       ))));
     }
 
-    if let Some(computed) = compute_mix_volumes(&settings.audio, &tracks) {
-      let mic_vol = computed[&AudioTrack::Mic];
-      let discord_vol = computed[&AudioTrack::Discord];
-      let game_vol = computed[&AudioTrack::Game];
-
+    if let Some(computed) = compute_mix_volumes(&settings.audio, &track_stats) {
       let _ =
         tx.send(JobProgress::Log(Arc::from("Computed volume adjustments:")));
-      let gm = tracks[0].mean.unwrap();
-      let mm = tracks[1].mean.unwrap();
-      let dm = tracks[2].mean.unwrap();
-      let _ = tx.send(JobProgress::Log(Arc::from(format!(
-        "  game    {:.1}dB  →  {:.1} dBFS mean",
-        game_vol,
-        gm + game_vol
-      ))));
-      let _ = tx.send(JobProgress::Log(Arc::from(format!(
-        "  mic     {:.1}dB  →  {:.1} dBFS mean",
-        mic_vol,
-        mm + mic_vol
-      ))));
-      let _ = tx.send(JobProgress::Log(Arc::from(format!(
-        "  discord {:.1}dB  →  {:.1} dBFS mean",
-        discord_vol,
-        dm + discord_vol
-      ))));
-      Ok((game_vol, mic_vol, discord_vol))
+      for (i, vol) in computed.iter().enumerate() {
+        let name = &audio_tracks[i].name;
+        let mean = track_stats[i].mean.unwrap();
+        let _ = tx.send(JobProgress::Log(Arc::from(format!(
+          "  {:<9} {:.1}dB  →  {:.1} dBFS mean",
+          &**name,
+          vol,
+          mean + vol
+        ))));
+      }
+      Ok(computed)
     } else {
       let _ = tx.send(JobProgress::Log(Arc::from(
         "Warning: track levels unreadable; falling back to 0dB adjustments",
       )));
-      Ok((0.0, 0.0, 0.0))
+      Ok(vec![0.0; track_count])
     }
   }
 
-  #[allow(clippy::too_many_arguments)]
   fn run_audio_analysis(
     &self,
     input_file: &str,
     settings: &RenderSettings,
-    volumes: Option<(f32, f32, f32)>,
+    volumes: Option<&[f32]>,
     step_num: usize,
     total_steps: usize,
     tx: &Sender<JobProgress>,
@@ -355,14 +346,10 @@ impl RenderProcess {
     ))));
 
     let mut analysis_args = vec!["-i".to_string(), input_file.to_string()];
-    if let Some((game_vol, mic_vol, discord_vol)) = volumes {
-      let mut computed_vols = HashMap::new();
-      computed_vols.insert(AudioTrack::Game, game_vol);
-      computed_vols.insert(AudioTrack::Mic, mic_vol);
-      computed_vols.insert(AudioTrack::Discord, discord_vol);
+    if let Some(vols) = volumes {
       let mix_filter = build_mix_filter_complex(
-        AudioTrack::all(),
-        &computed_vols,
+        &settings.audio.tracks,
+        vols,
         "loudnorm=I=-14:LRA=11:TP=-1:print_format=json",
       );
       analysis_args.push("-filter_complex".to_string());
@@ -468,7 +455,7 @@ impl RenderProcess {
     output_file: &str,
     settings: &RenderSettings,
     res: &LoudnormResult,
-    volumes: Option<(f32, f32, f32)>,
+    volumes: Option<&[f32]>,
     step_num: usize,
     total_steps: usize,
     tx: &Sender<JobProgress>,
@@ -483,18 +470,14 @@ impl RenderProcess {
 
     let mut encode_args =
       vec!["-y".to_string(), "-i".to_string(), input_file.to_string()];
-    if let Some((game_vol, mic_vol, discord_vol)) = volumes {
-      let mut computed_vols = HashMap::new();
-      computed_vols.insert(AudioTrack::Game, game_vol);
-      computed_vols.insert(AudioTrack::Mic, mic_vol);
-      computed_vols.insert(AudioTrack::Discord, discord_vol);
+    if let Some(vols) = volumes {
       let loudnorm_suffix = format!(
         "loudnorm=I=-14:LRA=11:TP=-1:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true[out]",
         res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
       );
       let mix_filter = build_mix_filter_complex(
-        AudioTrack::all(),
-        &computed_vols,
+        &settings.audio.tracks,
+        vols,
         &loudnorm_suffix,
       );
       encode_args.push("-filter_complex".to_string());
@@ -565,7 +548,7 @@ impl RenderProcess {
     let loudnorm_res = self.run_audio_analysis(
       input_file,
       settings,
-      volumes,
+      volumes.as_deref(),
       analysis_step_num,
       total_steps,
       &tx,
@@ -577,7 +560,7 @@ impl RenderProcess {
       output_file,
       settings,
       &loudnorm_res,
-      volumes,
+      volumes.as_deref(),
       encode_step_num,
       total_steps,
       &tx,

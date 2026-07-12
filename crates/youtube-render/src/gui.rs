@@ -1,5 +1,6 @@
 use std::{
-  collections::{HashMap, HashSet},
+  collections::HashSet,
+  fs,
   path::Path,
   sync::{Arc, Mutex},
   time::Duration,
@@ -7,8 +8,8 @@ use std::{
 
 use gpui::{
   div, prelude::*, px, AsyncApp, Context, Entity, FontWeight,
-  InteractiveElement, IntoElement, ParentElement, Render, Styled, Timer,
-  Window,
+  InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
+  Timer, Window,
 };
 use gpui_component::{
   button::{Button, ButtonVariants as _},
@@ -27,7 +28,7 @@ use gpui_component::{
 use rfd::FileDialog;
 
 use crate::{
-  ffmpeg::{kill_all_children, AudioSettings, AudioTrack},
+  ffmpeg::{kill_all_children, AudioSettings, Preset},
   queue::{AppState, QueueItemStatus},
 };
 
@@ -42,7 +43,7 @@ pub struct TrackSliderState {
 }
 
 pub struct ItemSliderStates {
-  pub tracks: HashMap<AudioTrack, TrackSliderState>,
+  pub tracks: Vec<TrackSliderState>,
 }
 
 pub struct YtRenderApp {
@@ -52,7 +53,7 @@ pub struct YtRenderApp {
   active_tab: ConfigTab,
 
   // Per-video config slider states mapped by job ID
-  item_sliders: HashMap<usize, ItemSliderStates>,
+  item_sliders: Vec<(usize, ItemSliderStates)>,
 
   // Track which item sliders have their layout bounds resolved to avoid blinks
   sliders_ready: HashSet<usize>,
@@ -82,10 +83,26 @@ impl YtRenderApp {
       selected_job_id: None,
       expanded_job_id: None,
       active_tab: ConfigTab::Global,
-      item_sliders: HashMap::new(),
+      item_sliders: Vec::new(),
       sliders_ready: HashSet::new(),
       ffmpeg_path_state,
     }
+  }
+
+  fn get_sliders(&self, id: usize) -> Option<&ItemSliderStates> {
+    self
+      .item_sliders
+      .iter()
+      .find(|(k, _)| *k == id)
+      .map(|(_, v)| v)
+  }
+
+  fn has_sliders(&self, id: usize) -> bool {
+    self.item_sliders.iter().any(|(k, _)| *k == id)
+  }
+
+  fn remove_sliders(&mut self, id: usize) {
+    self.item_sliders.retain(|(k, _)| *k != id);
   }
 
   fn ensure_slider_states(
@@ -95,14 +112,14 @@ impl YtRenderApp {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    if self.item_sliders.contains_key(&id) {
+    if self.has_sliders(id) {
       return;
     }
 
-    let mut tracks_map = HashMap::new();
+    let mut tracks_vec = Vec::new();
 
-    for &track in AudioTrack::all() {
-      let val = settings.get_offset(track);
+    for (track_idx, track_config) in settings.tracks.iter().enumerate() {
+      let val = track_config.offset;
       let slider_state = cx.new(|_| {
         SliderState::new()
           .min(-30.0)
@@ -128,10 +145,12 @@ impl YtRenderApp {
             if let Some(item) =
               state.queue.iter_mut().find(|item| item.id == id)
             {
-              item.settings.set_offset(track, val);
+              if let Some(tc) = item.settings.tracks.get_mut(track_idx) {
+                tc.offset = val;
+              }
             }
-            if let Some(sliders) = this.item_sliders.get(&id) {
-              if let Some(track_slider) = sliders.tracks.get(&track) {
+            if let Some(sliders) = this.get_sliders(id) {
+              if let Some(track_slider) = sliders.tracks.get(track_idx) {
                 let input_val = track_slider.input_state.read(cx).value();
                 let needs_update = match input_val.parse::<f32>() {
                   Ok(parsed) => {
@@ -156,6 +175,9 @@ impl YtRenderApp {
       )
       .detach();
 
+      // Capture default offset for the blur/reset fallback
+      let default_offset = val;
+
       // Subscribe to input changes/blur
       cx.subscribe_in(
         &input_state,
@@ -172,10 +194,12 @@ impl YtRenderApp {
               if let Some(item) =
                 state.queue.iter_mut().find(|item| item.id == id)
               {
-                item.settings.set_offset(track, clamped_val);
+                if let Some(tc) = item.settings.tracks.get_mut(track_idx) {
+                  tc.offset = clamped_val;
+                }
               }
-              if let Some(sliders) = this.item_sliders.get(&id) {
-                if let Some(track_slider) = sliders.tracks.get(&track) {
+              if let Some(sliders) = this.get_sliders(id) {
+                if let Some(track_slider) = sliders.tracks.get(track_idx) {
                   let mut slider_val =
                     track_slider.slider_state.read(cx).value().start();
                   if slider_val == 0.0 {
@@ -192,19 +216,21 @@ impl YtRenderApp {
             }
           }
           InputEvent::Blur | InputEvent::PressEnter { .. } => {
-            let mut current_offset = track.default_offset();
+            let mut current_offset = default_offset;
             {
               let state = this.state.lock().unwrap();
               if let Some(item) = state.queue.iter().find(|item| item.id == id)
               {
-                current_offset = item.settings.get_offset(track);
+                if let Some(tc) = item.settings.tracks.get(track_idx) {
+                  current_offset = tc.offset;
+                }
               }
             }
             if current_offset == 0.0 {
               current_offset = 0.0;
             }
-            if let Some(sliders) = this.item_sliders.get(&id) {
-              if let Some(track_slider) = sliders.tracks.get(&track) {
+            if let Some(sliders) = this.get_sliders(id) {
+              if let Some(track_slider) = sliders.tracks.get(track_idx) {
                 track_slider.input_state.update(cx, |input, cx| {
                   input.set_value(format!("{:.0}", current_offset), window, cx);
                 });
@@ -217,18 +243,15 @@ impl YtRenderApp {
       )
       .detach();
 
-      tracks_map.insert(
-        track,
-        TrackSliderState {
-          slider_state,
-          input_state,
-        },
-      );
+      tracks_vec.push(TrackSliderState {
+        slider_state,
+        input_state,
+      });
     }
 
     self
       .item_sliders
-      .insert(id, ItemSliderStates { tracks: tracks_map });
+      .push((id, ItemSliderStates { tracks: tracks_vec }));
   }
 }
 
@@ -407,7 +430,7 @@ impl Render for YtRenderApp {
                 .iter()
                 .map(|item| item.id)
                 .collect();
-              this.item_sliders.retain(|id, _| queue_ids.contains(id));
+              this.item_sliders.retain(|(id, _)| queue_ids.contains(id));
               this.sliders_ready.retain(|id| queue_ids.contains(id));
               if let Some(expanded_id) = this.expanded_job_id {
                 if !queue_ids.contains(&expanded_id) {
@@ -455,6 +478,7 @@ impl Render for YtRenderApp {
         let is_expanded = self.expanded_job_id == Some(item.id);
         let id = item.id;
         let item_settings = item.settings.clone();
+        let item_preset_index = item.preset_index;
 
         let filename = Path::new(&*item.input_path)
           .file_name()
@@ -467,23 +491,155 @@ impl Render for YtRenderApp {
         let state_arc_down = Arc::clone(&self.state);
 
         let item_settings_panel = if is_expanded {
-          let sliders = self.item_sliders.get(&id).unwrap();
+          let sliders = self.get_sliders(id).unwrap();
           let single_track = item_settings.single_track;
           let sliders_disabled =
             is_running || !matches!(item.status, QueueItemStatus::Pending);
           let is_ready = self.sliders_ready.contains(&id);
           let slider_opacity = if is_ready { 1.0 } else { 0.0 };
 
+          // Preset selector buttons
+          let builtins = Preset::builtins();
+          let mut preset_row = h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().text_xs().child("Preset:"));
+          for (preset_idx, preset) in builtins.iter().enumerate() {
+            let is_active_preset = item_preset_index == preset_idx;
+            let preset_name = preset.name.to_string();
+            let item_view_preset = item_view.clone();
+            preset_row = preset_row.child(
+              Button::new(SharedString::from(format!(
+                "preset_{}_{}",
+                id, preset_idx
+              )))
+              .label(preset_name)
+              .compact()
+              .when(is_active_preset, |b| b.primary())
+              .disabled(sliders_disabled)
+              .on_click(move |_, window, cx| {
+                if let Some(view) = item_view_preset.upgrade() {
+                  view.update(cx, |this, cx| {
+                    {
+                      let mut state = this.state.lock().unwrap();
+                      if let Some(item) =
+                        state.queue.iter_mut().find(|item| item.id == id)
+                      {
+                        item.preset_index = preset_idx;
+                        item.settings = AudioSettings::from_preset(
+                          &Preset::builtins()[preset_idx],
+                        );
+                      }
+                    }
+                    // Rebuild sliders for the new preset's track layout
+                    this.remove_sliders(id);
+                    this.sliders_ready.remove(&id);
+                    let new_settings = {
+                      let state = this.state.lock().unwrap();
+                      state
+                        .queue
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map(|item| item.settings.clone())
+                    };
+                    if let Some(settings) = new_settings {
+                      this.ensure_slider_states(id, &settings, window, cx);
+                      this.sliders_ready.insert(id);
+                    }
+                    cx.notify();
+                  });
+                }
+              }),
+            );
+          }
+
+          // Export button: serializes current settings to INI and saves
+          let settings_for_export = item_settings.clone();
+          preset_row = preset_row.child(
+            Button::new(SharedString::from(format!("export_{}", id)))
+              .icon(IconName::ExternalLink)
+              .compact()
+              .disabled(sliders_disabled)
+              .on_click(move |_, _, cx| {
+                let ini_content = settings_for_export.to_ini();
+                cx.spawn(|_: &mut AsyncApp| async move {
+                  let file = FileDialog::new()
+                    .add_filter("INI files", &["ini"])
+                    .set_file_name("preset.ini")
+                    .save_file();
+                  if let Some(path) = file {
+                    let _ = fs::write(path, ini_content);
+                  }
+                })
+                .detach();
+              }),
+          );
+
+          // Import button: reads INI file and applies to this item
+          let item_view_import = item_view.clone();
+          preset_row = preset_row.child(
+            Button::new(SharedString::from(format!("import_{}", id)))
+              .icon(IconName::FolderOpen)
+              .compact()
+              .disabled(sliders_disabled)
+              .on_click(move |_, _, cx| {
+                let view = item_view_import.clone();
+                cx.spawn(move |cx: &mut AsyncApp| {
+                  let cx = cx.clone();
+                  async move {
+                    let file = FileDialog::new()
+                      .add_filter("INI files", &["ini"])
+                      .pick_file();
+                    let Some(path) = file else { return };
+                    let Ok(content) = fs::read_to_string(&path) else {
+                      return;
+                    };
+                    let Ok(new_settings) = AudioSettings::from_ini(&content)
+                    else {
+                      return;
+                    };
+                    let _ = cx.update(|cx| {
+                      if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                          {
+                            let mut state = this.state.lock().unwrap();
+                            if let Some(item) =
+                              state.queue.iter_mut().find(|item| item.id == id)
+                            {
+                              item.settings = new_settings;
+                            }
+                          }
+                          // Invalidate sliders and collapse panel so they
+                          // are recreated on next expand (slider creation
+                          // requires a Window reference unavailable here).
+                          this.remove_sliders(id);
+                          this.sliders_ready.remove(&id);
+                          if this.expanded_job_id == Some(id) {
+                            this.expanded_job_id = None;
+                          }
+                          cx.notify();
+                        });
+                      }
+                    });
+                  }
+                })
+                .detach();
+              }),
+          );
+
+          // Track offset sliders (dynamic from settings.tracks)
           let mut tracks_container = v_flex().gap_1();
-          for &track in AudioTrack::all() {
-            if let Some(track_slider) = sliders.tracks.get(&track) {
+          for (track_idx, track_config) in
+            item_settings.tracks.iter().enumerate()
+          {
+            if let Some(track_slider) = sliders.tracks.get(track_idx) {
               tracks_container = tracks_container.child(
                 h_flex()
                   .gap_2()
                   .items_center()
                   .child(div().w(px(180.0)).text_xs().child(format!(
                     "{} track offset (dB):",
-                    track.display_name()
+                    &*track_config.name
                   )))
                   .child(
                     div().flex_grow().child(
@@ -509,6 +665,8 @@ impl Render for YtRenderApp {
               .p_2()
               .rounded_sm()
               .bg(cx.theme().accent.opacity(0.02))
+              .child(preset_row)
+              .child(Divider::horizontal())
               .child(
                 Checkbox::new(("single_track", id))
                   .checked(single_track)
@@ -707,7 +865,7 @@ impl Render for YtRenderApp {
                               if this.expanded_job_id == Some(id) {
                                 this.expanded_job_id = None;
                               }
-                              this.item_sliders.remove(&id);
+                              this.remove_sliders(id);
                               this.sliders_ready.remove(&id);
                               cx.notify();
                             });

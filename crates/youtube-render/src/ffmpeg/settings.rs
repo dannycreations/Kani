@@ -1,43 +1,168 @@
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use super::track::AudioTrack;
+use super::preset::Preset;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrackConfig {
+  pub name: Arc<str>,
+  pub index: usize,
+  pub offset: f32,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioSettings {
   pub single_track: bool,
-  pub game_offset: f32,
-  pub mic_offset: f32,
-  pub discord_offset: f32,
+  pub tracks: Vec<TrackConfig>,
 }
 
 impl AudioSettings {
-  pub fn get_offset(&self, track: AudioTrack) -> f32 {
-    match track {
-      AudioTrack::Mic => self.mic_offset,
-      AudioTrack::Discord => self.discord_offset,
-      AudioTrack::Game => self.game_offset,
+  pub fn from_preset(preset: &Preset) -> Self {
+    Self {
+      single_track: false,
+      tracks: preset
+        .tracks
+        .iter()
+        .map(|t| TrackConfig {
+          name: Arc::clone(&t.name),
+          index: t.index,
+          offset: t.default_offset,
+        })
+        .collect(),
     }
   }
 
-  pub fn set_offset(&mut self, track: AudioTrack, offset: f32) {
-    match track {
-      AudioTrack::Mic => self.mic_offset = offset,
-      AudioTrack::Discord => self.discord_offset = offset,
-      AudioTrack::Game => self.game_offset = offset,
+  pub fn to_ini(&self) -> String {
+    let mut out = String::new();
+    out.push_str("[audio]\n");
+    let _ = writeln!(out, "single_track = {}", self.single_track);
+    out.push('\n');
+    for (i, track) in self.tracks.iter().enumerate() {
+      let _ = writeln!(out, "[track.{}]", i);
+      let _ = writeln!(out, "name = {}", track.name);
+      let _ = writeln!(out, "index = {}", track.index);
+      let _ = writeln!(out, "offset = {:.1}", track.offset);
+      out.push('\n');
     }
+    out
+  }
+
+  pub fn from_ini(content: &str) -> Result<Self> {
+    let mut single_track = false;
+    let mut tracks: Vec<TrackConfig> = Vec::new();
+    let mut current_section = String::new();
+    let mut pending_name: Option<Arc<str>> = None;
+    let mut pending_index: Option<usize> = None;
+    let mut pending_offset: Option<f32> = None;
+
+    let flush_track = |tracks: &mut Vec<TrackConfig>,
+                       name: &mut Option<Arc<str>>,
+                       index: &mut Option<usize>,
+                       offset: &mut Option<f32>|
+     -> Result<()> {
+      let n = name
+        .take()
+        .ok_or_else(|| anyhow!("track section missing 'name'"))?;
+      let i = index
+        .take()
+        .ok_or_else(|| anyhow!("track section missing 'index'"))?;
+      let o = offset
+        .take()
+        .ok_or_else(|| anyhow!("track section missing 'offset'"))?;
+      tracks.push(TrackConfig {
+        name: n,
+        index: i,
+        offset: o,
+      });
+      Ok(())
+    };
+
+    for line in content.lines() {
+      let line = line.trim();
+      if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+        continue;
+      }
+
+      // Section header
+      if let Some(inner) =
+        line.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+      {
+        // Flush any pending track before switching sections
+        if current_section.starts_with("track.")
+          && (pending_name.is_some()
+            || pending_index.is_some()
+            || pending_offset.is_some())
+        {
+          flush_track(
+            &mut tracks,
+            &mut pending_name,
+            &mut pending_index,
+            &mut pending_offset,
+          )?;
+        }
+        current_section = inner.trim().to_string();
+        continue;
+      }
+
+      // Key = value
+      let Some(eq_pos) = line.find('=') else {
+        continue;
+      };
+      let key = line[..eq_pos].trim();
+      let value = line[eq_pos + 1..].trim();
+
+      if current_section == "audio" {
+        if key == "single_track" {
+          single_track = value == "true";
+        }
+      } else if current_section.starts_with("track.") {
+        match key {
+          "name" => pending_name = Some(Arc::from(value)),
+          "index" => {
+            pending_index = Some(
+              value
+                .parse::<usize>()
+                .map_err(|_| anyhow!("invalid index: '{}'", value))?,
+            )
+          }
+          "offset" => {
+            pending_offset = Some(
+              value
+                .parse::<f32>()
+                .map_err(|_| anyhow!("invalid offset: '{}'", value))?,
+            )
+          }
+          _ => {}
+        }
+      }
+    }
+
+    // Flush the last pending track
+    if current_section.starts_with("track.")
+      && (pending_name.is_some()
+        || pending_index.is_some()
+        || pending_offset.is_some())
+    {
+      flush_track(
+        &mut tracks,
+        &mut pending_name,
+        &mut pending_index,
+        &mut pending_offset,
+      )?;
+    }
+
+    Ok(Self {
+      single_track,
+      tracks,
+    })
   }
 }
 
 impl Default for AudioSettings {
   fn default() -> Self {
-    Self {
-      single_track: false,
-      game_offset: AudioTrack::Game.default_offset(),
-      mic_offset: AudioTrack::Mic.default_offset(),
-      discord_offset: AudioTrack::Discord.default_offset(),
-    }
+    Self::from_preset(&Preset::builtins()[Preset::default_index()])
   }
 }
 
