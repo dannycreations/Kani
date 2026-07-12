@@ -513,6 +513,10 @@ impl RenderProcess {
       return Err(e);
     }
 
+    let _ = tx.send(JobProgress::Log(Arc::from(format!(
+      "Output at {}",
+      output_file_str
+    ))));
     let _ = tx.send(JobProgress::Completed(Arc::from(output_file_str)));
 
     Ok(())

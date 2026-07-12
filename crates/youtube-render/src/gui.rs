@@ -926,30 +926,24 @@ impl Render for YtRenderApp {
       .child(Divider::horizontal())
       .child(
         if let Some(job) = display_job {
-          let output_exists = Path::new(&*job.output_path).exists();
           v_flex()
             .gap_2()
             .flex_grow()
             .h_full()
-            .child(div().text_sm().child(format!("Input: {}", &*job.input_path)))
-            .child(
+            .when_some(
               match &job.status {
-                QueueItemStatus::Completed { output_path } => {
-                  if output_exists {
-                    div().text_color(cx.theme().success).text_sm().child(format!("Output: {}", &**output_path))
-                  } else {
-                    div().text_sm().child(format!("Output: {}", &**output_path))
-                  }
-                }
-                QueueItemStatus::Failed(err) => {
-                  div().text_color(cx.theme().danger).text_sm().child(format!("Error: {}", &**err))
-                }
-                _ => {
-                  div().text_sm().child(format!("Output: {}", &*job.output_path))
-                }
-              }
+                QueueItemStatus::Failed(err) => Some(Arc::clone(err)),
+                _ => None,
+              },
+              |this, err| {
+                this.child(
+                  div()
+                    .text_color(cx.theme().danger)
+                    .text_sm()
+                    .child(format!("Error: {}", &*err)),
+                )
+              },
             )
-            .child(Divider::horizontal())
             .child(div().text_sm().child("Processing logs:"))
             .child(
               v_flex()
