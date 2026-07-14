@@ -5,8 +5,12 @@ use tray_icon::{
   menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
   Icon, TrayIcon, TrayIconBuilder,
 };
+use windows::Win32::{
+  Foundation::{LPARAM, WPARAM},
+  UI::WindowsAndMessaging::PostThreadMessageW,
+};
 
-use crate::registry::is_autorun_registered;
+use crate::{registry::is_autorun_registered, WM_WAKEUP};
 
 pub enum TrayAction {
   ToggleInput,
@@ -219,11 +223,11 @@ impl TrayApp {
   pub fn handle_events(&self) -> Option<TrayAction> {
     if let Ok(event) = MenuEvent::receiver().try_recv() {
       unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+        let _ = PostThreadMessageW(
           self.main_thread_id,
-          crate::WM_WAKEUP,
-          windows::Win32::Foundation::WPARAM(0),
-          windows::Win32::Foundation::LPARAM(0),
+          WM_WAKEUP,
+          WPARAM(0),
+          LPARAM(0),
         );
       }
       if event.id == self.menu_item_toggle_input.id() {

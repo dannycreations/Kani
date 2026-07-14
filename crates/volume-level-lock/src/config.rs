@@ -1,8 +1,13 @@
 #![cfg(windows)]
 
-use std::{env, fs, path::PathBuf};
+use std::{
+  env, fs,
+  path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Result};
+#[cfg(test)]
+use tempfile::tempdir;
 
 pub struct Config {
   pub input_target: u32,
@@ -16,7 +21,7 @@ impl Config {
     Self::load_from_path(&Self::get_path()?)
   }
 
-  pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
+  pub fn load_from_path(path: &Path) -> Result<Self> {
     let default_config = Self {
       input_target: 100,
       output_target: 100,
@@ -115,7 +120,7 @@ impl Config {
     self.save_to_path(&Self::get_path()?)
   }
 
-  pub fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
+  pub fn save_to_path(&self, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent)?;
     }
@@ -144,13 +149,11 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-  use std::fs;
-
   use super::*;
 
   #[test]
   fn test_load_non_existent() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("config.txt");
     let cfg = Config::load_from_path(&file_path).unwrap();
     assert_eq!(cfg.input_target, 100);
@@ -161,7 +164,7 @@ mod tests {
 
   #[test]
   fn test_load_key_value() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("config.txt");
     fs::write(
       &file_path,
@@ -177,7 +180,7 @@ mod tests {
 
   #[test]
   fn test_save_and_load() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("config.txt");
     let cfg = Config {
       input_target: 30,
@@ -195,7 +198,7 @@ mod tests {
 
   #[test]
   fn test_corrupted_config_rewritten() {
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempdir().unwrap();
     let file_path = temp_dir.path().join("config.txt");
     fs::write(&file_path, "invalid_junk_data_here").unwrap();
 

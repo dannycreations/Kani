@@ -1,6 +1,6 @@
 use std::{
   fs::{create_dir_all, metadata, write},
-  io::{self, Cursor},
+  io::{Cursor, Error as StdIoError},
   marker::PhantomData,
   path::{Path, PathBuf},
   str::FromStr,
@@ -27,7 +27,7 @@ pub enum TransformerError {
   #[error("Failed to optimize PNG: {0}")]
   OptimizationError(String),
   #[error("IO error: {0}")]
-  IoError(#[from] io::Error),
+  IoError(#[from] StdIoError),
   #[error("Image error: {0}")]
   ImageError(#[from] ImageError),
   #[error("Invalid input: {0}")]
@@ -241,7 +241,7 @@ pub fn run(
       } else {
         WalkDir::new(input)
           .into_iter()
-          .filter_map(Result::ok)
+          .filter_map(|e| e.ok())
           .filter(|e| e.file_type().is_file())
           .map(|e| e.path().to_path_buf())
           .filter(|path| {

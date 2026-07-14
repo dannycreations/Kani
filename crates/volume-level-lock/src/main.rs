@@ -8,6 +8,8 @@ mod tray;
 mod utils;
 
 use std::{
+  fs,
+  process::Command,
   sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::channel,
@@ -35,13 +37,13 @@ use windows::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
   },
   Win32::System::ProcessStatus::EmptyWorkingSet,
-  Win32::System::Threading::GetCurrentProcess,
+  Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId},
   Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostThreadMessageW, MSG, WM_QUIT,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, MSG, WM_QUIT, WM_USER,
   },
 };
 
-pub const WM_WAKEUP: u32 = windows::Win32::UI::WindowsAndMessaging::WM_USER + 1;
+pub const WM_WAKEUP: u32 = WM_USER + 1;
 
 /// Lock default input and output volumes at fixed target levels.
 #[derive(Parser, Debug)]
@@ -146,8 +148,7 @@ fn run_enforcer(config: Config) -> Result<()> {
   let output_target = Arc::new(AtomicU32::new(config.output_target));
   let input_paused = Arc::new(AtomicBool::new(config.input_paused));
   let output_paused = Arc::new(AtomicBool::new(config.output_paused));
-  let main_thread_id =
-    unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+  let main_thread_id = unsafe { GetCurrentThreadId() };
 
   // Setup System Tray icon
   let tray_app = TrayApp::new(
@@ -222,7 +223,7 @@ fn run_enforcer(config: Config) -> Result<()> {
       thread::sleep(Duration::from_millis(1500));
       if let Some(ref path) = config_path {
         let current_modified =
-          std::fs::metadata(path).and_then(|m| m.modified()).ok();
+          fs::metadata(path).and_then(|m| m.modified()).ok();
 
         if current_modified.is_none() || current_modified != last_modified {
           last_modified = current_modified;
@@ -363,13 +364,12 @@ fn run_enforcer(config: Config) -> Result<()> {
         TrayAction::PromptSetTarget => {
           if let Ok(path) = Config::get_path() {
             if let Some(parent) = path.parent() {
-              let _ = std::fs::create_dir_all(parent);
+              let _ = fs::create_dir_all(parent);
             }
             if !path.exists() {
-              let _ = std::fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
+              let _ = fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
             }
-            let _ =
-              std::process::Command::new("notepad.exe").arg(&path).spawn();
+            let _ = Command::new("notepad.exe").arg(&path).spawn();
           }
         }
         TrayAction::ToggleAutorun => {

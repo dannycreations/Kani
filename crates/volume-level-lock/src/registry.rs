@@ -1,18 +1,19 @@
 #![cfg(windows)]
 
-use std::{env, thread};
+use std::{env, process::Command, slice, thread};
 
 use anyhow::{anyhow, Result};
 use windows::Win32::System::Registry::{
-  RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW,
-  HKEY_CURRENT_USER, KEY_WRITE, REG_SZ, REG_VALUE_TYPE,
+  RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
+  RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+  KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 use windows_core::PCWSTR;
 
+use crate::utils::to_wide;
+
 const REG_RUN_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const REG_VALUE_NAME: &str = "VolumeLevelLock";
-
-use crate::utils::to_wide;
 
 pub fn register_autorun() -> Result<()> {
   let executable_path = env::current_exe()?;
@@ -23,13 +24,13 @@ pub fn register_autorun() -> Result<()> {
   let command_utf16 = to_wide(&command_line);
 
   unsafe {
-    let mut key_handle = windows::Win32::System::Registry::HKEY::default();
+    let mut key_handle = HKEY::default();
     let status = RegCreateKeyExW(
       HKEY_CURRENT_USER,
       PCWSTR(subkey_utf16.as_ptr()),
       Some(0),
       PCWSTR::null(),
-      windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
+      REG_OPTION_NON_VOLATILE,
       KEY_WRITE,
       None,
       &mut key_handle,
@@ -45,13 +46,13 @@ pub fn register_autorun() -> Result<()> {
       PCWSTR(value_name_utf16.as_ptr()),
       Some(0),
       REG_SZ,
-      Some(std::slice::from_raw_parts(
+      Some(slice::from_raw_parts(
         command_utf16.as_ptr() as *const u8,
         command_utf16.len() * 2,
       )),
     );
 
-    let _ = windows::Win32::System::Registry::RegCloseKey(key_handle);
+    let _ = RegCloseKey(key_handle);
 
     if status_val.is_err() {
       return Err(anyhow!("Failed to write registry value for autorun"));
@@ -61,9 +62,7 @@ pub fn register_autorun() -> Result<()> {
   // Also attempt to start the command in the background
   let child_path = executable_path;
   let _ = thread::spawn(move || {
-    let _ = std::process::Command::new(child_path)
-      .arg("--hidden")
-      .spawn();
+    let _ = Command::new(child_path).arg("--hidden").spawn();
   });
 
   Ok(())
@@ -74,7 +73,7 @@ pub fn deregister_autorun() -> Result<()> {
   let value_name_utf16 = to_wide(REG_VALUE_NAME);
 
   unsafe {
-    let mut key_handle = windows::Win32::System::Registry::HKEY::default();
+    let mut key_handle = HKEY::default();
     let status = RegOpenKeyExW(
       HKEY_CURRENT_USER,
       PCWSTR(subkey_utf16.as_ptr()),
@@ -88,7 +87,7 @@ pub fn deregister_autorun() -> Result<()> {
     }
 
     let _ = RegDeleteValueW(key_handle, PCWSTR(value_name_utf16.as_ptr()));
-    let _ = windows::Win32::System::Registry::RegCloseKey(key_handle);
+    let _ = RegCloseKey(key_handle);
   }
 
   Ok(())
@@ -99,12 +98,12 @@ pub fn is_autorun_registered() -> bool {
   let value_name_utf16 = to_wide(REG_VALUE_NAME);
 
   unsafe {
-    let mut key_handle = windows::Win32::System::Registry::HKEY::default();
+    let mut key_handle = HKEY::default();
     let status = RegOpenKeyExW(
       HKEY_CURRENT_USER,
       PCWSTR(subkey_utf16.as_ptr()),
       None,
-      windows::Win32::System::Registry::KEY_READ,
+      KEY_READ,
       &mut key_handle,
     );
 
@@ -114,7 +113,7 @@ pub fn is_autorun_registered() -> bool {
 
     let mut value_type = REG_VALUE_TYPE::default();
     let mut data_len = 0u32;
-    let status_val = windows::Win32::System::Registry::RegQueryValueExW(
+    let status_val = RegQueryValueExW(
       key_handle,
       PCWSTR(value_name_utf16.as_ptr()),
       None,
@@ -123,7 +122,7 @@ pub fn is_autorun_registered() -> bool {
       Some(&mut data_len),
     );
 
-    let _ = windows::Win32::System::Registry::RegCloseKey(key_handle);
+    let _ = RegCloseKey(key_handle);
     status_val.is_ok()
   }
 }

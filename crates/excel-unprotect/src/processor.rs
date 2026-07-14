@@ -1,6 +1,6 @@
 use std::{
   fs::File,
-  io::{self, BufWriter, Read, Seek, SeekFrom, Write},
+  io::{stdin, stdout, BufWriter, Read, Seek, SeekFrom, Write},
   path::Path,
 };
 
@@ -65,10 +65,10 @@ fn find_valid_password(file: &mut File) -> Result<NamedTempFile> {
       "Enter file password (attempt {}/{}): ",
       attempt, MAX_ATTEMPTS
     );
-    io::stdout().flush()?;
+    stdout().flush()?;
 
     let mut input_pass = String::new();
-    io::stdin().read_line(&mut input_pass)?;
+    stdin().read_line(&mut input_pass)?;
     let input_pass = input_pass.trim();
 
     if let Ok(temp_file) = attempt_decryption(file, input_pass) {

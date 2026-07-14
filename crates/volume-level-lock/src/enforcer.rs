@@ -8,9 +8,10 @@ use std::sync::{
 
 use anyhow::Result;
 use windows::Win32::{
-  Foundation::PROPERTYKEY,
+  Foundation::{LPARAM, PROPERTYKEY, WPARAM},
   Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, eRender, ERole,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow,
+    ERole,
     Endpoints::{
       IAudioEndpointVolume, IAudioEndpointVolumeCallback,
       IAudioEndpointVolumeCallback_Impl,
@@ -19,8 +20,11 @@ use windows::Win32::{
     MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
   },
   System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
+  UI::WindowsAndMessaging::PostThreadMessageW,
 };
-use windows_core::{implement, GUID, PCWSTR};
+use windows_core::{implement, Result as WinResult, GUID, PCWSTR};
+
+use crate::WM_WAKEUP;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFlow {
@@ -138,9 +142,7 @@ impl AudioEnforcer {
     Ok(())
   }
 
-  fn flow_to_win_flow(
-    flow: AudioFlow,
-  ) -> windows::Win32::Media::Audio::EDataFlow {
+  fn flow_to_win_flow(flow: AudioFlow) -> EDataFlow {
     match flow {
       AudioFlow::Input => eCapture,
       AudioFlow::Output => eRender,
@@ -228,7 +230,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
   fn OnNotify(
     &self,
     notification_data_ptr: *mut AUDIO_VOLUME_NOTIFICATION_DATA,
-  ) -> windows_core::Result<()> {
+  ) -> WinResult<()> {
     if notification_data_ptr.is_null() {
       return Ok(());
     }
@@ -278,38 +280,35 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     &self,
     _device_id_ptr: &PCWSTR,
     _new_state: DEVICE_STATE,
-  ) -> windows_core::Result<()> {
+  ) -> WinResult<()> {
     Ok(())
   }
 
-  fn OnDeviceAdded(&self, _device_id_ptr: &PCWSTR) -> windows_core::Result<()> {
+  fn OnDeviceAdded(&self, _device_id_ptr: &PCWSTR) -> WinResult<()> {
     Ok(())
   }
 
-  fn OnDeviceRemoved(
-    &self,
-    _device_id_ptr: &PCWSTR,
-  ) -> windows_core::Result<()> {
+  fn OnDeviceRemoved(&self, _device_id_ptr: &PCWSTR) -> WinResult<()> {
     Ok(())
   }
 
   fn OnDefaultDeviceChanged(
     &self,
-    flow: windows::Win32::Media::Audio::EDataFlow,
+    flow: EDataFlow,
     role: ERole,
     _default_device_id_ptr: &PCWSTR,
-  ) -> windows_core::Result<()> {
+  ) -> WinResult<()> {
     let target_flow = AudioEnforcer::flow_to_win_flow(self.flow);
     if flow == target_flow {
       let _ = self
         .event_tx
         .send(EnforcerEvent::RebindRole(self.flow, role));
       unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+        let _ = PostThreadMessageW(
           self.main_thread_id,
-          crate::WM_WAKEUP,
-          windows::Win32::Foundation::WPARAM(0),
-          windows::Win32::Foundation::LPARAM(0),
+          WM_WAKEUP,
+          WPARAM(0),
+          LPARAM(0),
         );
       }
     }
@@ -320,7 +319,7 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     &self,
     _device_id_ptr: &PCWSTR,
     _key: &PROPERTYKEY,
-  ) -> windows_core::Result<()> {
+  ) -> WinResult<()> {
     Ok(())
   }
 }
