@@ -12,11 +12,10 @@ use anyhow::{anyhow, Result};
 
 use super::{
   progress::{
-    extract_loudnorm_val, parse_duration, parse_volume_detect, JobProgress,
-    LoudnormResult, ProgressInfo, StepType,
+    FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
   },
   settings::RenderSettings,
-  track::{build_mix_filter_complex, clamp, compute_mix_volumes, TrackStats},
+  track::{AudioRenderer, TrackStats},
 };
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
@@ -153,7 +152,7 @@ impl RenderProcess {
             if dur > 0.0 {
               let current_secs =
                 progress_info.out_time_us.unwrap_or(0) as f32 / 1_000_000.0;
-              clamp(current_secs / dur, 0.0, 1.0)
+              AudioRenderer::clamp(current_secs / dur, 0.0, 1.0)
             } else {
               0.0
             }
@@ -198,7 +197,7 @@ impl RenderProcess {
 
         let mut dur_lock = duration.lock().unwrap();
         if dur_lock.is_none() {
-          if let Some(d) = parse_duration(line) {
+          if let Some(d) = FfmpegParser::parse_duration(line) {
             *dur_lock = Some(d);
           }
         }
@@ -271,7 +270,9 @@ impl RenderProcess {
       StepType::MixComputation,
       tx,
       &mut |line| {
-        if let Some((idx, is_mean, val)) = parse_volume_detect(line) {
+        if let Some((idx, is_mean, val)) =
+          FfmpegParser::parse_volume_detect(line)
+        {
           if idx < track_stats.len() {
             if is_mean {
               track_stats[idx].mean = Some(val);
@@ -308,7 +309,9 @@ impl RenderProcess {
       ))));
     }
 
-    if let Some(computed) = compute_mix_volumes(&settings.audio, &track_stats) {
+    if let Some(computed) =
+      AudioRenderer::compute_mix_volumes(&settings.audio, &track_stats)
+    {
       let _ =
         tx.send(JobProgress::Log(Arc::from("Computed volume adjustments:")));
       for (i, vol) in computed.iter().enumerate() {
@@ -347,7 +350,7 @@ impl RenderProcess {
 
     let mut analysis_args = vec!["-i".to_string(), input_file.to_string()];
     if let Some(vols) = volumes {
-      let mix_filter = build_mix_filter_complex(
+      let mix_filter = AudioRenderer::build_mix_filter_complex(
         &settings.audio.tracks,
         vols,
         "loudnorm=I=-14:LRA=11:TP=-1:print_format=json",
@@ -376,19 +379,21 @@ impl RenderProcess {
       tx,
       &mut |line| {
         if input_i.is_none() {
-          input_i = extract_loudnorm_val(line, "\"input_i\"");
+          input_i = FfmpegParser::extract_loudnorm_val(line, "\"input_i\"");
         }
         if input_lra.is_none() {
-          input_lra = extract_loudnorm_val(line, "\"input_lra\"");
+          input_lra = FfmpegParser::extract_loudnorm_val(line, "\"input_lra\"");
         }
         if input_tp.is_none() {
-          input_tp = extract_loudnorm_val(line, "\"input_tp\"");
+          input_tp = FfmpegParser::extract_loudnorm_val(line, "\"input_tp\"");
         }
         if input_thresh.is_none() {
-          input_thresh = extract_loudnorm_val(line, "\"input_thresh\"");
+          input_thresh =
+            FfmpegParser::extract_loudnorm_val(line, "\"input_thresh\"");
         }
         if target_offset.is_none() {
-          target_offset = extract_loudnorm_val(line, "\"target_offset\"");
+          target_offset =
+            FfmpegParser::extract_loudnorm_val(line, "\"target_offset\"");
         }
       },
     );
@@ -475,7 +480,7 @@ impl RenderProcess {
         "loudnorm=I=-14:LRA=11:TP=-1:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true[out]",
         res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
       );
-      let mix_filter = build_mix_filter_complex(
+      let mix_filter = AudioRenderer::build_mix_filter_complex(
         &settings.audio.tracks,
         vols,
         &loudnorm_suffix,

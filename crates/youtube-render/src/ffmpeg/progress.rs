@@ -9,24 +9,7 @@ pub struct LoudnormResult {
   pub target_offset: f32,
 }
 
-pub fn extract_loudnorm_val(line: &str, key: &str) -> Option<f32> {
-  let key_pos = line.find(key)?;
-  let sub = &line[key_pos + key.len()..];
-  let colon_pos = sub.find(':')?;
-  let val_part = &sub[colon_pos + 1..];
-
-  // Find the first quote
-  let start_quote = val_part.find('"')?;
-  let val_part = &val_part[start_quote + 1..];
-
-  // Find the closing quote
-  let end_quote = val_part.find('"')?;
-  let val_str = &val_part[..end_quote];
-
-  val_str.trim().parse::<f32>().ok()
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepType {
   MixComputation,
   AudioAnalysis,
@@ -47,46 +30,91 @@ pub enum JobProgress {
   Failed(Arc<str>),
 }
 
-pub fn parse_duration(line: &str) -> Option<f32> {
-  let pos = line.find("Duration:")?;
-  let sub = line[pos + 9..].split(',').next()?;
-  let mut parts = sub.trim().split(':');
-
-  let hours: f32 = parts.next()?.trim().parse().ok()?;
-  let minutes: f32 = parts.next()?.trim().parse().ok()?;
-  let seconds: f32 = parts.next()?.trim().parse().ok()?;
-
-  if parts.next().is_none() {
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
-  } else {
-    None
-  }
+#[derive(Debug, Clone, PartialEq)]
+pub enum VolumeType {
+  Mean,
+  Max,
 }
 
-pub fn parse_volume_detect(line: &str) -> Option<(usize, bool, f32)> {
-  let pos = line.find("volumedetect_")?;
-  let sub = &line[pos + 13..];
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolumeDetectInfo {
+  pub track_index: usize,
+  pub volume_type: VolumeType,
+  pub volume_db: f32,
+}
 
-  // Find where the index digits end
-  let end_digits = sub.find(|c: char| !c.is_ascii_digit()).unwrap_or(sub.len());
-  if end_digits == 0 {
-    return None;
+pub struct FfmpegParser;
+
+impl FfmpegParser {
+  pub fn extract_loudnorm_val(line: &str, key: &str) -> Option<f32> {
+    let key_pos = line.find(key)?;
+    let sub = &line[key_pos + key.len()..];
+    let colon_pos = sub.find(':')?;
+    let val_part = &sub[colon_pos + 1..];
+
+    // Find the first quote
+    let start_quote = val_part.find('"')?;
+    let val_part = &val_part[start_quote + 1..];
+
+    // Find the closing quote
+    let end_quote = val_part.find('"')?;
+    let val_str = &val_part[..end_quote];
+
+    val_str.trim().parse::<f32>().ok()
   }
-  let idx: usize = sub[..end_digits].parse().ok()?;
 
-  // Check if it contains mean_volume: or max_volume:
-  let (is_mean, val_pos) = if let Some(p) = line.find("mean_volume:") {
-    (true, p + 12)
-  } else {
-    let p = line.find("max_volume:")?;
-    (false, p + 11)
-  };
+  pub fn parse_duration(line: &str) -> Option<f32> {
+    let pos = line.find("Duration:")?;
+    let sub = line[pos + 9..].split(',').next()?;
+    let mut parts = sub.trim().split(':');
 
-  let val_sub = &line[val_pos..];
-  let val_str = val_sub.split_whitespace().next()?;
-  let val: f32 = val_str.parse().ok()?;
+    let hours: f32 = parts.next()?.trim().parse().ok()?;
+    let minutes: f32 = parts.next()?.trim().parse().ok()?;
+    let seconds: f32 = parts.next()?.trim().parse().ok()?;
 
-  Some((idx, is_mean, val))
+    if parts.next().is_none() {
+      Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    } else {
+      None
+    }
+  }
+
+  pub fn parse_volume_detect(line: &str) -> Option<(usize, bool, f32)> {
+    let info = Self::parse_volume_detect_typed(line)?;
+    let is_mean = info.volume_type == VolumeType::Mean;
+    Some((info.track_index, is_mean, info.volume_db))
+  }
+
+  pub fn parse_volume_detect_typed(line: &str) -> Option<VolumeDetectInfo> {
+    let pos = line.find("volumedetect_")?;
+    let sub = &line[pos + 13..];
+
+    // Find where the index digits end
+    let end_digits =
+      sub.find(|c: char| !c.is_ascii_digit()).unwrap_or(sub.len());
+    if end_digits == 0 {
+      return None;
+    }
+    let track_index: usize = sub[..end_digits].parse().ok()?;
+
+    // Check if it contains mean_volume: or max_volume:
+    let (volume_type, val_pos) = if let Some(p) = line.find("mean_volume:") {
+      (VolumeType::Mean, p + 12)
+    } else {
+      let p = line.find("max_volume:")?;
+      (VolumeType::Max, p + 11)
+    };
+
+    let val_sub = &line[val_pos..];
+    let val_str = val_sub.split_whitespace().next()?;
+    let volume_db: f32 = val_str.parse().ok()?;
+
+    Some(VolumeDetectInfo {
+      track_index,
+      volume_type,
+      volume_db,
+    })
+  }
 }
 
 #[derive(Debug, Clone, Default)]

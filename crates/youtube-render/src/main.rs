@@ -1,21 +1,16 @@
-mod assets;
-mod ffmpeg;
-mod gui;
-mod queue;
-
 use std::{
   panic::{set_hook, take_hook},
   process::exit,
 };
 
-use assets::EmbedAssets;
-use ffmpeg::kill_all_children;
 use gpui::{
   px, size, AppContext, Application, Bounds, TitlebarOptions, WindowBounds,
   WindowOptions,
 };
 use gpui_component::{init as init_gpui_component, Root};
-use gui::YtRenderApp;
+use youtube_render::{
+  ffmpeg::kill_all_children, gui::YtRenderApp, EmbedAssets,
+};
 
 fn main() {
   // Set up panic hook to ensure spawned children are killed if we panic
