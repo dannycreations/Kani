@@ -2,24 +2,22 @@
 
 ## Commands
 
-Always run project commands through `make`. Do **not** call `cargo` directly — see "Restrictions" below for why.
-
-```cmd
-make check                     # Compiles and runs the linter on all project — slow
-make check -- -p package_name  # Compiles and runs the linter on one specific package — fast
-make test                      # Runs all tests in all project — very slow
-make test -- -p package_name   # Runs all tests in one specific package — slow
-make test my_test_case         # Runs a single test, test module, or test group — fast
-make bench                     # Runs all performance benchmarks — very slow, use sparingly
-```
+| Command                         | What it does                              | Speed                     |
+| ------------------------------- | ----------------------------------------- | ------------------------- |
+| `make check`                    | Compiles and lints the entire project     | Slow                      |
+| `make check -- -p package_name` | Compiles and lints one specific package   | Fast                      |
+| `make test`                     | Runs all tests in the entire project      | Very slow                 |
+| `make test -- -p package_name`  | Runs all tests in one specific package    | Slow                      |
+| `make test my_test_case`        | Runs a single test, module, or test group | Fast                      |
+| `make bench`                    | Runs all performance benchmarks           | Very slow — use sparingly |
 
 ---
 
-## Restrictions
+## Guidelines
 
-### 1. Never edit the `[profile.*]` sections in `Cargo.toml`
+### 1. Never edit `[profile.*]` sections in `Cargo.toml`
 
-The `[profile.*]` tables (e.g., `[profile.release]`, `[profile.dev]`) control compiler optimization settings and are locked. Changing them affects the build behavior of the entire project and can silently break reproducibility — meaning the same code might no longer produce identical builds across different machines or at different times.
+Sections like `[profile.dev]` and `[profile.release]` control compiler optimization settings for the whole project. They are locked because changing them can silently break **reproducibility** — the guarantee that the same code always produces the same build, on any machine, at any time.
 
 ```toml
 # ✅ Allowed — adding a new dependency
@@ -33,9 +31,9 @@ opt-level = 3
 
 ---
 
-### 2. Never run `cargo test` directly
+### 2. Use `make test`, not `cargo test`
 
-`make test` adds safety protections — such as timeouts — that automatically stop a test run if something hangs or misbehaves. Running `cargo test` directly skips these protections. Always use one of the `make test` commands shown above instead.
+`make test` includes safety protections that `cargo test` does not — for example, automatic timeouts that stop a test run if it hangs. Running `cargo test` directly skips these protections entirely.
 
 ```sh
 # ✅ Correct
@@ -43,7 +41,7 @@ make test
 make test -- -p package_name
 make test my_test_case
 
-# ❌ Forbidden — no timeout or safety protection
+# ❌ Forbidden — bypasses timeout and safety protections
 cargo test
 cargo test -p package_name
 cargo test my_test_case
@@ -51,14 +49,14 @@ cargo test my_test_case
 
 ---
 
-### 3. Avoid `unsafe` code blocks
+### 3. Avoid `unsafe` code
 
-`unsafe` blocks turn off Rust's normal compile-time safety checks. Use them only in these two cases:
+`unsafe` blocks disable Rust's normal compile-time safety checks. Only use `unsafe` in these two cases:
 
-- **FFI (Foreign Function Interface):** code that interacts with non-Rust code, such as a C library.
-- **Performance-critical code:** only after profiling has proven that the `unsafe` block gives a measurable speed improvement.
+- **FFI (Foreign Function Interface):** interacting with non-Rust code, such as a C library.
+- **Performance-critical code:** only after profiling has proven a measurable speed benefit.
 
-Every `unsafe` block **must** have a `// SAFETY:` comment directly above it. This comment must explain exactly why the code is safe (what conditions or guarantees make it safe) and reference supporting documentation as an audit trail.
+Every `unsafe` block **must** be preceded by a `// SAFETY:` comment. This comment must explain why the code is safe (what conditions or guarantees make it so) and, where possible, link to supporting documentation.
 
 ```rust
 // ✅ Permitted — FFI usage with a documented safety justification
@@ -76,24 +74,33 @@ unsafe {
 
 ---
 
-### 4. Put all `use` (import) statements at the top of the file, and never use fully-qualified paths
+### 4. Keep all `use` statements at the top of the file — never use fully-qualified paths inline
 
-Every `use` statement must appear in the file's header section — not inside functions, `impl` blocks, or `match` arms. Keeping imports at the top lets anyone see all of a file's dependencies at a glance.
+**Where imports go:** Every `use` statement must be declared in the file's header — not inside functions, `impl` blocks, or `match` arms. This lets anyone see all of a file's dependencies at a glance.
 
-In addition, fully-qualified paths (e.g., writing `std::collections::HashMap` inline instead of importing `HashMap`) are not allowed anywhere in the code. Every external type, module, macro, or standard library item must be brought in with a `use` statement at the top of the file, then referenced by its short name.
+**How to reference imports:** Never write a fully-qualified path inline (e.g., `std::collections::HashMap` used directly in code). Instead, import the item with a `use` statement at the top of the file, then reference it by its short name (e.g., `HashMap`).
+
+This applies to everything — standard library items, external crates, and internal project paths alike (including `crate::foo::Bar` or `super::foo::Bar`).
 
 ```rust
 // ✅ Correct — all imports declared at the top; no fully-qualified paths in the code
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use crate::foo::Bar;
 
 pub fn build_index(items: &[&str]) -> HashMap<&str, usize> {
   items.iter().enumerate().map(|(i, k)| (*k, i)).collect()
 }
 
+pub fn handle_state(state: &Bar) {
+  // ...
+}
+```
+
+```rust
 // ❌ Forbidden — `use` statement hidden inside the function body
 pub fn build_index(items: &[&str]) -> std::collections::HashMap<&str, usize> {
-  use std::collections::HashMap;  // hidden dependency, easy to miss
+  use std::collections::HashMap; // hidden dependency, easy to miss
   items.iter().enumerate().map(|(i, k)| (*k, i)).collect()
 }
 
@@ -102,5 +109,10 @@ pub fn build_index_fq(items: &[&str]) -> std::collections::HashMap<&str, usize> 
   let map = std::collections::HashMap::new();
   // ...
   map
+}
+
+// ❌ Forbidden — internal crate path used inline instead of imported
+pub fn process_state(state: &crate::foo::Bar) {
+  // ...
 }
 ```

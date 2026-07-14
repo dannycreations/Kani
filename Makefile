@@ -1,8 +1,8 @@
 BINSTALL := $(shell command -v cargo-binstall 2> /dev/null)
 
-SUPPORTED_ARG_TARGETS := test check
+SUPPORTED_ARGS := check test
 FIRST_WORD := $(firstword $(MAKECMDGOALS))
-ifneq ($(filter $(FIRST_WORD),$(SUPPORTED_ARG_TARGETS)),)
+ifneq ($(filter $(FIRST_WORD),$(SUPPORTED_ARGS)),)
   CMD_ARGS := $(filter-out $(FIRST_WORD),$(MAKECMDGOALS))
   $(eval $(CMD_ARGS):;@:)
 endif
