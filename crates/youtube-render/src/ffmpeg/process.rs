@@ -17,6 +17,7 @@ use super::{
   settings::RenderSettings,
   track::{AudioRenderer, TrackStats},
 };
+use crate::core::DEFAULT_LOUDNORM_CONFIG;
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -353,14 +354,14 @@ impl RenderProcess {
       let mix_filter = AudioRenderer::build_mix_filter_complex(
         &settings.audio.tracks,
         vols,
-        "loudnorm=I=-14:LRA=11:TP=-1:print_format=json",
+        &format!("{DEFAULT_LOUDNORM_CONFIG}:print_format=json"),
       );
       analysis_args.push("-filter_complex".to_string());
       analysis_args.push(mix_filter);
     } else {
       analysis_args.push("-af".to_string());
       analysis_args
-        .push("loudnorm=I=-14:LRA=11:TP=-1:print_format=json".to_string());
+        .push(format!("{DEFAULT_LOUDNORM_CONFIG}:print_format=json"));
     }
     analysis_args.push("-f".to_string());
     analysis_args.push("null".to_string());
@@ -477,7 +478,7 @@ impl RenderProcess {
       vec!["-y".to_string(), "-i".to_string(), input_file.to_string()];
     if let Some(vols) = volumes {
       let loudnorm_suffix = format!(
-        "loudnorm=I=-14:LRA=11:TP=-1:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true[out]",
+        "{DEFAULT_LOUDNORM_CONFIG}:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true[out]",
         res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
       );
       let mix_filter = AudioRenderer::build_mix_filter_complex(
@@ -494,7 +495,7 @@ impl RenderProcess {
     } else {
       encode_args.push("-af".to_string());
       encode_args.push(format!(
-        "loudnorm=I=-14:LRA=11:TP=-1:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true",
+        "{DEFAULT_LOUDNORM_CONFIG}:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true",
         res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
       ));
     }
