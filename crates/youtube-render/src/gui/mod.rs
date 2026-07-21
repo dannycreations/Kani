@@ -297,6 +297,7 @@ impl Render for YtRenderApp {
         .on_click({
           let view = view.clone();
           move |_, _, cx| {
+            let view_weak = view.clone();
             if let Some(view) = view.upgrade() {
               view.update(cx, |this, cx| {
                 let state_clone = Arc::clone(&this.state);
@@ -308,12 +309,30 @@ impl Render for YtRenderApp {
                   let cx = cx.clone();
                   async move {
                     loop {
-                      let is_running = state_clone.lock().unwrap().is_running;
+                      let (is_running, active_id) = {
+                        let state = state_clone.lock().unwrap();
+                        let active_id =
+                          state.active_processes.last().map(|(id, _)| *id);
+                        (state.is_running, active_id)
+                      };
+
+                      let _ = cx.update(|cx| {
+                        if let Some(view) = view_weak.upgrade() {
+                          view.update(cx, |this, cx| {
+                            if let Some(id) = active_id {
+                              if this.selected_job_id != Some(id) {
+                                this.selected_job_id = Some(id);
+                                cx.notify();
+                              }
+                            }
+                          });
+                        }
+                        cx.refresh_windows();
+                      });
+
                       if !is_running {
-                        let _ = cx.update(|cx| cx.refresh_windows());
                         break;
                       }
-                      let _ = cx.update(|cx| cx.refresh_windows());
                       Timer::after(Duration::from_millis(100)).await;
                     }
                   }
