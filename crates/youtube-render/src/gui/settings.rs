@@ -1,5 +1,5 @@
 use gpui::{
-  div, prelude::*, px, Context, IntoElement, ParentElement, Styled, WeakEntity,
+  div, prelude::*, px, IntoElement, ParentElement, Styled, WeakEntity,
 };
 use gpui_component::{
   checkbox::Checkbox, h_flex, input::Input, v_flex, Disableable,
@@ -13,7 +13,6 @@ impl RenderApp {
     is_running: bool,
     enable_parallel: bool,
     view: &WeakEntity<Self>,
-    _cx: &mut Context<Self>,
   ) -> impl IntoElement {
     v_flex()
       .gap_4()

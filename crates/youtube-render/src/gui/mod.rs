@@ -267,7 +267,7 @@ impl Render for RenderApp {
 
     let enable_parallel = state.enable_parallel;
     let settings_panel =
-      self.render_settings_panel(is_running, enable_parallel, &view, cx);
+      self.render_settings_panel(is_running, enable_parallel, &view);
 
     let start_stop_btn = if is_running {
       Button::new("stop")
@@ -476,13 +476,11 @@ impl Render for RenderApp {
 
         let queue_item_el = self.render_queue_item(
           item,
-          item_idx,
           is_selected,
           is_expanded,
           is_running,
           display_name,
           &view,
-          window,
           cx,
         );
 

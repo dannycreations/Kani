@@ -2,7 +2,7 @@ use std::{fs, sync::Arc};
 
 use gpui::{
   div, prelude::*, px, AnyElement, AsyncApp, Context, IntoElement,
-  ParentElement, SharedString, Styled, WeakEntity, Window,
+  ParentElement, SharedString, Styled, WeakEntity,
 };
 use gpui_component::{
   button::{Button, ButtonVariants as _},
@@ -27,13 +27,11 @@ impl RenderApp {
   pub(super) fn render_queue_item(
     &self,
     item: &QueueItem,
-    _item_idx: usize,
     is_selected: bool,
     is_expanded: bool,
     is_running: bool,
     display_name: String,
     view: &WeakEntity<Self>,
-    _window: &mut Window,
     cx: &mut Context<Self>,
   ) -> impl IntoElement {
     let id = item.id;
@@ -102,7 +100,6 @@ impl RenderApp {
     item_settings: &AudioSettings,
     controls_disabled: bool,
     item_view: &WeakEntity<Self>,
-    _cx: &mut Context<Self>,
   ) -> impl IntoElement {
     let builtins = Preset::builtins();
     let mut preset_row = h_flex()
@@ -238,7 +235,6 @@ impl RenderApp {
     controls_disabled: bool,
     inputs: &ItemInputStates,
     item_view: &WeakEntity<Self>,
-    _cx: &mut Context<Self>,
   ) -> impl IntoElement {
     let track_count = item_settings.tracks.len();
     let mut tracks_container = v_flex().gap_1();
@@ -376,7 +372,6 @@ impl RenderApp {
       &item_settings,
       controls_disabled,
       item_view,
-      cx,
     );
 
     let tracks_container = self.render_track_list(
@@ -385,7 +380,6 @@ impl RenderApp {
       controls_disabled,
       inputs,
       item_view,
-      cx,
     );
 
     let item_view_cb = item_view.clone();
