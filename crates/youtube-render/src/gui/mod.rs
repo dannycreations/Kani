@@ -473,12 +473,16 @@ impl Render for RenderApp {
           .unwrap_or(&item.input_path)
           .to_string();
         let display_name = format!("{}. {}", item_idx + 1, filename);
+        let is_first = item_idx == 0;
+        let is_last = item_idx == state.queue.len() - 1;
 
         let queue_item_el = self.render_queue_item(
           item,
           is_selected,
           is_expanded,
           is_running,
+          is_first,
+          is_last,
           display_name,
           &view,
           cx,

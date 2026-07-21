@@ -1,5 +1,6 @@
 use gpui::{
-  div, prelude::*, px, IntoElement, ParentElement, Styled, WeakEntity,
+  div, prelude::*, px, Focusable, IntoElement, ParentElement, Styled,
+  WeakEntity,
 };
 use gpui_component::{
   checkbox::Checkbox, h_flex, input::Input, v_flex, Disableable,
@@ -25,9 +26,21 @@ impl RenderApp {
             .items_center()
             .child(div().child("ffmpeg executable path:"))
             .child(
-              div().flex_grow().child(
-                Input::new(&self.ffmpeg_path_state).disabled(is_running),
-              ),
+              div()
+                .id("ffmpeg_path_input_wrapper")
+                .flex_grow()
+                .child(Input::new(&self.ffmpeg_path_state).disabled(is_running))
+                .on_mouse_down_out({
+                  let state = self.ffmpeg_path_state.clone();
+                  move |_, window, cx| {
+                    if state.read(cx).focus_handle(cx).is_focused(window) {
+                      state.update(cx, |input, cx| {
+                        input.unselect(window, cx);
+                      });
+                      window.blur();
+                    }
+                  }
+                }),
             ),
         ),
       )
@@ -56,9 +69,23 @@ impl RenderApp {
             enable_parallel,
             |this| {
               this.child(div().child("Parallel jobs:")).child(
-                div().w(px(60.0)).child(
-                  Input::new(&self.parallel_jobs_state).disabled(is_running),
-                ),
+                div()
+                  .id("parallel_jobs_input_wrapper")
+                  .w(px(60.0))
+                  .child(
+                    Input::new(&self.parallel_jobs_state).disabled(is_running),
+                  )
+                  .on_mouse_down_out({
+                    let state = self.parallel_jobs_state.clone();
+                    move |_, window, cx| {
+                      if state.read(cx).focus_handle(cx).is_focused(window) {
+                        state.update(cx, |input, cx| {
+                          input.unselect(window, cx);
+                        });
+                        window.blur();
+                      }
+                    }
+                  }),
               )
             },
           )),

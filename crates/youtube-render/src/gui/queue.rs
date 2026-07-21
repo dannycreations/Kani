@@ -1,7 +1,7 @@
 use std::{fs, sync::Arc};
 
 use gpui::{
-  div, prelude::*, px, AnyElement, AsyncApp, Context, IntoElement,
+  div, prelude::*, px, AnyElement, AsyncApp, Context, Focusable, IntoElement,
   ParentElement, SharedString, Styled, WeakEntity,
 };
 use gpui_component::{
@@ -30,6 +30,8 @@ impl RenderApp {
     is_selected: bool,
     is_expanded: bool,
     is_running: bool,
+    is_first: bool,
+    is_last: bool,
     display_name: String,
     view: &WeakEntity<Self>,
     cx: &mut Context<Self>,
@@ -85,6 +87,8 @@ impl RenderApp {
           .child(self.render_queue_item_header_actions(
             item,
             is_expanded,
+            is_first,
+            is_last,
             &item_view,
             cx,
           )),
@@ -252,9 +256,26 @@ impl RenderApp {
       );
 
       if let Some(track_input) = inputs.tracks.get(track_idx) {
-        row = row.child(div().w(px(50.0)).child(
-          Input::new(&track_input.input_state).disabled(controls_disabled),
-        ));
+        let state = track_input.input_state.clone();
+        row = row.child(
+          div()
+            .id(SharedString::from(format!(
+              "track_input_{}_{}",
+              id, track_idx
+            )))
+            .w(px(50.0))
+            .child(
+              Input::new(&track_input.input_state).disabled(controls_disabled),
+            )
+            .on_mouse_down_out(move |_, window, cx| {
+              if state.read(cx).focus_handle(cx).is_focused(window) {
+                state.update(cx, |input, cx| {
+                  input.unselect(window, cx);
+                });
+                window.blur();
+              }
+            }),
+        );
       }
 
       row = row
@@ -450,6 +471,8 @@ impl RenderApp {
     &self,
     item: &QueueItem,
     is_expanded: bool,
+    is_first: bool,
+    is_last: bool,
     item_view: &WeakEntity<Self>,
     cx: &mut Context<Self>,
   ) -> impl IntoElement {
@@ -473,6 +496,7 @@ impl RenderApp {
               .icon(IconName::ArrowUp)
               .compact()
               .tooltip("Move Up")
+              .disabled(is_first)
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_up.upgrade() {
                   view.update(cx, |this, cx| {
@@ -487,6 +511,7 @@ impl RenderApp {
               .icon(IconName::ArrowDown)
               .compact()
               .tooltip("Move Down")
+              .disabled(is_last)
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_down.upgrade() {
                   view.update(cx, |this, cx| {
