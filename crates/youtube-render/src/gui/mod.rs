@@ -5,7 +5,8 @@ mod settings;
 use std::{
   collections::HashSet,
   path::Path,
-  sync::{Arc, Mutex},
+  sync::{mpsc, Arc, Mutex, OnceLock},
+  thread,
   time::Duration,
 };
 
@@ -22,7 +23,9 @@ use gpui_component::{
   tab::{Tab, TabBar},
   v_flex, ActiveTheme, Disableable, Selectable,
 };
-use rfd::FileDialog;
+use rfd::{
+  FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel,
+};
 
 use crate::{
   ffmpeg::{kill_all_children, AudioSettings},
@@ -57,7 +60,50 @@ pub struct YtRenderApp {
   pub(super) parallel_jobs_state: Entity<InputState>,
 }
 
+pub static ACTIVE_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
+
+pub fn set_active_app_state(state: Arc<Mutex<AppState>>) {
+  let _ = ACTIVE_STATE.set(state);
+}
+
+pub fn confirm_action(title: &str, description: &str) -> bool {
+  let (tx, rx) = mpsc::channel();
+  let title = title.to_string();
+  let description = description.to_string();
+  thread::spawn(move || {
+    let result = MessageDialog::new()
+      .set_title(title)
+      .set_description(description)
+      .set_buttons(MessageButtons::YesNo)
+      .set_level(MessageLevel::Warning)
+      .show();
+    let _ = tx.send(matches!(result, MessageDialogResult::Yes));
+  });
+  rx.recv().unwrap_or(true)
+}
+
+pub fn confirm_quit() -> bool {
+  let is_rendering = ACTIVE_STATE
+    .get()
+    .and_then(|state| state.lock().ok())
+    .map(|state| state.is_running)
+    .unwrap_or(false);
+
+  if is_rendering {
+    confirm_action(
+      "Confirm Exit",
+      "Rendering is in progress. Are you sure you want to quit?",
+    )
+  } else {
+    true
+  }
+}
+
 impl YtRenderApp {
+  pub fn state(&self) -> &Arc<Mutex<AppState>> {
+    &self.state
+  }
+
   pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
     let state = Arc::new(Mutex::new(AppState::new()));
 
@@ -226,11 +272,16 @@ impl Render for YtRenderApp {
       Button::new("stop").danger().label("Stop").on_click({
         let view = view.clone();
         move |_, _, cx| {
-          if let Some(view) = view.upgrade() {
-            view.update(cx, |this, cx| {
-              this.state.lock().unwrap().stop();
-              cx.notify();
-            });
+          if confirm_action(
+            "Confirm Stop",
+            "Rendering is currently in progress. Are you sure you want to stop?",
+          ) {
+            if let Some(view) = view.upgrade() {
+              view.update(cx, |this, cx| {
+                this.state.lock().unwrap().stop();
+                cx.notify();
+              });
+            }
           }
         }
       })

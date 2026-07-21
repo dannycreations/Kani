@@ -17,7 +17,7 @@ use rfd::FileDialog;
 
 use crate::{
   ffmpeg::{AudioSettings, Preset},
-  gui::{ItemInputStates, YtRenderApp},
+  gui::{confirm_action, ItemInputStates, YtRenderApp},
   queue::{QueueItem, QueueItemStatus},
 };
 
@@ -526,17 +526,33 @@ impl YtRenderApp {
           .compact()
           .on_click(move |_, _, cx| {
             if let Some(view) = view_for_remove.upgrade() {
-              view.update(cx, |this, cx| {
-                this.state.lock().unwrap().remove_item(id);
-                if this.selected_job_id == Some(id) {
-                  this.selected_job_id = None;
-                }
-                if this.expanded_job_id == Some(id) {
-                  this.expanded_job_id = None;
-                }
-                this.remove_inputs(id);
-                cx.notify();
-              });
+              let is_active = {
+                let state = view.read(cx).state.lock().unwrap();
+                state.active_processes.iter().any(|(pid, _)| *pid == id)
+              };
+
+              let should_remove = if is_active {
+                confirm_action(
+                  "Confirm Delete",
+                  "This video is currently being rendered. Are you sure you want to delete it?",
+                )
+              } else {
+                true
+              };
+
+              if should_remove {
+                view.update(cx, |this, cx| {
+                  this.state.lock().unwrap().remove_item(id);
+                  if this.selected_job_id == Some(id) {
+                    this.selected_job_id = None;
+                  }
+                  if this.expanded_job_id == Some(id) {
+                    this.expanded_job_id = None;
+                  }
+                  this.remove_inputs(id);
+                  cx.notify();
+                });
+              }
             }
           }),
       )

@@ -9,7 +9,9 @@ use gpui::{
 };
 use gpui_component::{init as init_gpui_component, Root};
 use youtube_render::{
-  ffmpeg::kill_all_children, gui::YtRenderApp, EmbedAssets,
+  ffmpeg::kill_all_children,
+  gui::{confirm_quit, set_active_app_state, YtRenderApp},
+  EmbedAssets,
 };
 
 fn main() {
@@ -22,8 +24,10 @@ fn main() {
 
   // Set up ctrlc handler to ensure cleanup on termination signals
   let _ = ctrlc::set_handler(move || {
-    kill_all_children();
-    exit(130);
+    if confirm_quit() {
+      kill_all_children();
+      exit(130);
+    }
   });
 
   let app = Application::new().with_assets(EmbedAssets);
@@ -43,6 +47,11 @@ fn main() {
 
     cx.open_window(options, |window, cx| {
       let view = cx.new(|cx| YtRenderApp::new(window, cx));
+      let state_arc = view.read(cx).state();
+      set_active_app_state(state_arc.clone());
+
+      window.on_window_should_close(cx, move |_, _| confirm_quit());
+
       cx.new(|cx| Root::new(view, window, cx))
     })
     .unwrap();
