@@ -350,19 +350,12 @@ impl RenderProcess {
     ))));
 
     let mut analysis_args = vec!["-i".to_string(), input_file.to_string()];
-    if let Some(vols) = volumes {
-      let mix_filter = AudioRenderer::build_mix_filter_complex(
-        &settings.audio.tracks,
-        vols,
-        &format!("{DEFAULT_LOUDNORM_CONFIG}:print_format=json"),
-      );
-      analysis_args.push("-filter_complex".to_string());
-      analysis_args.push(mix_filter);
-    } else {
-      analysis_args.push("-af".to_string());
-      analysis_args
-        .push(format!("{DEFAULT_LOUDNORM_CONFIG}:print_format=json"));
-    }
+    AudioRenderer::append_filter_args(
+      &mut analysis_args,
+      &settings.audio.tracks,
+      volumes,
+      &format!("{DEFAULT_LOUDNORM_CONFIG}:print_format=json"),
+    );
     analysis_args.push("-f".to_string());
     analysis_args.push("null".to_string());
     analysis_args.push("-".to_string());
@@ -476,29 +469,15 @@ impl RenderProcess {
 
     let mut encode_args =
       vec!["-y".to_string(), "-i".to_string(), input_file.to_string()];
-    if let Some(vols) = volumes {
-      let loudnorm_suffix = format!(
-        "{DEFAULT_LOUDNORM_CONFIG}:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true[out]",
-        res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
-      );
-      let mix_filter = AudioRenderer::build_mix_filter_complex(
-        &settings.audio.tracks,
-        vols,
-        &loudnorm_suffix,
-      );
-      encode_args.push("-filter_complex".to_string());
-      encode_args.push(mix_filter);
-      encode_args.push("-map".to_string());
-      encode_args.push("0:v:0".to_string());
-      encode_args.push("-map".to_string());
-      encode_args.push("[out]".to_string());
-    } else {
-      encode_args.push("-af".to_string());
-      encode_args.push(format!(
+    AudioRenderer::append_filter_args(
+      &mut encode_args,
+      &settings.audio.tracks,
+      volumes,
+      &format!(
         "{DEFAULT_LOUDNORM_CONFIG}:measured_I={}:measured_LRA={}:measured_TP={}:measured_thresh={}:offset={}:linear=true",
         res.input_i, res.input_lra, res.input_tp, res.input_thresh, res.target_offset
-      ));
-    }
+      ),
+    );
 
     encode_args.extend(settings.custom_vflags.iter().map(|s| s.to_string()));
     encode_args.push(output_file_str.clone());

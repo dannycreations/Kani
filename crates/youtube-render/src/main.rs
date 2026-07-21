@@ -9,9 +9,9 @@ use gpui::{
 };
 use gpui_component::{init as init_gpui_component, Root};
 use youtube_render::{
+  assets::EmbedAssets,
   ffmpeg::kill_all_children,
   gui::{confirm_quit, set_active_app_state, RenderApp},
-  EmbedAssets,
 };
 
 fn main() {

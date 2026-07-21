@@ -28,9 +28,9 @@ use rfd::{
 };
 
 use crate::{
+  assets::IconName,
   ffmpeg::{kill_all_children, AudioSettings},
   queue::{AppState, QueueItemStatus},
-  IconName,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +161,26 @@ impl RenderApp {
 
   pub(super) fn remove_inputs(&mut self, id: usize) {
     self.item_inputs.retain(|(k, _)| *k != id);
+  }
+
+  pub(super) fn rebuild_input_states(
+    &mut self,
+    id: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.remove_inputs(id);
+    let settings = {
+      let state = self.state.lock().unwrap();
+      state
+        .queue
+        .iter()
+        .find(|item| item.id == id)
+        .map(|item| item.settings.clone())
+    };
+    if let Some(settings) = settings {
+      self.ensure_input_states(id, &settings, window, cx);
+    }
   }
 
   pub(super) fn ensure_input_states(

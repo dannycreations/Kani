@@ -1,3 +1,6 @@
+pub mod assets;
+pub mod queue;
+
 /// Default EBU R128 / ITU-R BS.1770 audio normalization settings optimized for YouTube playback.
 ///
 /// Parameters:

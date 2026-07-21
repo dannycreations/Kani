@@ -16,6 +16,16 @@ pub enum StepType {
   VideoEncoding,
 }
 
+impl StepType {
+  pub fn name(&self) -> &'static str {
+    match self {
+      Self::MixComputation => "Mix Computation",
+      Self::AudioAnalysis => "Audio Analysis",
+      Self::VideoEncoding => "Video Encoding",
+    }
+  }
+}
+
 #[derive(Debug, Clone)]
 pub enum JobProgress {
   Starting(StepType),

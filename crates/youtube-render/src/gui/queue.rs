@@ -16,10 +16,10 @@ use gpui_component::{
 use rfd::FileDialog;
 
 use crate::{
+  assets::IconName,
   ffmpeg::{AudioSettings, Preset},
   gui::{confirm_action, ItemInputStates, RenderApp},
   queue::{QueueItem, QueueItemStatus},
-  IconName,
 };
 
 impl RenderApp {
@@ -302,18 +302,7 @@ impl RenderApp {
                   }
                 }
                 // Rebuild inputs to match the new track order
-                this.remove_inputs(id);
-                let new_settings = {
-                  let state = this.state.lock().unwrap();
-                  state
-                    .queue
-                    .iter()
-                    .find(|item| item.id == id)
-                    .map(|item| item.settings.clone())
-                };
-                if let Some(settings) = new_settings {
-                  this.ensure_input_states(id, &settings, window, cx);
-                }
+                this.rebuild_input_states(id, window, cx);
                 cx.notify();
               });
             }
@@ -342,18 +331,7 @@ impl RenderApp {
                   }
                 }
                 // Rebuild inputs to match the new track order
-                this.remove_inputs(id);
-                let new_settings = {
-                  let state = this.state.lock().unwrap();
-                  state
-                    .queue
-                    .iter()
-                    .find(|item| item.id == id)
-                    .map(|item| item.settings.clone())
-                };
-                if let Some(settings) = new_settings {
-                  this.ensure_input_states(id, &settings, window, cx);
-                }
+                this.rebuild_input_states(id, window, cx);
                 cx.notify();
               });
             }

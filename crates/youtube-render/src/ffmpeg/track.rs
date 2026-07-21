@@ -38,14 +38,40 @@ impl AudioRenderer {
     let amix_inputs_str = amix_inputs.join("");
     let n_inputs = tracks.len();
     let weights = vec!["1"; n_inputs].join(" ");
+    let suffix = if loudnorm_suffix.contains("[out]") {
+      loudnorm_suffix.to_string()
+    } else {
+      format!("{loudnorm_suffix}[out]")
+    };
     format!(
       "{};{}amix=inputs={}:weights='{}':dropout_transition=2:normalize=0[mixed];[mixed]{}",
       filter_parts.join(";"),
       amix_inputs_str,
       n_inputs,
       weights,
-      loudnorm_suffix
+      suffix
     )
+  }
+
+  pub fn append_filter_args(
+    args: &mut Vec<String>,
+    tracks: &[TrackConfig],
+    volumes: Option<&[f32]>,
+    loudnorm_config: &str,
+  ) {
+    if let Some(vols) = volumes {
+      let mix_filter =
+        Self::build_mix_filter_complex(tracks, vols, loudnorm_config);
+      args.push("-filter_complex".to_string());
+      args.push(mix_filter);
+      args.push("-map".to_string());
+      args.push("0:v:0".to_string());
+      args.push("-map".to_string());
+      args.push("[out]".to_string());
+    } else {
+      args.push("-af".to_string());
+      args.push(loudnorm_config.to_string());
+    }
   }
 
   pub fn compute_mix_volumes(

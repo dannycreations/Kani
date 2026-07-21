@@ -7,7 +7,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::ffmpeg::{
-  AudioSettings, JobProgress, Preset, RenderProcess, RenderSettings, StepType,
+  AudioSettings, JobProgress, Preset, RenderProcess, RenderSettings,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub enum QueueItemStatus {
   Cancelled,
 }
 
-pub fn compute_output_path(
+fn compute_output_path(
   input_path: &str,
   existing_outputs: &[Arc<str>],
 ) -> String {
@@ -257,13 +257,8 @@ impl AppState {
             {
               match progress {
                 JobProgress::Starting(step_type) => {
-                  let step_name = match step_type {
-                    StepType::MixComputation => "Mix Computation",
-                    StepType::AudioAnalysis => "Audio Analysis",
-                    StepType::VideoEncoding => "Video Encoding",
-                  };
                   item.status = QueueItemStatus::Processing {
-                    step: Arc::from(step_name),
+                    step: Arc::from(step_type.name()),
                     percent: 0.0,
                     speed: Arc::from(""),
                     time_str: Arc::from(""),
@@ -278,16 +273,11 @@ impl AppState {
                   speed,
                   time_str,
                 } => {
-                  let step_name = match step {
-                    StepType::MixComputation => "Mix Computation",
-                    StepType::AudioAnalysis => "Audio Analysis",
-                    StepType::VideoEncoding => "Video Encoding",
-                  };
                   item.status = QueueItemStatus::Processing {
-                    step: Arc::from(step_name),
+                    step: Arc::from(step.name()),
                     percent,
-                    speed: speed.unwrap_or_else(|| Arc::from("")),
-                    time_str: time_str.unwrap_or_else(|| Arc::from("")),
+                    speed: speed.unwrap_or_default(),
+                    time_str: time_str.unwrap_or_default(),
                   };
                 }
                 JobProgress::Completed(out_path) => {
