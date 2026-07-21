@@ -10,7 +10,7 @@ use gpui::{
 use gpui_component::{init as init_gpui_component, Root};
 use youtube_render::{
   ffmpeg::kill_all_children,
-  gui::{confirm_quit, set_active_app_state, YtRenderApp},
+  gui::{confirm_quit, set_active_app_state, RenderApp},
   EmbedAssets,
 };
 
@@ -46,7 +46,7 @@ fn main() {
     };
 
     cx.open_window(options, |window, cx| {
-      let view = cx.new(|cx| YtRenderApp::new(window, cx));
+      let view = cx.new(|cx| RenderApp::new(window, cx));
       let state_arc = view.read(cx).state();
       set_active_app_state(state_arc.clone());
 

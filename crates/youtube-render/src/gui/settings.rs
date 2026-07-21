@@ -5,9 +5,9 @@ use gpui_component::{
   checkbox::Checkbox, h_flex, input::Input, v_flex, Disableable,
 };
 
-use crate::gui::YtRenderApp;
+use crate::gui::RenderApp;
 
-impl YtRenderApp {
+impl RenderApp {
   pub(super) fn render_settings_panel(
     &self,
     is_running: bool,

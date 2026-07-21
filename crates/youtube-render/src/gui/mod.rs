@@ -30,6 +30,7 @@ use rfd::{
 use crate::{
   ffmpeg::{kill_all_children, AudioSettings},
   queue::{AppState, QueueItemStatus},
+  IconName,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +47,7 @@ pub struct ItemInputStates {
   pub tracks: Vec<TrackInputState>,
 }
 
-pub struct YtRenderApp {
+pub struct RenderApp {
   pub(super) state: Arc<Mutex<AppState>>,
   pub(super) selected_job_id: Option<usize>,
   pub(super) expanded_job_id: Option<usize>,
@@ -99,7 +100,7 @@ pub fn confirm_quit() -> bool {
   }
 }
 
-impl YtRenderApp {
+impl RenderApp {
   pub fn state(&self) -> &Arc<Mutex<AppState>> {
     &self.state
   }
@@ -242,13 +243,13 @@ impl YtRenderApp {
   }
 }
 
-impl Drop for YtRenderApp {
+impl Drop for RenderApp {
   fn drop(&mut self) {
     kill_all_children();
   }
 }
 
-impl Render for YtRenderApp {
+impl Render for RenderApp {
   fn render(
     &mut self,
     window: &mut Window,
@@ -269,30 +270,37 @@ impl Render for YtRenderApp {
       self.render_settings_panel(is_running, enable_parallel, &view, cx);
 
     let start_stop_btn = if is_running {
-      Button::new("stop").danger().label("Stop").on_click({
-        let view = view.clone();
-        move |_, _, cx| {
-          if confirm_action(
-            "Confirm Stop",
-            "Rendering is currently in progress. Are you sure you want to stop?",
-          ) {
-            if let Some(view) = view.upgrade() {
-              view.update(cx, |this, cx| {
-                this.state.lock().unwrap().stop();
-                cx.notify();
-              });
+      Button::new("stop")
+        .danger()
+        .icon(IconName::Stop)
+        .compact()
+        .tooltip("Stop")
+        .on_click({
+          let view = view.clone();
+          move |_, _, cx| {
+            if confirm_action(
+              "Confirm Stop",
+              "Rendering is currently in progress. Are you sure you want to stop?",
+            ) {
+              if let Some(view) = view.upgrade() {
+                view.update(cx, |this, cx| {
+                  this.state.lock().unwrap().stop();
+                  cx.notify();
+                });
+              }
             }
           }
-        }
-      })
+        })
     } else {
       let has_pending = state
         .queue
         .iter()
         .any(|item| matches!(item.status, QueueItemStatus::Pending));
       Button::new("start")
-        .primary()
-        .label("Start")
+        .success()
+        .icon(IconName::Play)
+        .compact()
+        .tooltip("Start")
         .disabled(!has_pending)
         .on_click({
           let view = view.clone();
@@ -346,8 +354,11 @@ impl Render for YtRenderApp {
         })
     };
 
-    let add_files_btn =
-      Button::new("add_files").label("Add Video Files").on_click({
+    let add_files_btn = Button::new("add_files")
+      .icon(IconName::Plus)
+      .compact()
+      .tooltip("Add Video Files")
+      .on_click({
         let view = view.clone();
         move |_, _, cx| {
           let view = view.clone();
@@ -379,8 +390,18 @@ impl Render for YtRenderApp {
         }
       });
 
+    let has_completed = state
+      .queue
+      .iter()
+      .any(|item| matches!(item.status, QueueItemStatus::Completed { .. }));
+    let has_items = !state.queue.is_empty();
+
     let clear_completed_btn = Button::new("clear_completed")
-      .label("Clear Completed")
+      .warning()
+      .icon(IconName::Check)
+      .compact()
+      .tooltip("Clear Completed")
+      .disabled(!has_completed)
       .on_click({
         let view = view.clone();
         move |_, _, cx| {
@@ -412,20 +433,26 @@ impl Render for YtRenderApp {
         }
       });
 
-    let clear_all_btn = Button::new("clear_all").label("Clear All").on_click({
-      let view = view.clone();
-      move |_, _, cx| {
-        if let Some(view) = view.upgrade() {
-          view.update(cx, |this, cx| {
-            this.state.lock().unwrap().clear_all();
-            this.item_inputs.clear();
-            this.expanded_job_id = None;
-            this.selected_job_id = None;
-            cx.notify();
-          });
+    let clear_all_btn = Button::new("clear_all")
+      .danger()
+      .icon(IconName::Delete)
+      .compact()
+      .tooltip("Clear All")
+      .disabled(!has_items)
+      .on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+          if let Some(view) = view.upgrade() {
+            view.update(cx, |this, cx| {
+              this.state.lock().unwrap().clear_all();
+              this.item_inputs.clear();
+              this.expanded_job_id = None;
+              this.selected_job_id = None;
+              cx.notify();
+            });
+          }
         }
-      }
-    });
+      });
 
     let mut queue_items_elements = Vec::new();
     if state.queue.is_empty() {
@@ -470,7 +497,7 @@ impl Render for YtRenderApp {
         div()
           .font_weight(FontWeight::BOLD)
           .text_lg()
-          .child("Render Queue"),
+          .child("Job Queue"),
       )
       .child(
         h_flex()
@@ -506,7 +533,7 @@ impl Render for YtRenderApp {
           .underline()
           .child(
             Tab::new()
-              .label("Render Queue")
+              .label("Queue")
               .selected(self.active_tab == AppTab::Queue)
               .on_click({
                 let view = view.clone();

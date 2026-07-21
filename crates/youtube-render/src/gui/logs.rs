@@ -8,11 +8,11 @@ use gpui_component::{
 };
 
 use crate::{
-  gui::YtRenderApp,
+  gui::RenderApp,
   queue::{AppState, QueueItemStatus},
 };
 
-impl YtRenderApp {
+impl RenderApp {
   pub(super) fn render_logs_panel(
     &self,
     selected_job_id: Option<usize>,

@@ -11,17 +11,18 @@ use gpui_component::{
   h_flex,
   input::Input,
   progress::Progress,
-  v_flex, ActiveTheme, Disableable, IconName,
+  v_flex, ActiveTheme, Disableable,
 };
 use rfd::FileDialog;
 
 use crate::{
   ffmpeg::{AudioSettings, Preset},
-  gui::{confirm_action, ItemInputStates, YtRenderApp},
+  gui::{confirm_action, ItemInputStates, RenderApp},
   queue::{QueueItem, QueueItemStatus},
+  IconName,
 };
 
-impl YtRenderApp {
+impl RenderApp {
   #[allow(clippy::too_many_arguments)]
   pub(super) fn render_queue_item(
     &self,
@@ -161,6 +162,7 @@ impl YtRenderApp {
       Button::new(SharedString::from(format!("export_{}", id)))
         .icon(IconName::ExternalLink)
         .compact()
+        .tooltip("Export Preset")
         .disabled(controls_disabled)
         .on_click(move |_, _, cx| {
           let ini_content = settings_for_export.to_ini();
@@ -183,6 +185,7 @@ impl YtRenderApp {
       Button::new(SharedString::from(format!("import_{}", id)))
         .icon(IconName::FolderOpen)
         .compact()
+        .tooltip("Import Preset")
         .disabled(controls_disabled)
         .on_click(move |_, _, cx| {
           let view = item_view_import.clone();
@@ -266,6 +269,7 @@ impl YtRenderApp {
           )))
           .icon(IconName::ArrowUp)
           .compact()
+          .tooltip("Move Track Up")
           .disabled(controls_disabled || is_first)
           .on_click(move |_, window, cx| {
             if let Some(view) = item_view_track_up.upgrade() {
@@ -305,6 +309,7 @@ impl YtRenderApp {
           )))
           .icon(IconName::ArrowDown)
           .compact()
+          .tooltip("Move Track Down")
           .disabled(controls_disabled || is_last)
           .on_click(move |_, window, cx| {
             if let Some(view) = item_view_track_down.upgrade() {
@@ -473,6 +478,7 @@ impl YtRenderApp {
             Button::new(("up", id))
               .icon(IconName::ArrowUp)
               .compact()
+              .tooltip("Move Up")
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_up.upgrade() {
                   view.update(cx, |this, cx| {
@@ -486,6 +492,7 @@ impl YtRenderApp {
             Button::new(("down", id))
               .icon(IconName::ArrowDown)
               .compact()
+              .tooltip("Move Down")
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_down.upgrade() {
                   view.update(cx, |this, cx| {
@@ -504,6 +511,11 @@ impl YtRenderApp {
             IconName::Settings
           })
           .compact()
+          .tooltip(if is_expanded {
+            "Collapse Settings"
+          } else {
+            "Settings"
+          })
           .on_click(move |_, window, cx| {
             if let Some(view) = view_for_toggle.upgrade() {
               view.update(cx, |this, cx| {
@@ -524,6 +536,7 @@ impl YtRenderApp {
           .danger()
           .icon(IconName::Delete)
           .compact()
+          .tooltip("Delete")
           .on_click(move |_, _, cx| {
             if let Some(view) = view_for_remove.upgrade() {
               let is_active = {
