@@ -10,7 +10,7 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 image = "0.25.10"
 indicatif = { workspace = true, features = ["rayon"] }
-oxipng = "10.1.1"
+oxipng = "10.2.1"
 rayon.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true

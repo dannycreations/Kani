@@ -136,14 +136,14 @@ impl Config {
   }
 
   pub fn get_path() -> Result<PathBuf> {
-    let local_app_data = env::var("LOCALAPPDATA")
-      .map(PathBuf::from)
-      .or_else(|_| {
-        env::var("USERPROFILE")
-          .map(|p| PathBuf::from(p).join("AppData").join("Local"))
-      })
-      .map_err(|_| anyhow!("Could not determine local app data directory"))?;
-    Ok(local_app_data.join("VolumeLevelLock").join("config.txt"))
+    let exe_path = env::current_exe()?;
+    let exe_dir = exe_path
+      .parent()
+      .ok_or_else(|| anyhow!("Could not determine executable directory"))?;
+    let stem = exe_path
+      .file_stem()
+      .ok_or_else(|| anyhow!("Could not determine executable name"))?;
+    Ok(exe_dir.join(stem).with_extension("ini"))
   }
 }
 
@@ -154,7 +154,7 @@ mod tests {
   #[test]
   fn test_load_non_existent() {
     let temp_dir = tempdir().unwrap();
-    let file_path = temp_dir.path().join("config.txt");
+    let file_path = temp_dir.path().join("config.ini");
     let cfg = Config::load_from_path(&file_path).unwrap();
     assert_eq!(cfg.input_target, 100);
     assert_eq!(cfg.output_target, 100);
@@ -165,7 +165,7 @@ mod tests {
   #[test]
   fn test_load_key_value() {
     let temp_dir = tempdir().unwrap();
-    let file_path = temp_dir.path().join("config.txt");
+    let file_path = temp_dir.path().join("config.ini");
     fs::write(
       &file_path,
       "input_target=45\noutput_target=90\ninput_paused=true\noutput_paused=false\n",
@@ -181,7 +181,7 @@ mod tests {
   #[test]
   fn test_save_and_load() {
     let temp_dir = tempdir().unwrap();
-    let file_path = temp_dir.path().join("config.txt");
+    let file_path = temp_dir.path().join("config.ini");
     let cfg = Config {
       input_target: 30,
       output_target: 80,
@@ -199,7 +199,7 @@ mod tests {
   #[test]
   fn test_corrupted_config_rewritten() {
     let temp_dir = tempdir().unwrap();
-    let file_path = temp_dir.path().join("config.txt");
+    let file_path = temp_dir.path().join("config.ini");
     fs::write(&file_path, "invalid_junk_data_here").unwrap();
 
     // Loading should detect corruption, delete the file, write defaults, and return default

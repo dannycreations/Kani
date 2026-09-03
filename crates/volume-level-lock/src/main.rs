@@ -205,7 +205,7 @@ fn run_enforcer(config: Config) -> Result<()> {
     output_enforcer.force_to_target();
   }
 
-  // Spawn config file monitor to update target volume dynamically if config.txt changes
+  // Spawn config file monitor to update target volume dynamically if config changes
   let input_target_clone = input_target.clone();
   let output_target_clone = output_target.clone();
   let input_paused_clone = input_paused.clone();
