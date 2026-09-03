@@ -34,25 +34,19 @@ impl WorkbookMap {
       loop {
         match reader.read_event_into(&mut buf) {
           Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-            if e.local_name().as_ref() == b"sheet" {
+            if e.local_name().as_ref() == "sheet" {
               let (mut name, mut rid) = (None, None);
               for a in e.attributes().flatten() {
                 match a.key.local_name().as_ref() {
-                  b"name" => {
+                  "name" => {
                     name = a
-                      .decoded_and_normalized_value(
-                        XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                      )
+                      .normalized_value(XmlVersion::Implicit1_0)
                       .ok()
                       .map(|v| v.into_owned());
                   }
-                  b"id" => {
+                  "id" => {
                     rid = a
-                      .decoded_and_normalized_value(
-                        XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                      )
+                      .normalized_value(XmlVersion::Implicit1_0)
                       .ok()
                       .map(|v| v.into_owned());
                   }
@@ -78,25 +72,19 @@ impl WorkbookMap {
       loop {
         match reader.read_event_into(&mut buf) {
           Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-            if e.local_name().as_ref() == b"Relationship" {
+            if e.local_name().as_ref() == "Relationship" {
               let (mut id, mut target) = (None, None);
               for a in e.attributes().flatten() {
                 match a.key.local_name().as_ref() {
-                  b"Id" => {
+                  "Id" => {
                     id = a
-                      .decoded_and_normalized_value(
-                        XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                      )
+                      .normalized_value(XmlVersion::Implicit1_0)
                       .ok()
                       .map(|v| v.into_owned());
                   }
-                  b"Target" => {
+                  "Target" => {
                     target = a
-                      .decoded_and_normalized_value(
-                        XmlVersion::Implicit1_0,
-                        reader.decoder(),
-                      )
+                      .normalized_value(XmlVersion::Implicit1_0)
                       .ok()
                       .map(|v| v.into_owned());
                   }
@@ -224,16 +212,16 @@ fn should_remove(
   wb_map: &WorkbookMap,
 ) -> bool {
   match e.local_name().as_ref() {
-    b"sheetProtection" if is_worksheet => {
+    "sheetProtection" if is_worksheet => {
       let display_name = wb_map.get_sheet_name(name).unwrap_or(name);
       println!("[+] Sheet protection removed: {display_name}");
       true
     }
-    b"workbookProtection" => {
+    "workbookProtection" => {
       println!("[+] Workbook protection removed");
       true
     }
-    b"fileSharing" => {
+    "fileSharing" => {
       println!("[+] File sharing protection removed");
       true
     }

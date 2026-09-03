@@ -10,7 +10,7 @@ use aes::{
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cfb::CompoundFile;
-use quick_xml::{events::Event, reader::Reader, XmlVersion};
+use quick_xml::{events::Event, Reader, XmlVersion};
 use sha2::{Digest, Sha512};
 
 const BLOCK_KEY: [u8; 8] = [0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6];
@@ -51,53 +51,35 @@ impl AgileEncryptionInfo {
       match reader.read_event_into(&mut buf) {
         Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
           match e.local_name().as_ref() {
-            b"keyData" => {
+            "keyData" => {
               for a in e.attributes().flatten() {
-                if a.key.local_name().as_ref() == b"saltValue" {
-                  let val = a.decoded_and_normalized_value(
-                    XmlVersion::Implicit1_0,
-                    reader.decoder(),
-                  )?;
+                if a.key.local_name().as_ref() == "saltValue" {
+                  let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                   key_data_salt = Some(STANDARD.decode(val.as_bytes())?);
                 }
               }
             }
-            b"encryptedKey" => {
+            "encryptedKey" => {
               for a in e.attributes().flatten() {
                 match a.key.local_name().as_ref() {
-                  b"saltValue" => {
-                    let val = a.decoded_and_normalized_value(
-                      XmlVersion::Implicit1_0,
-                      reader.decoder(),
-                    )?;
+                  "saltValue" => {
+                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                     enc_key_salt = Some(STANDARD.decode(val.as_bytes())?);
                   }
-                  b"spinCount" => {
-                    let val = a.decoded_and_normalized_value(
-                      XmlVersion::Implicit1_0,
-                      reader.decoder(),
-                    )?;
+                  "spinCount" => {
+                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                     spin_count = Some(val.parse()?);
                   }
-                  b"keyBits" => {
-                    let val = a.decoded_and_normalized_value(
-                      XmlVersion::Implicit1_0,
-                      reader.decoder(),
-                    )?;
+                  "keyBits" => {
+                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                     key_bits = Some(val.parse()?);
                   }
-                  b"hashAlgorithm" => {
-                    let val = a.decoded_and_normalized_value(
-                      XmlVersion::Implicit1_0,
-                      reader.decoder(),
-                    )?;
+                  "hashAlgorithm" => {
+                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                     alg_id = Some(val.into_owned());
                   }
-                  b"encryptedKeyValue" => {
-                    let val = a.decoded_and_normalized_value(
-                      XmlVersion::Implicit1_0,
-                      reader.decoder(),
-                    )?;
+                  "encryptedKeyValue" => {
+                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
                     enc_key_value = Some(STANDARD.decode(val.as_bytes())?);
                   }
                   _ => {}
