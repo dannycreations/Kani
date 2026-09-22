@@ -65,6 +65,23 @@ const RED_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(220, 20, 60);
 const ORANGE_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(255, 165, 0);
 const GRAY_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(128, 128, 128);
 
+struct IconSet {
+  red: Icon,
+  orange: Icon,
+  gray: Icon,
+}
+
+fn icon_set() -> IconSet {
+  IconSet {
+    red: Icon::from_rgba(RED_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+      .expect("built-in icon RGBA buffer is always valid"),
+    orange: Icon::from_rgba(ORANGE_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+      .expect("built-in icon RGBA buffer is always valid"),
+    gray: Icon::from_rgba(GRAY_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+      .expect("built-in icon RGBA buffer is always valid"),
+  }
+}
+
 impl TrayApp {
   pub fn new(
     input_target: u32,
@@ -73,7 +90,7 @@ impl TrayApp {
     output_paused: bool,
     main_thread_id: u32,
   ) -> Result<Self> {
-    let icon = Self::get_icon_for_state(input_paused, output_paused)?;
+    let icon = Self::get_icon_for_state(input_paused, output_paused);
 
     let tray_menu = Menu::new();
 
@@ -166,16 +183,13 @@ impl TrayApp {
     )
   }
 
-  fn get_icon_for_state(
-    input_paused: bool,
-    output_paused: bool,
-  ) -> Result<Icon> {
-    let rgba = match (input_paused, output_paused) {
-      (true, true) => &GRAY_ICON_RGBA,
-      (false, false) => &RED_ICON_RGBA,
-      _ => &ORANGE_ICON_RGBA,
-    };
-    Icon::from_rgba(rgba.to_vec(), WIDTH, HEIGHT).map_err(Into::into)
+  fn get_icon_for_state(input_paused: bool, output_paused: bool) -> Icon {
+    let icons = icon_set();
+    match (input_paused, output_paused) {
+      (true, true) => icons.gray.clone(),
+      (false, false) => icons.red.clone(),
+      _ => icons.orange.clone(),
+    }
   }
 
   pub fn update_tooltip(
@@ -211,7 +225,7 @@ impl TrayApp {
     input_paused: bool,
     output_paused: bool,
   ) -> Result<()> {
-    let icon = Self::get_icon_for_state(input_paused, output_paused)?;
+    let icon = Self::get_icon_for_state(input_paused, output_paused);
     self.tray_icon.set_icon(Some(icon))?;
     Ok(())
   }

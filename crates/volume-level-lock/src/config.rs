@@ -3,6 +3,7 @@
 use std::{
   env, fs,
   path::{Path, PathBuf},
+  sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use anyhow::{anyhow, Result};
@@ -116,6 +117,20 @@ impl Config {
     }
   }
 
+  pub fn from_state(
+    input_target: &AtomicU32,
+    output_target: &AtomicU32,
+    input_paused: &AtomicBool,
+    output_paused: &AtomicBool,
+  ) -> Self {
+    Self {
+      input_target: input_target.load(Ordering::SeqCst),
+      output_target: output_target.load(Ordering::SeqCst),
+      input_paused: input_paused.load(Ordering::SeqCst),
+      output_paused: output_paused.load(Ordering::SeqCst),
+    }
+  }
+
   pub fn save(&self) -> Result<()> {
     self.save_to_path(&Self::get_path()?)
   }
@@ -215,5 +230,23 @@ mod tests {
     assert!(replaced_content.contains("output_target=100"));
     assert!(replaced_content.contains("input_paused=false"));
     assert!(replaced_content.contains("output_paused=false"));
+  }
+
+  #[test]
+  fn test_from_state_snapshot() {
+    let input_target = AtomicU32::new(42);
+    let output_target = AtomicU32::new(77);
+    let input_paused = AtomicBool::new(true);
+    let output_paused = AtomicBool::new(false);
+    let cfg = Config::from_state(
+      &input_target,
+      &output_target,
+      &input_paused,
+      &output_paused,
+    );
+    assert_eq!(cfg.input_target, 42);
+    assert_eq!(cfg.output_target, 77);
+    assert!(cfg.input_paused);
+    assert!(!cfg.output_paused);
   }
 }

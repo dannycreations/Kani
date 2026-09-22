@@ -139,6 +139,35 @@ fn proceed(args: Args) -> Result<()> {
 }
 
 #[cfg(windows)]
+fn apply_enforcer_state(enforcer: &mut AudioEnforcer, paused: bool) {
+  if paused {
+    let _ = enforcer.disable();
+  } else {
+    let _ = enforcer.enable();
+    enforcer.force_to_target();
+  }
+}
+
+#[cfg(windows)]
+fn sync_tray_ui(
+  tray_app: &TrayApp,
+  input_target: u32,
+  input_paused: bool,
+  output_target: u32,
+  output_paused: bool,
+) {
+  tray_app.update_toggle_input_text(input_paused);
+  tray_app.update_toggle_output_text(output_paused);
+  let _ = tray_app.update_icon(input_paused, output_paused);
+  tray_app.update_tooltip(
+    input_target,
+    input_paused,
+    output_target,
+    output_paused,
+  );
+}
+
+#[cfg(windows)]
 fn run_enforcer(config: Config) -> Result<()> {
   unsafe {
     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -265,42 +294,29 @@ fn run_enforcer(config: Config) -> Result<()> {
     // 1. Process all pending queue events (volume watcher updates, default device modifications)
     while let Ok(event) = event_rx.try_recv() {
       match event {
-        EnforcerEvent::RebindRole(flow, role) => match flow {
-          AudioFlow::Input => {
-            if !input_paused.load(Ordering::SeqCst) {
-              let _ = input_enforcer.bind_role(role);
-              input_enforcer.force_to_target();
+        EnforcerEvent::RebindRole(flow, role) => {
+          let (enforcer, paused) = match flow {
+            AudioFlow::Input => {
+              (&mut input_enforcer, input_paused.load(Ordering::SeqCst))
             }
-          }
-          AudioFlow::Output => {
-            if !output_paused.load(Ordering::SeqCst) {
-              let _ = output_enforcer.bind_role(role);
-              output_enforcer.force_to_target();
+            AudioFlow::Output => {
+              (&mut output_enforcer, output_paused.load(Ordering::SeqCst))
             }
+          };
+          if !paused {
+            let _ = enforcer.bind_role(role);
+            enforcer.force_to_target();
           }
-        },
+        }
         EnforcerEvent::VolumeFileChanged => {
           let in_paused = input_paused.load(Ordering::SeqCst);
           let out_paused = output_paused.load(Ordering::SeqCst);
 
-          if in_paused {
-            let _ = input_enforcer.disable();
-          } else {
-            let _ = input_enforcer.enable();
-            input_enforcer.force_to_target();
-          }
+          apply_enforcer_state(&mut input_enforcer, in_paused);
+          apply_enforcer_state(&mut output_enforcer, out_paused);
 
-          if out_paused {
-            let _ = output_enforcer.disable();
-          } else {
-            let _ = output_enforcer.enable();
-            output_enforcer.force_to_target();
-          }
-
-          tray_app.update_toggle_input_text(in_paused);
-          tray_app.update_toggle_output_text(out_paused);
-          let _ = tray_app.update_icon(in_paused, out_paused);
-          tray_app.update_tooltip(
+          sync_tray_ui(
+            &tray_app,
             input_target.load(Ordering::SeqCst),
             in_paused,
             output_target.load(Ordering::SeqCst),
@@ -314,52 +330,42 @@ fn run_enforcer(config: Config) -> Result<()> {
     while let Some(action) = tray_app.handle_events() {
       match action {
         TrayAction::ToggleInput => {
-          let currently_paused = input_paused.load(Ordering::SeqCst);
-          let next_paused = !currently_paused;
+          let next_paused = !input_paused.load(Ordering::SeqCst);
           input_paused.store(next_paused, Ordering::SeqCst);
-          if next_paused {
-            let _ = input_enforcer.disable();
-          } else {
-            let _ = input_enforcer.enable();
-            input_enforcer.force_to_target();
-          }
-          tray_app.update_toggle_input_text(next_paused);
-          let _ = tray_app
-            .update_icon(next_paused, output_paused.load(Ordering::SeqCst));
-          tray_app.update_tooltip(
+          apply_enforcer_state(&mut input_enforcer, next_paused);
+          sync_tray_ui(
+            &tray_app,
             input_target.load(Ordering::SeqCst),
             next_paused,
             output_target.load(Ordering::SeqCst),
             output_paused.load(Ordering::SeqCst),
           );
-          if let Ok(mut cfg) = Config::load() {
-            cfg.input_paused = next_paused;
-            let _ = cfg.save();
-          }
+          let _ = Config::from_state(
+            &input_target,
+            &output_target,
+            &input_paused,
+            &output_paused,
+          )
+          .save();
         }
         TrayAction::ToggleOutput => {
-          let currently_paused = output_paused.load(Ordering::SeqCst);
-          let next_paused = !currently_paused;
+          let next_paused = !output_paused.load(Ordering::SeqCst);
           output_paused.store(next_paused, Ordering::SeqCst);
-          if next_paused {
-            let _ = output_enforcer.disable();
-          } else {
-            let _ = output_enforcer.enable();
-            output_enforcer.force_to_target();
-          }
-          tray_app.update_toggle_output_text(next_paused);
-          let _ = tray_app
-            .update_icon(input_paused.load(Ordering::SeqCst), next_paused);
-          tray_app.update_tooltip(
+          apply_enforcer_state(&mut output_enforcer, next_paused);
+          sync_tray_ui(
+            &tray_app,
             input_target.load(Ordering::SeqCst),
             input_paused.load(Ordering::SeqCst),
             output_target.load(Ordering::SeqCst),
             next_paused,
           );
-          if let Ok(mut cfg) = Config::load() {
-            cfg.output_paused = next_paused;
-            let _ = cfg.save();
-          }
+          let _ = Config::from_state(
+            &input_target,
+            &output_target,
+            &input_paused,
+            &output_paused,
+          )
+          .save();
         }
         TrayAction::PromptSetTarget => {
           if let Ok(path) = Config::get_path() {

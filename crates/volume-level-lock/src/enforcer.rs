@@ -37,12 +37,23 @@ pub enum EnforcerEvent {
   VolumeFileChanged,
 }
 
+const ROLE_SLOTS: usize = 3;
+
+fn role_slot(role: ERole) -> usize {
+  match role.0 {
+    v if v == eConsole.0 => 0,
+    v if v == eMultimedia.0 => 1,
+    v if v == eCommunications.0 => 2,
+    _ => 0,
+  }
+}
+
 pub struct AudioEnforcer {
   flow: AudioFlow,
   target: Arc<AtomicU32>,
   enumerator: IMMDeviceEnumerator,
   notification_client: Option<IMMNotificationClient>,
-  bindings_and_roles: Vec<(ERole, AudioBinding)>,
+  bindings: [Option<AudioBinding>; ROLE_SLOTS],
   enabled: bool,
   context_guid: GUID,
   event_tx: Sender<EnforcerEvent>,
@@ -84,7 +95,7 @@ impl AudioEnforcer {
       target,
       enumerator,
       notification_client: None,
-      bindings_and_roles: Vec::new(),
+      bindings: Default::default(),
       enabled: false,
       context_guid,
       event_tx,
@@ -135,8 +146,8 @@ impl AudioEnforcer {
     }
     self.notification_client = None;
 
-    // Clear all bindings (will trigger Drop for each AudioBinding)
-    self.bindings_and_roles.clear();
+    // Drop all bindings (unregisters each endpoint's notify callback).
+    self.bindings = Default::default();
 
     self.enabled = false;
     Ok(())
@@ -154,14 +165,10 @@ impl AudioEnforcer {
   }
 
   pub fn bind_role(&mut self, role: ERole) -> Result<()> {
-    // Remove existing binding if any (triggers Drop)
-    if let Some(pos) = self
-      .bindings_and_roles
-      .iter()
-      .position(|(r, _)| r.0 == role.0)
-    {
-      self.bindings_and_roles.remove(pos);
-    }
+    let slot = role_slot(role);
+    // Drop the existing binding for this slot, if any (triggers Drop,
+    // which unregisters its notify callback).
+    self.bindings[slot] = None;
 
     unsafe {
       let win_flow = Self::flow_to_win_flow(self.flow);
@@ -181,13 +188,10 @@ impl AudioEnforcer {
 
       endpoint_volume_obj.RegisterControlChangeNotify(&callback_interface)?;
 
-      self.bindings_and_roles.push((
-        role,
-        AudioBinding {
-          endpoint: endpoint_volume_obj,
-          callback: callback_interface,
-        },
-      ));
+      self.bindings[slot] = Some(AudioBinding {
+        endpoint: endpoint_volume_obj,
+        callback: callback_interface,
+      });
     }
 
     Ok(())
@@ -195,7 +199,7 @@ impl AudioEnforcer {
 
   pub fn force_to_target(&self) {
     let val = Self::target_to_scalar(&self.target);
-    for (_, binding) in &self.bindings_and_roles {
+    for binding in self.bindings.iter().flatten() {
       unsafe {
         let _ = binding
           .endpoint
