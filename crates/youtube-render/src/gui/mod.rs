@@ -10,18 +10,19 @@ use std::{
   time::Duration,
 };
 
-use gpui::{
-  div, prelude::*, px, AsyncApp, Context, Entity, FontWeight, IntoElement,
-  ParentElement, Render, Styled, Timer, Window,
-};
-use gpui_component::{
-  button::{Button, ButtonVariants as _},
-  divider::Divider,
-  h_flex,
-  input::{InputEvent, InputState},
-  scroll::ScrollableElement as _,
-  tab::{Tab, TabBar},
-  v_flex, ActiveTheme, Disableable, Selectable,
+use gpui_kit::{
+  component::{
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{InputEvent, InputState},
+    scroll::ScrollableElement as _,
+    tab::{Tab, TabBar},
+    v_flex, ActiveTheme, Disableable, Selectable,
+  },
+  div,
+  prelude::*,
+  px, AsyncApp, Context, Entity, FontWeight, IntoElement, ParentElement,
+  Render, Styled, Window,
 };
 use rfd::{
   FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel,
@@ -344,7 +345,7 @@ impl Render for RenderApp {
                         (state.is_running, active_id)
                       };
 
-                      let _ = cx.update(|cx| {
+                      cx.update(|cx| {
                         if let Some(view) = view_weak.upgrade() {
                           view.update(cx, |this, cx| {
                             if let Some(id) = active_id {
@@ -361,7 +362,9 @@ impl Render for RenderApp {
                       if !is_running {
                         break;
                       }
-                      Timer::after(Duration::from_millis(100)).await;
+                      cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
                     }
                   }
                 })
@@ -392,7 +395,7 @@ impl Render for RenderApp {
                 )
                 .pick_files();
               if let Some(files) = files {
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                   if let Some(view) = view.upgrade() {
                     view.update(cx, |this, cx| {
                       let mut state = this.state.lock().unwrap();
@@ -529,7 +532,7 @@ impl Render for RenderApp {
           .child(clear_completed_btn)
           .child(clear_all_btn),
       )
-      .child(Divider::horizontal())
+      .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
       .child(
         v_flex()
           .flex_1()
@@ -593,7 +596,7 @@ impl Render for RenderApp {
         .flex()
         .flex_row()
         .w_full()
-        .flex_grow()
+        .flex_grow(1.0)
         .h_full()
         .gap_4()
         .child(div().flex().flex_col().flex_1().h_full().child(left_col))
@@ -603,7 +606,7 @@ impl Render for RenderApp {
         .flex()
         .flex_col()
         .w_full()
-        .flex_grow()
+        .flex_grow(1.0)
         .h_full()
         .gap_4()
         .child(
@@ -619,7 +622,7 @@ impl Render for RenderApp {
             .flex()
             .flex_col()
             .w_full()
-            .flex_grow()
+            .flex_grow(1.0)
             .h_full()
             .child(right_col),
         )

@@ -3,13 +3,15 @@
 use std::env;
 
 use anyhow::{anyhow, Result};
-use windows::Win32::{
-  Foundation::{CloseHandle, HANDLE},
-  System::Threading::{
-    CreateMutexW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
+use windows::{
+  core::PCWSTR,
+  Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::Threading::{
+      CreateMutexW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
+    },
   },
 };
-use windows_core::PCWSTR;
 
 use crate::utils::to_wide;
 

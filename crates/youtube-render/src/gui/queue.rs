@@ -1,17 +1,18 @@
 use std::{fs, sync::Arc};
 
-use gpui::{
-  div, prelude::*, px, AnyElement, AsyncApp, Context, Focusable, IntoElement,
-  ParentElement, SharedString, Styled, WeakEntity,
-};
-use gpui_component::{
-  button::{Button, ButtonVariants as _},
-  checkbox::Checkbox,
-  divider::Divider,
-  h_flex,
-  input::Input,
-  progress::Progress,
-  v_flex, ActiveTheme, Disableable,
+use gpui_kit::{
+  component::{
+    button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
+    h_flex,
+    input::Input,
+    progress::Progress,
+    v_flex, ActiveTheme, Disableable,
+  },
+  div,
+  prelude::*,
+  px, AnyElement, AsyncApp, Context, Focusable, IntoElement, ParentElement,
+  SharedString, Styled, WeakEntity,
 };
 use rfd::FileDialog;
 
@@ -203,7 +204,7 @@ impl RenderApp {
               let Ok(new_settings) = AudioSettings::from_ini(&content) else {
                 return;
               };
-              let _ = cx.update(|cx| {
+              cx.update(|cx| {
                 if let Some(view) = view.upgrade() {
                   view.update(cx, |this, cx| {
                     {
@@ -272,7 +273,7 @@ impl RenderApp {
                 state.update(cx, |input, cx| {
                   input.unselect(window, cx);
                 });
-                window.blur();
+                window.blur(cx);
               }
             }),
         );
@@ -391,7 +392,7 @@ impl RenderApp {
         .rounded_sm()
         .bg(cx.theme().accent.opacity(0.02))
         .child(preset_row)
-        .child(Divider::horizontal())
+        .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
         .child(
           Checkbox::new(("single_track", id))
             .checked(single_track)
@@ -587,7 +588,11 @@ impl RenderApp {
           v_flex()
             .mt_2()
             .gap_1()
-            .child(Progress::new().bg(cx.theme().info).value(percent * 100.0))
+            .child(
+              Progress::new(("progress", item.id))
+                .bg(cx.theme().info)
+                .value(percent * 100.0),
+            )
             .child(
               h_flex()
                 .justify_end()

@@ -3,11 +3,11 @@ use std::{
   process::exit,
 };
 
-use gpui::{
-  px, size, AppContext, Application, Bounds, TitlebarOptions, WindowBounds,
-  WindowOptions,
+use gpui_kit::{
+  application,
+  component::{init as init_gpui_component, Root},
+  px, size, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 };
-use gpui_component::{init as init_gpui_component, Root};
 use youtube_render::{
   assets::EmbedAssets,
   ffmpeg::kill_all_children,
@@ -30,7 +30,7 @@ fn main() {
     }
   });
 
-  let app = Application::new().with_assets(EmbedAssets);
+  let app = application().with_assets(EmbedAssets);
   app.run(move |cx| {
     init_gpui_component(cx);
 

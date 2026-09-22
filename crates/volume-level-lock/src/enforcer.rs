@@ -7,22 +7,24 @@ use std::sync::{
 };
 
 use anyhow::Result;
-use windows::Win32::{
-  Foundation::{LPARAM, PROPERTYKEY, WPARAM},
-  Media::Audio::{
-    eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow,
-    ERole,
-    Endpoints::{
-      IAudioEndpointVolume, IAudioEndpointVolumeCallback,
-      IAudioEndpointVolumeCallback_Impl,
+use windows::{
+  core::{implement, Result as WinResult, GUID, PCWSTR},
+  Win32::{
+    Foundation::{LPARAM, PROPERTYKEY, WPARAM},
+    Media::Audio::{
+      eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow,
+      ERole,
+      Endpoints::{
+        IAudioEndpointVolume, IAudioEndpointVolumeCallback,
+        IAudioEndpointVolumeCallback_Impl,
+      },
+      IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
+      MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
     },
-    IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
-    MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
+    System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
+    UI::WindowsAndMessaging::PostThreadMessageW,
   },
-  System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
-  UI::WindowsAndMessaging::PostThreadMessageW,
 };
-use windows_core::{implement, Result as WinResult, GUID, PCWSTR};
 
 use crate::WM_WAKEUP;
 

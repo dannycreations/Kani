@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use gpui::{
-  div, prelude::*, Context, FontWeight, IntoElement, ParentElement, Styled,
-};
-use gpui_component::{
-  divider::Divider, scroll::ScrollableElement as _, v_flex, ActiveTheme,
+use gpui_kit::{
+  component::{scroll::ScrollableElement as _, v_flex, ActiveTheme},
+  div,
+  prelude::*,
+  px, Context, FontWeight, IntoElement, ParentElement, Styled,
 };
 
 use crate::{
@@ -39,12 +39,12 @@ impl RenderApp {
           .text_lg()
           .child("Job Logs"),
       )
-      .child(Divider::horizontal())
+      .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
       .child(
         if let Some(job) = display_job {
           v_flex()
             .gap_2()
-            .flex_grow()
+            .flex_grow(1.0)
             .h_full()
             .when_some(
               match &job.status {
@@ -62,7 +62,7 @@ impl RenderApp {
             )
             .child(
               v_flex()
-                .flex_grow()
+                .flex_grow(1.0)
                 .h_full()
                 .overflow_y_scrollbar()
                 .bg(cx.theme().accent.opacity(0.05))
@@ -83,7 +83,7 @@ impl RenderApp {
             )
         } else {
           v_flex()
-            .flex_grow()
+            .flex_grow(1.0)
             .justify_center()
             .items_center()
             .gap_2()

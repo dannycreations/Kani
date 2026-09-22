@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 
 use anyhow::Result;
-use gpui::{AssetSource, SharedString};
-use gpui_component::IconNamed;
+use gpui_kit::{component::IconNamed, AssetSource, SharedString};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconName {

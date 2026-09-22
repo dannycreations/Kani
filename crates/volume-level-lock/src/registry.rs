@@ -3,12 +3,14 @@
 use std::{env, process::Command, slice, thread};
 
 use anyhow::{anyhow, Result};
-use windows::Win32::System::Registry::{
-  RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
-  RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-  KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+use windows::{
+  core::PCWSTR,
+  Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+  },
 };
-use windows_core::PCWSTR;
 
 use crate::utils::to_wide;
 

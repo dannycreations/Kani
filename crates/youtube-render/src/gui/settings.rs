@@ -1,9 +1,8 @@
-use gpui::{
-  div, prelude::*, px, Focusable, IntoElement, ParentElement, Styled,
-  WeakEntity,
-};
-use gpui_component::{
-  checkbox::Checkbox, h_flex, input::Input, v_flex, Disableable,
+use gpui_kit::{
+  component::{checkbox::Checkbox, h_flex, input::Input, v_flex, Disableable},
+  div,
+  prelude::*,
+  px, Focusable, IntoElement, ParentElement, Styled, WeakEntity,
 };
 
 use crate::gui::RenderApp;
@@ -17,7 +16,7 @@ impl RenderApp {
   ) -> impl IntoElement {
     v_flex()
       .gap_4()
-      .flex_grow()
+      .flex_grow(1.0)
       .h_full()
       .child(
         v_flex().gap_2().child(
@@ -28,7 +27,7 @@ impl RenderApp {
             .child(
               div()
                 .id("ffmpeg_path_input_wrapper")
-                .flex_grow()
+                .flex_grow(1.0)
                 .child(Input::new(&self.ffmpeg_path_state).disabled(is_running))
                 .on_mouse_down_out({
                   let state = self.ffmpeg_path_state.clone();
@@ -37,7 +36,7 @@ impl RenderApp {
                       state.update(cx, |input, cx| {
                         input.unselect(window, cx);
                       });
-                      window.blur();
+                      window.blur(cx);
                     }
                   }
                 }),
@@ -82,7 +81,7 @@ impl RenderApp {
                         state.update(cx, |input, cx| {
                           input.unselect(window, cx);
                         });
-                        window.blur();
+                        window.blur(cx);
                       }
                     }
                   }),
