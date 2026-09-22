@@ -1,3 +1,9 @@
+mod cleaner;
+mod crypto;
+mod fs;
+mod processor;
+mod xml;
+
 use std::{
   io::{stdin, stdout, Write},
   process::exit,
@@ -6,14 +12,15 @@ use std::{
 use anyhow::Result;
 use clap::Parser;
 use ctrlc::set_handler;
-use excel_unprotect::{fs::normalize_path, processor::process_file};
+use fs::normalize_path;
+use processor::process_file;
 
 #[derive(Parser, Debug)]
 #[command(
   author,
   version,
   about = "Excel Protection Remover",
-  long_about = "A tool to remove sheet and workbook protection from Excel files (.xlsx, .xlsm)."
+  long_about = "A tool to remove sheet and workbook protection"
 )]
 struct Args {
   /// Input file paths

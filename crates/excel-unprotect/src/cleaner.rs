@@ -1,7 +1,7 @@
 use std::{
   collections::HashMap,
   fs::File,
-  io::{copy, BufReader, BufWriter, Read, Seek},
+  io::{copy, BufWriter, Read, Seek, Write},
   path::Path,
 };
 
@@ -10,16 +10,74 @@ use quick_xml::{
   events::{BytesStart, Event},
   reader::Reader,
   writer::Writer,
-  XmlVersion,
 };
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
-use crate::fs::{add_suffix, safe_save_path};
+use crate::{
+  fs::{add_suffix, safe_save_path},
+  xml::find_attrs,
+};
 
 const XML_BUFFER_CAPACITY: usize = 8192;
 
 struct WorkbookMap {
   sheet_map: HashMap<String, String>,
+  workbook_xml: Option<Vec<u8>>,
+}
+
+fn read_all(mut reader: impl Read, size_hint: u64) -> std::io::Result<Vec<u8>> {
+  let mut buf = Vec::with_capacity(size_hint as usize);
+  reader.read_to_end(&mut buf)?;
+  Ok(buf)
+}
+
+fn read_zip_entry<R: Read + Seek>(
+  archive: &mut ZipArchive<R>,
+  name: &str,
+) -> Option<Vec<u8>> {
+  let mut file = archive.by_name(name).ok()?;
+  let size = file.size();
+  read_all(&mut file, size).ok()
+}
+
+fn for_each_element(
+  data: &[u8],
+  target: &str,
+  mut on_match: impl FnMut(&BytesStart),
+) {
+  let mut reader = Reader::from_reader(data);
+  reader.config_mut().trim_text(true);
+  let mut buf = Vec::new();
+
+  loop {
+    match reader.read_event_into(&mut buf) {
+      Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+        if e.local_name().as_ref() == target {
+          on_match(e);
+        }
+      }
+      Ok(Event::Eof) | Err(_) => break,
+      _ => {}
+    }
+    buf.clear();
+  }
+}
+
+fn needs_protection_removal(content: &[u8]) -> bool {
+  const PROTECTION: &[u8] = b"Protection";
+  const FILE_SHARING: &[u8] = b"fileSharing";
+
+  let n = content.len();
+  for i in 0..n {
+    let b = content[i];
+    if b == PROTECTION[0] && content[i..].starts_with(PROTECTION) {
+      return true;
+    }
+    if b == FILE_SHARING[0] && content[i..].starts_with(FILE_SHARING) {
+      return true;
+    }
+  }
+  false
 }
 
 impl WorkbookMap {
@@ -27,90 +85,35 @@ impl WorkbookMap {
     let mut rid_to_name = HashMap::new();
     let mut sheet_map = HashMap::new();
 
-    if let Ok(file) = archive.by_name("xl/workbook.xml") {
-      let mut reader = Reader::from_reader(BufReader::new(file));
-      reader.config_mut().trim_text(true);
-      let mut buf = Vec::new();
-      loop {
-        match reader.read_event_into(&mut buf) {
-          Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-            if e.local_name().as_ref() == "sheet" {
-              let (mut name, mut rid) = (None, None);
-              for a in e.attributes().flatten() {
-                match a.key.local_name().as_ref() {
-                  "name" => {
-                    name = a
-                      .normalized_value(XmlVersion::Implicit1_0)
-                      .ok()
-                      .map(|v| v.into_owned());
-                  }
-                  "id" => {
-                    rid = a
-                      .normalized_value(XmlVersion::Implicit1_0)
-                      .ok()
-                      .map(|v| v.into_owned());
-                  }
-                  _ => {}
-                }
-              }
-              if let (Some(n), Some(r)) = (name, rid) {
-                rid_to_name.insert(r, n);
-              }
-            }
-          }
-          Ok(Event::Eof) => break,
-          _ => {}
+    let workbook_xml = read_zip_entry(archive, "xl/workbook.xml");
+    if let Some(content) = workbook_xml.as_deref() {
+      for_each_element(content, "sheet", |e| {
+        let mut vals = find_attrs(e, &["name", "id"]);
+        if let (Some(name), Some(rid)) = (vals[0].take(), vals[1].take()) {
+          rid_to_name.insert(rid, name);
         }
-        buf.clear();
-      }
+      });
     }
 
-    if let Ok(file) = archive.by_name("xl/_rels/workbook.xml.rels") {
-      let mut reader = Reader::from_reader(BufReader::new(file));
-      reader.config_mut().trim_text(true);
-      let mut buf = Vec::new();
-      loop {
-        match reader.read_event_into(&mut buf) {
-          Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
-            if e.local_name().as_ref() == "Relationship" {
-              let (mut id, mut target) = (None, None);
-              for a in e.attributes().flatten() {
-                match a.key.local_name().as_ref() {
-                  "Id" => {
-                    id = a
-                      .normalized_value(XmlVersion::Implicit1_0)
-                      .ok()
-                      .map(|v| v.into_owned());
-                  }
-                  "Target" => {
-                    target = a
-                      .normalized_value(XmlVersion::Implicit1_0)
-                      .ok()
-                      .map(|v| v.into_owned());
-                  }
-                  _ => {}
-                }
-              }
-              if let (Some(id), Some(target)) = (id, target) {
-                if let Some(name) = rid_to_name.get(&id) {
-                  let path = if target.starts_with('/') {
-                    target.trim_start_matches('/').to_string()
-                  } else {
-                    format!("xl/{}", target)
-                  };
-                  sheet_map.insert(path, name.clone());
-                }
-              }
-            }
+    if let Some(rels) = read_zip_entry(archive, "xl/_rels/workbook.xml.rels") {
+      for_each_element(&rels, "Relationship", |e| {
+        let mut vals = find_attrs(e, &["Id", "Target"]);
+        if let (Some(id), Some(target)) = (vals[0].take(), vals[1].take()) {
+          if let Some(name) = rid_to_name.get(&id) {
+            let path = match target.strip_prefix('/') {
+              Some(stripped) => stripped.to_string(),
+              None => format!("xl/{target}"),
+            };
+            sheet_map.insert(path, name.clone());
           }
-          Ok(Event::Eof) => break,
-          _ => {}
         }
-        buf.clear();
-      }
+      });
     }
 
-    Self { sheet_map }
+    Self {
+      sheet_map,
+      workbook_xml,
+    }
   }
 
   fn get_sheet_name(&self, path: &str) -> Option<&str> {
@@ -125,17 +128,14 @@ fn is_vba_file(name: &str) -> bool {
     || name.ends_with(".xlsm")
 }
 
-pub fn remove_protection_and_save(
-  target_path: &Path,
+pub fn remove_protection_and_save<R: Read + Seek>(
+  source: R,
   original_path: &Path,
   disable_macros: bool,
 ) -> Result<()> {
-  let file = File::open(target_path)?;
-  let reader = BufReader::new(file);
-
   let mut archive =
-    ZipArchive::new(reader).map_err(|e| anyhow!("Failed to open Zip: {e}"))?;
-  let wb_map = WorkbookMap::new(&mut archive);
+    ZipArchive::new(source).map_err(|e| anyhow!("Failed to open Zip: {e}"))?;
+  let mut wb_map = WorkbookMap::new(&mut archive);
 
   let clean_path = add_suffix(original_path, "_clean");
   let final_path = safe_save_path(&clean_path);
@@ -168,31 +168,41 @@ pub fn remove_protection_and_save(
     let is_workbook = name == "xl/workbook.xml";
 
     if is_worksheet || is_workbook {
-      let mut reader = Reader::from_reader(BufReader::new(file));
-      let mut writer = Writer::new(&mut zip_writer);
-
-      loop {
-        match reader.read_event_into(&mut xml_buf) {
-          Ok(Event::Start(ref e)) => {
-            if !should_remove(e, is_worksheet, &name, &wb_map) {
-              writer.write_event(Event::Start(e.clone()))?;
-            }
-          }
-          Ok(Event::Empty(ref e)) => {
-            if !should_remove(e, is_worksheet, &name, &wb_map) {
-              writer.write_event(Event::Empty(e.clone()))?;
-            }
-          }
-          Ok(Event::End(ref e)) => {
-            writer.write_event(Event::End(e.clone()))?;
-          }
-          Ok(Event::Eof) => break,
-          Ok(e) => {
-            writer.write_event(e)?;
-          }
-          Err(e) => return Err(anyhow!("XML parsing error: {e}")),
+      let content = match (is_workbook, wb_map.workbook_xml.take()) {
+        (true, Some(cached)) => cached,
+        _ => {
+          let size = file.size();
+          read_all(&mut file, size)?
         }
-        xml_buf.clear();
+      };
+
+      if needs_protection_removal(&content) {
+        let mut reader = Reader::from_reader(content.as_slice());
+        let mut writer = Writer::new(&mut zip_writer);
+
+        loop {
+          match reader.read_event_into(&mut xml_buf) {
+            Ok(ev @ (Event::Start(_) | Event::Empty(_))) => {
+              let keep = match &ev {
+                Event::Start(e) | Event::Empty(e) => {
+                  !should_remove(e, is_worksheet, &name, &wb_map)
+                }
+                _ => unreachable!(),
+              };
+              if keep {
+                writer.write_event(ev)?;
+              }
+            }
+            Ok(Event::Eof) => break,
+            Ok(e) => {
+              writer.write_event(e)?;
+            }
+            Err(e) => return Err(anyhow!("XML parsing error: {e}")),
+          }
+          xml_buf.clear();
+        }
+      } else {
+        zip_writer.write_all(&content)?;
       }
     } else {
       copy(&mut file, &mut zip_writer)?;

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+  ffi::OsStr,
+  path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, bail, Result};
 
@@ -33,24 +36,25 @@ pub fn normalize_path(user_input: &str) -> Result<PathBuf> {
   Ok(canonical)
 }
 
-#[must_use]
+fn push_extension(name: &mut std::ffi::OsString, ext: Option<&OsStr>) {
+  if let Some(ext) = ext {
+    name.push(".");
+    name.push(ext);
+  }
+}
+
 pub fn add_suffix(path: &Path, suffix: &str) -> PathBuf {
   let mut new_path = path.to_path_buf();
   let stem = path.file_stem().unwrap_or_default();
 
   let mut new_name = stem.to_os_string();
   new_name.push(suffix);
-
-  if let Some(ext) = path.extension() {
-    new_name.push(".");
-    new_name.push(ext);
-  }
+  push_extension(&mut new_name, path.extension());
 
   new_path.set_file_name(new_name);
   new_path
 }
 
-#[must_use]
 pub fn safe_save_path(target: &Path) -> PathBuf {
   if !target.exists() {
     return target.to_path_buf();
@@ -64,11 +68,7 @@ pub fn safe_save_path(target: &Path) -> PathBuf {
     let mut new_name = stem.to_os_string();
     new_name.push("_");
     new_name.push(counter.to_string());
-
-    if let Some(ext) = extension {
-      new_name.push(".");
-      new_name.push(ext);
-    }
+    push_extension(&mut new_name, extension);
 
     let candidate = parent.join(new_name);
     if !candidate.exists() {

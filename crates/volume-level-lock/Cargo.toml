@@ -28,4 +28,4 @@ windows = { version = "=0.62.2", features = [
 windows-core = "=0.62.2"
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tempfile.workspace = true

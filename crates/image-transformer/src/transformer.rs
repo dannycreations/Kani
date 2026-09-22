@@ -14,7 +14,6 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum TransformerError {
   #[error("Unsupported resolution: {0}")]
   UnsupportedResolution(String),

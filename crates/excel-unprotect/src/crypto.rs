@@ -4,25 +4,70 @@ use std::{
 };
 
 use aes::{
-  cipher::{typenum::U32, Array, BlockCipherDecrypt, KeyInit},
+  cipher::{
+    typenum::{U16, U32},
+    Array, BlockCipherDecrypt, KeyInit,
+  },
   Aes256,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use cfb::CompoundFile;
-use quick_xml::{events::Event, Reader, XmlVersion};
+use quick_xml::{
+  events::{BytesStart, Event},
+  Reader,
+};
 use sha2::{Digest, Sha512};
 
-const BLOCK_KEY: [u8; 8] = [0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6];
+use crate::xml::{find_attr, find_attrs};
+
+const BLOCK_KEY_ENCRYPTED_KEY: [u8; 8] =
+  [0x14, 0x6e, 0x0b, 0xe7, 0xab, 0xac, 0xd0, 0xd6];
+const BLOCK_KEY_VERIFIER_INPUT: [u8; 8] =
+  [0xfe, 0xa7, 0xd2, 0x76, 0x3b, 0x4b, 0x9e, 0x79];
+const BLOCK_KEY_VERIFIER_VALUE: [u8; 8] =
+  [0xd7, 0xaa, 0x0f, 0x6d, 0x30, 0x61, 0x34, 0x4e];
 const OLE_HEADER: &[u8] = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1";
 
 const MAX_ENCRYPTION_INFO_SIZE: usize = 10 * 1024 * 1024;
 const IO_BUFFER_SIZE: usize = 128 * 1024;
+const SEGMENT_SIZE: usize = 4096;
 const MAX_SPIN_COUNT: u32 = 10_000_000;
 
-#[must_use]
 pub fn is_ole_file(buffer: &[u8]) -> bool {
   buffer.len() >= 8 && &buffer[0..8] == OLE_HEADER
+}
+
+fn key32(bytes: &[u8]) -> Result<Array<u8, U32>> {
+  bytes
+    .get(..32)
+    .and_then(|b| Array::try_from(b).ok())
+    .ok_or_else(|| anyhow!("Invalid key size (expected 32 bytes)"))
+}
+
+fn iv16(bytes: &[u8]) -> Result<Array<u8, U16>> {
+  bytes
+    .get(..16)
+    .and_then(|b| Array::try_from(b).ok())
+    .ok_or_else(|| anyhow!("Invalid IV size (expected 16 bytes)"))
+}
+
+fn decode_base64_opt(v: Option<&str>) -> Result<Option<Vec<u8>>> {
+  v.map(|s| STANDARD.decode(s.as_bytes()))
+    .transpose()
+    .map_err(Into::into)
+}
+
+fn decode_attr(e: &BytesStart, name: &str) -> Result<Option<Vec<u8>>> {
+  decode_base64_opt(find_attr(e, name).as_deref())
+}
+
+fn parse_opt<T>(v: Option<&str>) -> Result<Option<T>>
+where
+  T: std::str::FromStr,
+  T::Err: std::error::Error + Send + Sync + 'static,
+{
+  v.map(str::parse).transpose().map_err(Into::into)
 }
 
 struct AgileEncryptionInfo {
@@ -31,6 +76,8 @@ struct AgileEncryptionInfo {
   spin_count: u32,
   key_bits: u32,
   encrypted_key_value: Vec<u8>,
+  encrypted_verifier_hash_input: Vec<u8>,
+  encrypted_verifier_hash_value: Vec<u8>,
 }
 
 impl AgileEncryptionInfo {
@@ -43,6 +90,8 @@ impl AgileEncryptionInfo {
     let mut spin_count = None;
     let mut key_bits = None;
     let mut enc_key_value = None;
+    let mut verifier_hash_input = None;
+    let mut verifier_hash_value = None;
     let mut alg_id = None;
 
     let mut buf = Vec::with_capacity(1024);
@@ -52,41 +101,42 @@ impl AgileEncryptionInfo {
         Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
           match e.local_name().as_ref() {
             "keyData" => {
-              for a in e.attributes().flatten() {
-                if a.key.local_name().as_ref() == "saltValue" {
-                  let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                  key_data_salt = Some(STANDARD.decode(val.as_bytes())?);
-                }
-              }
+              key_data_salt = decode_attr(e, "saltValue")?;
             }
             "encryptedKey" => {
-              for a in e.attributes().flatten() {
-                match a.key.local_name().as_ref() {
-                  "saltValue" => {
-                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                    enc_key_salt = Some(STANDARD.decode(val.as_bytes())?);
-                  }
-                  "spinCount" => {
-                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                    spin_count = Some(val.parse()?);
-                  }
-                  "keyBits" => {
-                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                    key_bits = Some(val.parse()?);
-                  }
-                  "hashAlgorithm" => {
-                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                    alg_id = Some(val.into_owned());
-                  }
-                  "encryptedKeyValue" => {
-                    let val = a.normalized_value(XmlVersion::Implicit1_0)?;
-                    enc_key_value = Some(STANDARD.decode(val.as_bytes())?);
-                  }
-                  _ => {}
-                }
-              }
+              let vals = find_attrs(
+                e,
+                &[
+                  "saltValue",
+                  "spinCount",
+                  "keyBits",
+                  "hashAlgorithm",
+                  "encryptedKeyValue",
+                  "encryptedVerifierHashInput",
+                  "encryptedVerifierHashValue",
+                ],
+              );
+              enc_key_salt = decode_base64_opt(vals[0].as_deref())?;
+              spin_count = parse_opt(vals[1].as_deref())?;
+              key_bits = parse_opt(vals[2].as_deref())?;
+              alg_id = vals[3].clone();
+              enc_key_value = decode_base64_opt(vals[4].as_deref())?;
+              verifier_hash_input = decode_base64_opt(vals[5].as_deref())?;
+              verifier_hash_value = decode_base64_opt(vals[6].as_deref())?;
             }
             _ => {}
+          }
+
+          if key_data_salt.is_some()
+            && enc_key_salt.is_some()
+            && spin_count.is_some()
+            && key_bits.is_some()
+            && enc_key_value.is_some()
+            && verifier_hash_input.is_some()
+            && verifier_hash_value.is_some()
+            && alg_id.is_some()
+          {
+            break;
           }
         }
         Ok(Event::Eof) => break,
@@ -107,12 +157,19 @@ impl AgileEncryptionInfo {
       key_bits: key_bits.context("Missing keyBits")?,
       encrypted_key_value: enc_key_value
         .context("Missing encryptedKeyValue")?,
+      encrypted_verifier_hash_input: verifier_hash_input
+        .context("Missing encryptedVerifierHashInput")?,
+      encrypted_verifier_hash_value: verifier_hash_value
+        .context("Missing encryptedVerifierHashValue")?,
     })
   }
 
-  fn derive_key(&self, password: &str) -> Result<(Array<u8, U32>, Vec<u8>)> {
+  fn iterate_hash(&self, password: &str) -> Result<Vec<u8>> {
     if self.spin_count > MAX_SPIN_COUNT {
       bail!("Spin count too high");
+    }
+    if self.key_bits != 256 {
+      bail!("Unsupported key size: only 256-bit keys are supported");
     }
 
     let mut hasher = Sha512::new();
@@ -120,61 +177,108 @@ impl AgileEncryptionInfo {
     for c in password.encode_utf16() {
       hasher.update(c.to_le_bytes());
     }
-    let mut h_n = hasher.finalize();
+    let mut h_n = hasher.finalize_reset();
 
     for i in 0..self.spin_count {
-      let mut hasher = Sha512::new();
       hasher.update(i.to_le_bytes());
       hasher.update(h_n);
-      h_n = hasher.finalize();
+      h_n = hasher.finalize_reset();
     }
 
+    Ok(h_n.to_vec())
+  }
+
+  fn block_key(h_n: &[u8], block_key: &[u8]) -> Result<Array<u8, U32>> {
     let mut hasher = Sha512::new();
     hasher.update(h_n);
-    hasher.update(BLOCK_KEY);
-    let kek_hash = hasher.finalize();
+    hasher.update(block_key);
+    let hash = hasher.finalize();
+    key32(&hash)
+  }
 
-    let key_len = (self.key_bits / 8) as usize;
-    if key_len > kek_hash.len() {
-      bail!("Key length exceeds hash size");
-    }
-    let kek = &kek_hash[0..key_len];
-
+  fn iv(&self) -> Array<u8, U16> {
     let mut iv = [0u8; 16];
     let salt_len = self.enc_key_salt.len().min(16);
     iv[..salt_len].copy_from_slice(&self.enc_key_salt[..salt_len]);
-
-    let key_array =
-      Array::try_from(kek).map_err(|e| anyhow!("Invalid key size: {e}"))?;
-    let cipher = Aes256::new(&key_array);
-    let mut encrypted_key = self.encrypted_key_value.clone();
-
-    if !encrypted_key.len().is_multiple_of(16) {
-      bail!("Encrypted Key Value size not multiple of 16");
-    }
-
-    let mut prev_block = Array::from(iv);
-
-    for block in encrypted_key.chunks_mut(16) {
-      let current_ciphertext = *<&Array<u8, _>>::try_from(&*block)
-        .map_err(|e| anyhow!("Invalid block size: {e}"))?;
-      let mut state = current_ciphertext;
-
-      cipher.decrypt_block(&mut state);
-
-      for (r, v) in state.iter_mut().zip(prev_block.iter()) {
-        *r ^= *v;
-      }
-
-      block.copy_from_slice(state.as_slice());
-      prev_block = current_ciphertext;
-    }
-
-    let actual_key = &encrypted_key[0..32];
-    let actual_key_array = Array::try_from(actual_key)
-      .map_err(|e| anyhow!("Invalid actual key size: {e}"))?;
-    Ok((actual_key_array, self.key_data_salt.clone()))
+    Array::from(iv)
   }
+
+  fn verify_and_derive_key(
+    &self,
+    password: &str,
+  ) -> Result<(Array<u8, U32>, Vec<u8>)> {
+    let h_n = self.iterate_hash(password)?;
+    let iv = self.iv();
+
+    let input_key = Self::block_key(&h_n, &BLOCK_KEY_VERIFIER_INPUT)?;
+    let mut verifier_input = self.encrypted_verifier_hash_input.clone();
+    decrypt_cbc(&input_key, &iv, &mut verifier_input)?;
+
+    let value_key = Self::block_key(&h_n, &BLOCK_KEY_VERIFIER_VALUE)?;
+    let mut verifier_value = self.encrypted_verifier_hash_value.clone();
+    decrypt_cbc(&value_key, &iv, &mut verifier_value)?;
+
+    let computed = Sha512::digest(&verifier_input);
+    let n = computed.len().min(verifier_value.len());
+    if n == 0 || computed[..n] != verifier_value[..n] {
+      bail!("Invalid password");
+    }
+
+    let content_key_kek = Self::block_key(&h_n, &BLOCK_KEY_ENCRYPTED_KEY)?;
+    let mut encrypted_key = self.encrypted_key_value.clone();
+    decrypt_cbc(&content_key_kek, &iv, &mut encrypted_key)?;
+
+    let content_key = key32(&encrypted_key)?;
+
+    Ok((content_key, self.key_data_salt.clone()))
+  }
+}
+
+fn decrypt_cbc_blocks(
+  cipher: &Aes256,
+  iv: &Array<u8, U16>,
+  data: &mut [u8],
+  scratch: &mut Vec<Array<u8, U16>>,
+) -> Result<()> {
+  if !data.len().is_multiple_of(16) {
+    bail!("Ciphertext length not a multiple of the block size");
+  }
+  if data.is_empty() {
+    return Ok(());
+  }
+
+  let (blocks, _) = data.as_chunks_mut::<16>();
+
+  scratch.clear();
+  scratch.extend(blocks.iter().map(|b| Array::from(*b)));
+  cipher.decrypt_blocks(scratch);
+
+  let mut prev: [u8; 16] =
+    iv.as_slice().try_into().expect("IV is exactly 16 bytes");
+
+  for (block, decrypted) in blocks.iter_mut().zip(scratch.iter()) {
+    let ciphertext = *block;
+    let dec: [u8; 16] = decrypted
+      .as_slice()
+      .try_into()
+      .expect("block is exactly 16 bytes");
+
+    let plain = u128::from_ne_bytes(dec) ^ u128::from_ne_bytes(prev);
+    *block = plain.to_ne_bytes();
+    prev = ciphertext;
+  }
+
+  Ok(())
+}
+
+fn decrypt_cbc(
+  key: &Array<u8, U32>,
+  iv: &Array<u8, U16>,
+  data: &mut [u8],
+) -> Result<()> {
+  let cipher = Aes256::new(key);
+  let mut scratch = Vec::with_capacity(data.len() / 16);
+  decrypt_cbc_blocks(&cipher, iv, data, &mut scratch)
 }
 
 pub fn decrypt_file<R, W>(
@@ -208,7 +312,8 @@ where
   let xml_str = from_utf8(&enc_info_data[8..])
     .context("EncryptionInfo data is not valid UTF-8")?;
   let info = AgileEncryptionInfo::from_xml(xml_str)?;
-  let (content_key, pkg_salt) = info.derive_key(password)?;
+
+  let (content_key, pkg_salt) = info.verify_and_derive_key(password)?;
 
   let mut enc_pkg_stream = cfb.open_stream("/EncryptedPackage")?;
   let mut size_buf = [0u8; 8];
@@ -223,6 +328,7 @@ where
   base_iv_hasher.update(&pkg_salt);
 
   let cipher = Aes256::new(&content_key);
+  let mut scratch: Vec<Array<u8, U16>> = Vec::with_capacity(SEGMENT_SIZE / 16);
 
   loop {
     let mut pos = 0;
@@ -239,32 +345,22 @@ where
 
     let chunk = &mut buffer[..pos];
 
-    for segment in chunk.chunks_mut(4096) {
+    for segment in chunk.chunks_mut(SEGMENT_SIZE) {
       let mut iv_hasher = base_iv_hasher.clone();
       iv_hasher.update(block_idx.to_le_bytes());
       let iv_hash = iv_hasher.finalize();
+      let iv = iv16(&iv_hash)?;
 
-      let mut prev_block = *<&Array<u8, _>>::try_from(&iv_hash[0..16])
-        .map_err(|e| anyhow!("Invalid IV block size: {e}"))?;
-
-      for block in segment.chunks_mut(16) {
-        if block.len() < 16 {
-          break;
-        }
-
-        let current_ciphertext = *<&Array<u8, _>>::try_from(&*block)
-          .map_err(|e| anyhow!("Invalid block size: {e}"))?;
-        let mut state = current_ciphertext;
-
-        cipher.decrypt_block(&mut state);
-
-        for (r, v) in state.iter_mut().zip(prev_block.iter()) {
-          *r ^= *v;
-        }
-
-        block.copy_from_slice(state.as_slice());
-        prev_block = current_ciphertext;
+      let aligned = segment.len() - segment.len() % 16;
+      if aligned > 0 {
+        decrypt_cbc_blocks(
+          &cipher,
+          &iv,
+          &mut segment[..aligned],
+          &mut scratch,
+        )?;
       }
+
       block_idx = block_idx
         .checked_add(1)
         .ok_or_else(|| anyhow!("Block index overflow"))?;
