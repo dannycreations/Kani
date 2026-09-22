@@ -29,9 +29,11 @@ use rfd::{
 };
 
 use crate::{
-  assets::IconName,
+  core::{
+    assets::IconName,
+    queue::{AppState, QueueItemStatus},
+  },
   ffmpeg::{kill_all_children, AudioSettings},
-  queue::{AppState, QueueItemStatus},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

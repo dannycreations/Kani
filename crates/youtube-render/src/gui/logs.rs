@@ -8,8 +8,8 @@ use gpui_kit::{
 };
 
 use crate::{
+  core::queue::{AppState, QueueItemStatus},
   gui::RenderApp,
-  queue::{AppState, QueueItemStatus},
 };
 
 impl RenderApp {

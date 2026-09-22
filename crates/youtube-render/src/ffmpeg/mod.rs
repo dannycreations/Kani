@@ -7,7 +7,7 @@ pub mod track;
 
 pub use preset::Preset;
 pub use process::{kill_all_children, RenderProcess};
-pub use progress::{JobProgress, StepType};
+pub use progress::JobProgress;
 pub use settings::{AudioSettings, RenderSettings};
 
 #[cfg(test)]

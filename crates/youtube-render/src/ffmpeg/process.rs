@@ -10,14 +10,16 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
-use super::{
-  progress::{
-    FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
+use crate::{
+  core::DEFAULT_LOUDNORM_CONFIG,
+  ffmpeg::{
+    progress::{
+      FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
+    },
+    settings::RenderSettings,
+    track::{AudioRenderer, TrackStats},
   },
-  settings::RenderSettings,
-  track::{AudioRenderer, TrackStats},
 };
-use crate::core::DEFAULT_LOUDNORM_CONFIG;
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
 

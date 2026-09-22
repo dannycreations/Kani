@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-
 mod transformer;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;

@@ -17,10 +17,12 @@ use gpui_kit::{
 use rfd::FileDialog;
 
 use crate::{
-  assets::IconName,
+  core::{
+    assets::IconName,
+    queue::{QueueItem, QueueItemStatus},
+  },
   ffmpeg::{AudioSettings, Preset},
   gui::{confirm_action, ItemInputStates, RenderApp},
-  queue::{QueueItem, QueueItemStatus},
 };
 
 impl RenderApp {
