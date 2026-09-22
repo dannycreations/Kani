@@ -3,12 +3,14 @@
 use std::{
   env, fs,
   path::{Path, PathBuf},
-  sync::atomic::{AtomicBool, AtomicU32, Ordering},
+  sync::atomic::Ordering,
 };
 
 use anyhow::{anyhow, Result};
 #[cfg(test)]
 use tempfile::tempdir;
+
+use crate::enforcer::VolumeState;
 
 pub struct Config {
   pub input_target: u32,
@@ -17,117 +19,108 @@ pub struct Config {
   pub output_paused: bool,
 }
 
+impl Default for Config {
+  fn default() -> Self {
+    Self {
+      input_target: 100,
+      output_target: 100,
+      input_paused: false,
+      output_paused: false,
+    }
+  }
+}
+
+fn parse_percent(val: &str) -> Option<u32> {
+  val.parse::<u32>().ok().filter(|&v| (1..=100).contains(&v))
+}
+
 impl Config {
   pub fn load() -> Result<Self> {
     Self::load_from_path(&Self::get_path()?)
   }
 
   pub fn load_from_path(path: &Path) -> Result<Self> {
-    let default_config = Self {
-      input_target: 100,
-      output_target: 100,
-      input_paused: false,
-      output_paused: false,
-    };
-
     if !path.exists() {
-      return Ok(default_config);
+      return Ok(Self::default());
     }
 
-    let content = match fs::read_to_string(path) {
-      Ok(c) => c,
-      Err(_) => {
-        let _ = fs::remove_file(path);
-        let _ = default_config.save_to_path(path);
-        return Ok(default_config);
-      }
+    // Unreadable file is treated the same as corrupted,
+    // avoiding a separate error branch further down.
+    let Ok(content) = fs::read_to_string(path) else {
+      return Ok(Self::reset_to_default(path));
     };
 
     let mut input_target = None;
     let mut output_target = None;
     let mut input_paused = None;
     let mut output_paused = None;
-    let mut is_corrupted = false;
+    let mut corrupted = false;
 
     for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
       let Some((key, val)) = line.split_once('=') else {
-        is_corrupted = true;
+        corrupted = true;
         continue;
       };
-      let key = key.trim();
-      let val = val.trim();
+      let (key, val) = (key.trim(), val.trim());
 
       match key {
-        "input_target" => {
-          if let Some(v) =
-            val.parse::<u32>().ok().filter(|&v| (1..=100).contains(&v))
-          {
-            input_target = Some(v);
-          } else {
-            is_corrupted = true;
-          }
-        }
-        "output_target" => {
-          if let Some(v) =
-            val.parse::<u32>().ok().filter(|&v| (1..=100).contains(&v))
-          {
-            output_target = Some(v);
-          } else {
-            is_corrupted = true;
-          }
-        }
-        "input_paused" => {
-          if let Ok(v) = val.parse::<bool>() {
-            input_paused = Some(v);
-          } else {
-            is_corrupted = true;
-          }
-        }
-        "output_paused" => {
-          if let Ok(v) = val.parse::<bool>() {
-            output_paused = Some(v);
-          } else {
-            is_corrupted = true;
-          }
-        }
-        _ => {
-          is_corrupted = true;
-        }
+        "input_target" => match parse_percent(val) {
+          Some(v) => input_target = Some(v),
+          None => corrupted = true,
+        },
+        "output_target" => match parse_percent(val) {
+          Some(v) => output_target = Some(v),
+          None => corrupted = true,
+        },
+        "input_paused" => match val.parse::<bool>() {
+          Ok(v) => input_paused = Some(v),
+          Err(_) => corrupted = true,
+        },
+        "output_paused" => match val.parse::<bool>() {
+          Ok(v) => output_paused = Some(v),
+          Err(_) => corrupted = true,
+        },
+        _ => corrupted = true,
       }
     }
 
-    match (
-      is_corrupted,
+    // A missing field is equivalent to corruption: both paths reset to
+    // defaults, so the two checks are unified into one bail-out point.
+    let (
+      Some(input_target),
+      Some(output_target),
+      Some(input_paused),
+      Some(output_paused),
+    ) = (input_target, output_target, input_paused, output_paused)
+    else {
+      return Ok(Self::reset_to_default(path));
+    };
+
+    if corrupted {
+      return Ok(Self::reset_to_default(path));
+    }
+
+    Ok(Self {
       input_target,
       output_target,
       input_paused,
       output_paused,
-    ) {
-      (false, Some(in_t), Some(out_t), Some(in_p), Some(out_p)) => Ok(Self {
-        input_target: in_t,
-        output_target: out_t,
-        input_paused: in_p,
-        output_paused: out_p,
-      }),
-      _ => {
-        let _ = fs::remove_file(path);
-        let _ = default_config.save_to_path(path);
-        Ok(default_config)
-      }
-    }
+    })
   }
 
-  pub fn from_state(
-    input_target: &AtomicU32,
-    output_target: &AtomicU32,
-    input_paused: &AtomicBool,
-    output_paused: &AtomicBool,
-  ) -> Self {
+  fn reset_to_default(path: &Path) -> Self {
+    let default_config = Self::default();
+    let _ = fs::remove_file(path);
+    let _ = default_config.save_to_path(path);
+    default_config
+  }
+
+  pub fn from_state(state: &VolumeState) -> Self {
     Self {
-      input_target: input_target.load(Ordering::SeqCst),
-      output_target: output_target.load(Ordering::SeqCst),
-      input_paused: input_paused.load(Ordering::SeqCst),
-      output_paused: output_paused.load(Ordering::SeqCst),
+      input_target: state.input_target.load(Ordering::SeqCst),
+      output_target: state.output_target.load(Ordering::SeqCst),
+      input_paused: state.input_paused.load(Ordering::SeqCst),
+      output_paused: state.output_paused.load(Ordering::SeqCst),
     }
   }
 
@@ -234,16 +227,8 @@ mod tests {
 
   #[test]
   fn test_from_state_snapshot() {
-    let input_target = AtomicU32::new(42);
-    let output_target = AtomicU32::new(77);
-    let input_paused = AtomicBool::new(true);
-    let output_paused = AtomicBool::new(false);
-    let cfg = Config::from_state(
-      &input_target,
-      &output_target,
-      &input_paused,
-      &output_paused,
-    );
+    let state = VolumeState::new(42, 77, true, false);
+    let cfg = Config::from_state(&state);
     assert_eq!(cfg.input_target, 42);
     assert_eq!(cfg.output_target, 77);
     assert!(cfg.input_paused);

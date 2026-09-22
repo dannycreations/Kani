@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::sync::{
-  atomic::{AtomicU32, Ordering},
+  atomic::{AtomicBool, AtomicU32, Ordering},
   mpsc::Sender,
   Arc,
 };
@@ -10,7 +10,7 @@ use anyhow::Result;
 use windows::{
   core::{implement, Result as WinResult, GUID, PCWSTR},
   Win32::{
-    Foundation::{LPARAM, PROPERTYKEY, WPARAM},
+    Foundation::PROPERTYKEY,
     Media::Audio::{
       eCapture, eCommunications, eConsole, eMultimedia, eRender, EDataFlow,
       ERole,
@@ -22,11 +22,10 @@ use windows::{
       MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA, DEVICE_STATE,
     },
     System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
-    UI::WindowsAndMessaging::PostThreadMessageW,
   },
 };
 
-use crate::WM_WAKEUP;
+use crate::utils::wake_main_thread;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFlow {
@@ -40,6 +39,7 @@ pub enum EnforcerEvent {
 }
 
 const ROLE_SLOTS: usize = 3;
+const VOLUME_EPSILON: f32 = 0.005;
 
 fn role_slot(role: ERole) -> usize {
   match role.0 {
@@ -50,9 +50,54 @@ fn role_slot(role: ERole) -> usize {
   }
 }
 
+#[derive(Default)]
+pub struct VolumeState {
+  pub input_target: AtomicU32,
+  pub output_target: AtomicU32,
+  pub input_paused: AtomicBool,
+  pub output_paused: AtomicBool,
+}
+
+impl VolumeState {
+  pub fn new(
+    input_target: u32,
+    output_target: u32,
+    input_paused: bool,
+    output_paused: bool,
+  ) -> Self {
+    Self {
+      input_target: AtomicU32::new(input_target),
+      output_target: AtomicU32::new(output_target),
+      input_paused: AtomicBool::new(input_paused),
+      output_paused: AtomicBool::new(output_paused),
+    }
+  }
+
+  #[inline]
+  pub fn target(&self, flow: AudioFlow) -> &AtomicU32 {
+    match flow {
+      AudioFlow::Input => &self.input_target,
+      AudioFlow::Output => &self.output_target,
+    }
+  }
+
+  #[inline]
+  pub fn paused(&self, flow: AudioFlow) -> &AtomicBool {
+    match flow {
+      AudioFlow::Input => &self.input_paused,
+      AudioFlow::Output => &self.output_paused,
+    }
+  }
+
+  #[inline]
+  pub fn scalar(&self, flow: AudioFlow) -> f32 {
+    (self.target(flow).load(Ordering::SeqCst) as f32 / 100.0).clamp(0.0, 1.0)
+  }
+}
+
 pub struct AudioEnforcer {
   flow: AudioFlow,
-  target: Arc<AtomicU32>,
+  state: Arc<VolumeState>,
   enumerator: IMMDeviceEnumerator,
   notification_client: Option<IMMNotificationClient>,
   bindings: [Option<AudioBinding>; ROLE_SLOTS],
@@ -84,7 +129,7 @@ impl Drop for AudioEnforcer {
 impl AudioEnforcer {
   pub fn new(
     flow: AudioFlow,
-    target: Arc<AtomicU32>,
+    state: Arc<VolumeState>,
     event_tx: Sender<EnforcerEvent>,
     main_thread_id: u32,
   ) -> Result<Self> {
@@ -94,7 +139,7 @@ impl AudioEnforcer {
     let context_guid = GUID::new()?;
     Ok(Self {
       flow,
-      target,
+      state,
       enumerator,
       notification_client: None,
       bindings: Default::default(),
@@ -162,10 +207,6 @@ impl AudioEnforcer {
     }
   }
 
-  fn target_to_scalar(target: &AtomicU32) -> f32 {
-    (target.load(Ordering::SeqCst) as f32 / 100.0).clamp(0.0, 1.0)
-  }
-
   pub fn bind_role(&mut self, role: ERole) -> Result<()> {
     let slot = role_slot(role);
     // Drop the existing binding for this slot, if any (triggers Drop,
@@ -183,7 +224,8 @@ impl AudioEnforcer {
 
       let callback = VolumeNotificationCallback::new(
         endpoint_volume_obj.clone(),
-        self.target.clone(),
+        self.state.clone(),
+        self.flow,
         self.context_guid,
       );
       let callback_interface: IAudioEndpointVolumeCallback = callback.into();
@@ -200,12 +242,18 @@ impl AudioEnforcer {
   }
 
   pub fn force_to_target(&self) {
-    let val = Self::target_to_scalar(&self.target);
+    let val = self.state.scalar(self.flow);
     for binding in self.bindings.iter().flatten() {
       unsafe {
-        let _ = binding
-          .endpoint
-          .SetMasterVolumeLevelScalar(val, &self.context_guid);
+        let needs_set = match binding.endpoint.GetMasterVolumeLevelScalar() {
+          Ok(current) => (current - val).abs() > VOLUME_EPSILON,
+          Err(_) => true,
+        };
+        if needs_set {
+          let _ = binding
+            .endpoint
+            .SetMasterVolumeLevelScalar(val, &self.context_guid);
+        }
       }
     }
   }
@@ -214,19 +262,22 @@ impl AudioEnforcer {
 #[implement(IAudioEndpointVolumeCallback)]
 struct VolumeNotificationCallback {
   endpoint: IAudioEndpointVolume,
-  target: Arc<AtomicU32>,
+  state: Arc<VolumeState>,
+  flow: AudioFlow,
   context_guid: GUID,
 }
 
 impl VolumeNotificationCallback {
   fn new(
     endpoint: IAudioEndpointVolume,
-    target: Arc<AtomicU32>,
+    state: Arc<VolumeState>,
+    flow: AudioFlow,
     context_guid: GUID,
   ) -> Self {
     Self {
       endpoint,
-      target,
+      state,
+      flow,
       context_guid,
     }
   }
@@ -246,9 +297,8 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
       return Ok(());
     }
 
-    let target_val = AudioEnforcer::target_to_scalar(&self.target);
-
-    if (data.fMasterVolume - target_val).abs() > 0.005 {
+    let target_val = self.state.scalar(self.flow);
+    if (data.fMasterVolume - target_val).abs() > VOLUME_EPSILON {
       unsafe {
         let _ = self
           .endpoint
@@ -309,14 +359,7 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
       let _ = self
         .event_tx
         .send(EnforcerEvent::RebindRole(self.flow, role));
-      unsafe {
-        let _ = PostThreadMessageW(
-          self.main_thread_id,
-          WM_WAKEUP,
-          WPARAM(0),
-          LPARAM(0),
-        );
-      }
+      wake_main_thread(self.main_thread_id);
     }
     Ok(())
   }

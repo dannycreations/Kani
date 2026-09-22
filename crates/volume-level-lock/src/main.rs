@@ -11,7 +11,7 @@ use std::{
   fs,
   process::Command,
   sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc::channel,
     Arc,
   },
@@ -23,13 +23,15 @@ use anyhow::Result;
 use clap::Parser;
 use config::Config;
 #[cfg(windows)]
-use enforcer::{AudioEnforcer, AudioFlow, EnforcerEvent};
+use enforcer::{AudioEnforcer, AudioFlow, EnforcerEvent, VolumeState};
 #[cfg(windows)]
 use instance::acquire_single_instance_guard;
 #[cfg(windows)]
 use registry::{deregister_autorun, is_autorun_registered, register_autorun};
 #[cfg(windows)]
 use tray::{TrayAction, TrayApp};
+#[cfg(windows)]
+use utils::wake_main_thread;
 #[cfg(windows)]
 use windows::{
   Win32::Foundation::{LPARAM, WPARAM},
@@ -105,20 +107,26 @@ fn run_windows(args: Args) -> Result<()> {
 fn proceed(args: Args) -> Result<()> {
   // Load config/settings
   let mut config = Config::load()?;
+  let mut dirty = false;
 
   if let Some(target) = args.level {
-    config.input_target = target.clamp(1, 100);
-    config.output_target = target.clamp(1, 100);
-    config.save()?;
+    let clamped = target.clamp(1, 100);
+    config.input_target = clamped;
+    config.output_target = clamped;
+    dirty = true;
   }
 
   if let Some(target) = args.input_level {
     config.input_target = target.clamp(1, 100);
-    config.save()?;
+    dirty = true;
   }
 
   if let Some(target) = args.output_level {
     config.output_target = target.clamp(1, 100);
+    dirty = true;
+  }
+
+  if dirty {
     config.save()?;
   }
 
@@ -149,13 +157,12 @@ fn apply_enforcer_state(enforcer: &mut AudioEnforcer, paused: bool) {
 }
 
 #[cfg(windows)]
-fn sync_tray_ui(
-  tray_app: &TrayApp,
-  input_target: u32,
-  input_paused: bool,
-  output_target: u32,
-  output_paused: bool,
-) {
+fn sync_tray_ui(tray_app: &TrayApp, state: &VolumeState) {
+  let input_target = state.input_target.load(Ordering::SeqCst);
+  let input_paused = state.input_paused.load(Ordering::SeqCst);
+  let output_target = state.output_target.load(Ordering::SeqCst);
+  let output_paused = state.output_paused.load(Ordering::SeqCst);
+
   tray_app.update_toggle_input_text(input_paused);
   tray_app.update_toggle_output_text(output_paused);
   let _ = tray_app.update_icon(input_paused, output_paused);
@@ -168,15 +175,34 @@ fn sync_tray_ui(
 }
 
 #[cfg(windows)]
+fn toggle_and_sync(
+  enforcer: &mut AudioEnforcer,
+  flow: AudioFlow,
+  state: &VolumeState,
+  tray_app: &TrayApp,
+) {
+  let paused_atomic = state.paused(flow);
+  let next_paused = !paused_atomic.load(Ordering::SeqCst);
+  paused_atomic.store(next_paused, Ordering::SeqCst);
+  apply_enforcer_state(enforcer, next_paused);
+
+  sync_tray_ui(tray_app, state);
+
+  let _ = Config::from_state(state).save();
+}
+
+#[cfg(windows)]
 fn run_enforcer(config: Config) -> Result<()> {
   unsafe {
     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
   }
 
-  let input_target = Arc::new(AtomicU32::new(config.input_target));
-  let output_target = Arc::new(AtomicU32::new(config.output_target));
-  let input_paused = Arc::new(AtomicBool::new(config.input_paused));
-  let output_paused = Arc::new(AtomicBool::new(config.output_paused));
+  let state = Arc::new(VolumeState::new(
+    config.input_target,
+    config.output_target,
+    config.input_paused,
+    config.output_paused,
+  ));
   let main_thread_id = unsafe { GetCurrentThreadId() };
 
   // Setup System Tray icon
@@ -213,78 +239,76 @@ fn run_enforcer(config: Config) -> Result<()> {
   // Enforcer Core states
   let mut input_enforcer = AudioEnforcer::new(
     AudioFlow::Input,
-    input_target.clone(),
+    state.clone(),
     event_tx.clone(),
     main_thread_id,
   )?;
   let mut output_enforcer = AudioEnforcer::new(
     AudioFlow::Output,
-    output_target.clone(),
+    state.clone(),
     event_tx.clone(),
     main_thread_id,
   )?;
 
-  if !config.input_paused {
-    input_enforcer.enable()?;
-    input_enforcer.force_to_target();
-  }
-
-  if !config.output_paused {
-    output_enforcer.enable()?;
-    output_enforcer.force_to_target();
-  }
+  apply_enforcer_state(&mut input_enforcer, config.input_paused);
+  apply_enforcer_state(&mut output_enforcer, config.output_paused);
 
   // Spawn config file monitor to update target volume dynamically if config changes
-  let input_target_clone = input_target.clone();
-  let output_target_clone = output_target.clone();
-  let input_paused_clone = input_paused.clone();
-  let output_paused_clone = output_paused.clone();
+  let watcher_state = state.clone();
   let event_tx_clone = event_tx.clone();
   thread::spawn(move || {
     let mut last_modified = None;
-    let mut last_input_target = input_target_clone.load(Ordering::SeqCst);
-    let mut last_output_target = output_target_clone.load(Ordering::SeqCst);
-    let mut last_input_paused = input_paused_clone.load(Ordering::SeqCst);
-    let mut last_output_paused = output_paused_clone.load(Ordering::SeqCst);
     let config_path = Config::get_path().ok();
 
     loop {
       thread::sleep(Duration::from_millis(1500));
-      if let Some(ref path) = config_path {
-        let current_modified =
-          fs::metadata(path).and_then(|m| m.modified()).ok();
 
-        if current_modified.is_none() || current_modified != last_modified {
-          last_modified = current_modified;
-          if let Ok(cfg) = Config::load() {
-            if cfg.input_target != last_input_target
-              || cfg.output_target != last_output_target
-              || cfg.input_paused != last_input_paused
-              || cfg.output_paused != last_output_paused
-            {
-              last_input_target = cfg.input_target;
-              last_output_target = cfg.output_target;
-              last_input_paused = cfg.input_paused;
-              last_output_paused = cfg.output_paused;
+      let Some(ref path) = config_path else {
+        continue;
+      };
 
-              input_target_clone.store(cfg.input_target, Ordering::SeqCst);
-              output_target_clone.store(cfg.output_target, Ordering::SeqCst);
-              input_paused_clone.store(cfg.input_paused, Ordering::SeqCst);
-              output_paused_clone.store(cfg.output_paused, Ordering::SeqCst);
+      let current_modified = fs::metadata(path).and_then(|m| m.modified()).ok();
 
-              let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
-              unsafe {
-                let _ = PostThreadMessageW(
-                  main_thread_id,
-                  WM_WAKEUP,
-                  WPARAM(0),
-                  LPARAM(0),
-                );
-              }
-            }
-          }
-        }
+      // Nothing changed on disk, skip the reparse entirely.
+      if current_modified.is_some() && current_modified == last_modified {
+        continue;
       }
+      last_modified = current_modified;
+
+      let Ok(cfg) = Config::load() else {
+        continue;
+      };
+
+      // Compare directly against the live atomics rather than a thread-local shadow copy
+      // that can drift out of sync with tray-driven toggles.
+      let changed = cfg.input_target
+        != watcher_state.input_target.load(Ordering::SeqCst)
+        || cfg.output_target
+          != watcher_state.output_target.load(Ordering::SeqCst)
+        || cfg.input_paused
+          != watcher_state.input_paused.load(Ordering::SeqCst)
+        || cfg.output_paused
+          != watcher_state.output_paused.load(Ordering::SeqCst);
+
+      if !changed {
+        continue;
+      }
+
+      watcher_state
+        .input_target
+        .store(cfg.input_target, Ordering::SeqCst);
+      watcher_state
+        .output_target
+        .store(cfg.output_target, Ordering::SeqCst);
+      watcher_state
+        .input_paused
+        .store(cfg.input_paused, Ordering::SeqCst);
+      watcher_state
+        .output_paused
+        .store(cfg.output_paused, Ordering::SeqCst);
+
+      let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
+      wake_main_thread(main_thread_id);
     }
   });
 
@@ -295,33 +319,23 @@ fn run_enforcer(config: Config) -> Result<()> {
     while let Ok(event) = event_rx.try_recv() {
       match event {
         EnforcerEvent::RebindRole(flow, role) => {
-          let (enforcer, paused) = match flow {
-            AudioFlow::Input => {
-              (&mut input_enforcer, input_paused.load(Ordering::SeqCst))
-            }
-            AudioFlow::Output => {
-              (&mut output_enforcer, output_paused.load(Ordering::SeqCst))
-            }
+          let enforcer = match flow {
+            AudioFlow::Input => &mut input_enforcer,
+            AudioFlow::Output => &mut output_enforcer,
           };
-          if !paused {
+          if !state.paused(flow).load(Ordering::SeqCst) {
             let _ = enforcer.bind_role(role);
             enforcer.force_to_target();
           }
         }
         EnforcerEvent::VolumeFileChanged => {
-          let in_paused = input_paused.load(Ordering::SeqCst);
-          let out_paused = output_paused.load(Ordering::SeqCst);
+          let in_paused = state.input_paused.load(Ordering::SeqCst);
+          let out_paused = state.output_paused.load(Ordering::SeqCst);
 
           apply_enforcer_state(&mut input_enforcer, in_paused);
           apply_enforcer_state(&mut output_enforcer, out_paused);
 
-          sync_tray_ui(
-            &tray_app,
-            input_target.load(Ordering::SeqCst),
-            in_paused,
-            output_target.load(Ordering::SeqCst),
-            out_paused,
-          );
+          sync_tray_ui(&tray_app, &state);
         }
       }
     }
@@ -330,42 +344,20 @@ fn run_enforcer(config: Config) -> Result<()> {
     while let Some(action) = tray_app.handle_events() {
       match action {
         TrayAction::ToggleInput => {
-          let next_paused = !input_paused.load(Ordering::SeqCst);
-          input_paused.store(next_paused, Ordering::SeqCst);
-          apply_enforcer_state(&mut input_enforcer, next_paused);
-          sync_tray_ui(
+          toggle_and_sync(
+            &mut input_enforcer,
+            AudioFlow::Input,
+            &state,
             &tray_app,
-            input_target.load(Ordering::SeqCst),
-            next_paused,
-            output_target.load(Ordering::SeqCst),
-            output_paused.load(Ordering::SeqCst),
           );
-          let _ = Config::from_state(
-            &input_target,
-            &output_target,
-            &input_paused,
-            &output_paused,
-          )
-          .save();
         }
         TrayAction::ToggleOutput => {
-          let next_paused = !output_paused.load(Ordering::SeqCst);
-          output_paused.store(next_paused, Ordering::SeqCst);
-          apply_enforcer_state(&mut output_enforcer, next_paused);
-          sync_tray_ui(
+          toggle_and_sync(
+            &mut output_enforcer,
+            AudioFlow::Output,
+            &state,
             &tray_app,
-            input_target.load(Ordering::SeqCst),
-            input_paused.load(Ordering::SeqCst),
-            output_target.load(Ordering::SeqCst),
-            next_paused,
           );
-          let _ = Config::from_state(
-            &input_target,
-            &output_target,
-            &input_paused,
-            &output_paused,
-          )
-          .save();
         }
         TrayAction::PromptSetTarget => {
           if let Ok(path) = Config::get_path() {

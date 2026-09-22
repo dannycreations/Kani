@@ -1,16 +1,14 @@
 #![cfg(windows)]
 
+use std::cell::OnceCell;
+
 use anyhow::Result;
 use tray_icon::{
   menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
   Icon, TrayIcon, TrayIconBuilder,
 };
-use windows::Win32::{
-  Foundation::{LPARAM, WPARAM},
-  UI::WindowsAndMessaging::PostThreadMessageW,
-};
 
-use crate::{registry::is_autorun_registered, WM_WAKEUP};
+use crate::{registry::is_autorun_registered, utils::wake_main_thread};
 
 pub enum TrayAction {
   ToggleInput,
@@ -71,15 +69,22 @@ struct IconSet {
   gray: Icon,
 }
 
-fn icon_set() -> IconSet {
-  IconSet {
-    red: Icon::from_rgba(RED_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-      .expect("built-in icon RGBA buffer is always valid"),
-    orange: Icon::from_rgba(ORANGE_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-      .expect("built-in icon RGBA buffer is always valid"),
-    gray: Icon::from_rgba(GRAY_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-      .expect("built-in icon RGBA buffer is always valid"),
-  }
+thread_local! {
+  static ICONS: OnceCell<IconSet> = const { OnceCell::new() };
+}
+
+fn with_icon_set<R>(f: impl FnOnce(&IconSet) -> R) -> R {
+  ICONS.with(|cell| {
+    let icons = cell.get_or_init(|| IconSet {
+      red: Icon::from_rgba(RED_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+        .expect("built-in icon RGBA buffer is always valid"),
+      orange: Icon::from_rgba(ORANGE_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+        .expect("built-in icon RGBA buffer is always valid"),
+      gray: Icon::from_rgba(GRAY_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
+        .expect("built-in icon RGBA buffer is always valid"),
+    });
+    f(icons)
+  })
 }
 
 impl TrayApp {
@@ -184,12 +189,14 @@ impl TrayApp {
   }
 
   fn get_icon_for_state(input_paused: bool, output_paused: bool) -> Icon {
-    let icons = icon_set();
-    match (input_paused, output_paused) {
-      (true, true) => icons.gray.clone(),
-      (false, false) => icons.red.clone(),
-      _ => icons.orange.clone(),
-    }
+    with_icon_set(|icons| {
+      match (input_paused, output_paused) {
+        (true, true) => &icons.gray,
+        (false, false) => &icons.red,
+        _ => &icons.orange,
+      }
+      .clone()
+    })
   }
 
   pub fn update_tooltip(
@@ -236,14 +243,7 @@ impl TrayApp {
 
   pub fn handle_events(&self) -> Option<TrayAction> {
     if let Ok(event) = MenuEvent::receiver().try_recv() {
-      unsafe {
-        let _ = PostThreadMessageW(
-          self.main_thread_id,
-          WM_WAKEUP,
-          WPARAM(0),
-          LPARAM(0),
-        );
-      }
+      wake_main_thread(self.main_thread_id);
       if event.id == self.menu_item_toggle_input.id() {
         return Some(TrayAction::ToggleInput);
       } else if event.id == self.menu_item_toggle_output.id() {

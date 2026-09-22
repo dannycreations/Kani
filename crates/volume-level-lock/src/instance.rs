@@ -6,10 +6,8 @@ use anyhow::{anyhow, Result};
 use windows::{
   core::PCWSTR,
   Win32::{
-    Foundation::{CloseHandle, HANDLE},
-    System::Threading::{
-      CreateMutexW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_ACCESS_RIGHTS,
-    },
+    Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE},
+    System::Threading::{CreateMutexW, ReleaseMutex},
   },
 };
 
@@ -35,21 +33,15 @@ pub fn acquire_single_instance_guard() -> Result<Option<InstanceGuard>> {
   let mutex_name_utf16 = to_wide(&mutex_name);
 
   unsafe {
-    // Try opening first to see if it already exists
-    if let Ok(existing_handle) = OpenMutexW(
-      SYNCHRONIZATION_ACCESS_RIGHTS(0x00100000), // SYNCHRONIZE
-      false,
-      PCWSTR(mutex_name_utf16.as_ptr()),
-    ) {
-      let _ = CloseHandle(existing_handle);
-      // Instance already exists, return None to signal exit
-      return Ok(None);
-    }
-
-    let mutex_handle =
-      CreateMutexW(None, false, PCWSTR(mutex_name_utf16.as_ptr()));
-    match mutex_handle {
-      Ok(handle) => Ok(Some(InstanceGuard(handle))),
+    match CreateMutexW(None, false, PCWSTR(mutex_name_utf16.as_ptr())) {
+      Ok(handle) => {
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+          let _ = CloseHandle(handle);
+          Ok(None)
+        } else {
+          Ok(Some(InstanceGuard(handle)))
+        }
+      }
       Err(err) => {
         Err(anyhow!("Failed to create single-instance mutex: {:?}", err))
       }
