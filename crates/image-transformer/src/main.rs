@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 
+mod transformer;
+
 use anyhow::Result;
 use clap::Parser;
-use image_transformer::{run, Resolution, TransformerConfig};
+use transformer::{run, Resolution, Summary, TransformerConfig};
 
 #[derive(Parser, Debug)]
 #[command(
   author,
   version,
   about = "Batch image transformer and optimizer",
-  long_about = "A tool to downscale and optimize JPG/PNG images using Lanczos3 resampling and oxipng compression."
+  long_about = "A tool to downscale and optimize JPG/PNG images"
 )]
 struct Args {
   /// Input files or directories (supports drag and drop)
@@ -44,7 +46,27 @@ fn main() -> Result<()> {
     scale: args.scale,
   };
 
-  let _results = run(config);
+  let results = run(config);
+
+  if results.is_empty() {
+    println!("No matching images found.");
+    return Ok(());
+  }
+
+  let summary = Summary::from_results(&results);
+
+  println!(
+    "Processed {} file(s), {} failed. {} -> {} bytes ({:.2}% saved)",
+    summary.processed,
+    summary.failed,
+    summary.original_total,
+    summary.optimized_total,
+    summary.saved_ratio() * 100.0
+  );
+
+  if summary.failed > 0 {
+    std::process::exit(1);
+  }
 
   Ok(())
 }
