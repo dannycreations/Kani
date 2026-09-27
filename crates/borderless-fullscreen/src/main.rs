@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod console;
 mod overlay;
 mod registry;
 mod tray;
@@ -19,11 +20,7 @@ use windows::{
     Foundation::{
       GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
     },
-    System::{
-      Console::{AttachConsole, ATTACH_PARENT_PROCESS},
-      LibraryLoader::GetModuleHandleW,
-      Threading::CreateMutexW,
-    },
+    System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::WindowsAndMessaging::{
       CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
       MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
@@ -33,7 +30,10 @@ use windows::{
   },
 };
 
-use crate::app::{with_app, App, TIMER_POLL_ID};
+use crate::{
+  app::{with_app, App, TIMER_POLL_ID},
+  console::enable_terminal_logging,
+};
 
 const SINGLE_INSTANCE_MUTEX: PCWSTR = w!("BorderlessFullscreen_SingleInstance");
 const MAIN_WINDOW_CLASS: PCWSTR = w!("BorderlessFullscreen_MessageWindowClass");
@@ -66,9 +66,9 @@ unsafe extern "system" fn main_window_proc(
 }
 
 fn main() -> windows::core::Result<()> {
-  unsafe {
-    let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+  enable_terminal_logging();
 
+  unsafe {
     let _mutex = CreateMutexW(None, true, SINGLE_INSTANCE_MUTEX)?;
     if GetLastError() == ERROR_ALREADY_EXISTS {
       MessageBoxW(
@@ -133,11 +133,14 @@ fn main() -> windows::core::Result<()> {
     app::install(app);
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+    let menu_events = MenuEvent::receiver();
+    // `GetMessageW` returns -1 on failure, which `as_bool` would report as
+    // true. Compare against 0 so only real messages continue the loop.
+    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
       let _ = TranslateMessage(&msg);
       DispatchMessageW(&msg);
 
-      while let Ok(event) = MenuEvent::receiver().try_recv() {
+      while let Ok(event) = menu_events.try_recv() {
         with_app(|app| app.handle_menu_event(&event.id.0));
       }
     }

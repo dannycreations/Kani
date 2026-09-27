@@ -1,4 +1,7 @@
-use std::cell::Cell;
+use std::{
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
+};
 
 use windows::{
   core::{w, PCWSTR},
@@ -15,16 +18,16 @@ use windows::{
       Input::KeyboardAndMouse::VK_ESCAPE,
       WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor,
-        GetCursorPos, GetSystemMetrics, GetWindow, GetWindowRect, IsIconic,
-        IsWindowVisible, LoadCursorW, RegisterClassExW, SetCursor,
-        SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos,
-        ShowWindow, WindowFromPoint, GA_ROOT, GW_HWNDNEXT, HTTRANSPARENT,
-        IDC_CROSS, LWA_ALPHA, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE,
-        SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-        WM_DESTROY, WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
-        WM_SETCURSOR, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST, WS_POPUP,
+        GetCursorPos, GetDesktopWindow, GetShellWindow, GetSystemMetrics,
+        GetWindow, GetWindowRect, IsIconic, IsWindowVisible, LoadCursorW,
+        RegisterClassExW, SetCursor, SetForegroundWindow,
+        SetLayeredWindowAttributes, SetWindowPos, ShowWindow, WindowFromPoint,
+        GA_ROOT, GW_HWNDNEXT, HCURSOR, HTTRANSPARENT, IDC_CROSS, LWA_ALPHA,
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+        SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_DESTROY, WM_KEYDOWN,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WNDCLASSEXW,
+        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
       },
     },
   },
@@ -37,7 +40,9 @@ const OVERLAY_WINDOW_CLASS: PCWSTR =
 const HIGHLIGHT_WINDOW_CLASS: PCWSTR =
   w!("BorderlessFullscreen_HighlightWindowClass");
 
-#[derive(Clone, Copy, Default)]
+static CROSS_CURSOR_HANDLE: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy)]
 struct OverlayState {
   overlay: HWND,
   highlight: HWND,
@@ -45,17 +50,30 @@ struct OverlayState {
   hovered_rect: RECT,
   last_cursor: POINT,
   highlight_size: (i32, i32),
+  desktop: HWND,
+  shell: HWND,
+}
+
+impl Default for OverlayState {
+  fn default() -> Self {
+    Self {
+      overlay: HWND::default(),
+      highlight: HWND::default(),
+      hovered: HWND::default(),
+      hovered_rect: RECT::default(),
+      last_cursor: POINT {
+        x: i32::MIN,
+        y: i32::MIN,
+      },
+      highlight_size: (0, 0),
+      desktop: HWND::default(),
+      shell: HWND::default(),
+    }
+  }
 }
 
 thread_local! {
-  static STATE: Cell<OverlayState> = const { Cell::new(OverlayState {
-    overlay: HWND(std::ptr::null_mut()),
-    highlight: HWND(std::ptr::null_mut()),
-    hovered: HWND(std::ptr::null_mut()),
-    hovered_rect: RECT { left: 0, top: 0, right: 0, bottom: 0 },
-    last_cursor: POINT { x: i32::MIN, y: i32::MIN },
-    highlight_size: (0, 0),
-  }) };
+  static STATE: Cell<OverlayState> = Cell::new(OverlayState::default());
 }
 
 #[inline(always)]
@@ -65,23 +83,26 @@ fn point_in_rect(pt: POINT, r: RECT) -> bool {
 
 pub fn register_class(hinstance: HMODULE) {
   unsafe {
+    let cross = LoadCursorW(None, IDC_CROSS).unwrap_or_default();
+    CROSS_CURSOR_HANDLE.store(cross.0 as usize, Ordering::Relaxed);
+
     let wc = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
       lpfnWndProc: Some(overlay_window_proc),
       hInstance: hinstance.into(),
-      hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
+      hCursor: cross,
       hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
       lpszClassName: OVERLAY_WINDOW_CLASS,
       ..Default::default()
     };
     RegisterClassExW(&wc);
 
-    let highlight_brush = CreateSolidBrush(COLORREF((255 << 8) | 255));
+    let highlight_brush = CreateSolidBrush(COLORREF(0x0000_FFFF));
     let wc2 = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
       lpfnWndProc: Some(highlight_window_proc),
       hInstance: hinstance.into(),
-      hCursor: LoadCursorW(None, IDC_CROSS).unwrap_or_default(),
+      hCursor: cross,
       hbrBackground: highlight_brush,
       lpszClassName: HIGHLIGHT_WINDOW_CLASS,
       ..Default::default()
@@ -116,9 +137,14 @@ pub fn spawn() -> Option<HWND> {
     )
     .ok()?;
 
+    let desktop = GetDesktopWindow();
+    let shell = GetShellWindow();
+
     STATE.with(|c| {
       let mut s = c.get();
       s.overlay = hwnd;
+      s.desktop = desktop;
+      s.shell = shell;
       c.set(s);
     });
 
@@ -209,6 +235,10 @@ fn find_window_under_point(
   pt: POINT,
   overlay: HWND,
   highlight: HWND,
+  desktop: HWND,
+  shell: HWND,
+  cached_hovered: HWND,
+  cached_rect: RECT,
 ) -> Option<(HWND, RECT)> {
   unsafe {
     let hit = WindowFromPoint(pt);
@@ -222,13 +252,31 @@ fn find_window_under_point(
     }
 
     while root != HWND::default() {
+      // Only revalidate the previously hovered window once the walk actually
+      // reaches it, so the three Win32 calls below are skipped entirely when
+      // the cursor has moved onto a different window.
+      if root == cached_hovered
+        && point_in_rect(pt, cached_rect)
+        && is_valid_window(cached_hovered)
+        && IsWindowVisible(cached_hovered).as_bool()
+        && !IsIconic(cached_hovered).as_bool()
+      {
+        return Some((cached_hovered, cached_rect));
+      }
+
       if root != overlay
         && root != highlight
+        && root != desktop
+        && root != shell
         && IsWindowVisible(root).as_bool()
         && !IsIconic(root).as_bool()
       {
         let mut rect = RECT::default();
-        if GetWindowRect(root, &mut rect).is_ok() && point_in_rect(pt, rect) {
+        if GetWindowRect(root, &mut rect).is_ok()
+          && (rect.right - rect.left) >= 32
+          && (rect.bottom - rect.top) >= 32
+          && point_in_rect(pt, rect)
+        {
           return Some((root, rect));
         }
       }
@@ -250,8 +298,8 @@ unsafe extern "system" fn overlay_window_proc(
 ) -> LRESULT {
   match msg {
     WM_SETCURSOR => {
-      let cross_cursor = LoadCursorW(None, IDC_CROSS).unwrap_or_default();
-      SetCursor(Some(cross_cursor));
+      let raw = CROSS_CURSOR_HANDLE.load(Ordering::Relaxed);
+      SetCursor(Some(HCURSOR(raw as *mut _)));
       LRESULT(1)
     }
     WM_KEYDOWN => {
@@ -270,14 +318,20 @@ unsafe extern "system" fn overlay_window_proc(
       }
       s.last_cursor = pt;
 
-      let target = find_window_under_point(pt, s.overlay, s.highlight);
+      let target = find_window_under_point(
+        pt,
+        s.overlay,
+        s.highlight,
+        s.desktop,
+        s.shell,
+        s.hovered,
+        s.hovered_rect,
+      );
+
       match target {
         Some((root, rect)) => {
           if root == s.hovered
-            && rect.left == s.hovered_rect.left
-            && rect.top == s.hovered_rect.top
-            && rect.right == s.hovered_rect.right
-            && rect.bottom == s.hovered_rect.bottom
+            && rect == s.hovered_rect
             && is_valid_window(s.highlight)
           {
             STATE.with(|c| c.set(s));
@@ -318,7 +372,16 @@ unsafe extern "system" fn overlay_window_proc(
       } else {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
-        find_window_under_point(pt, s.overlay, s.highlight).map(|(w, _)| w)
+        find_window_under_point(
+          pt,
+          s.overlay,
+          s.highlight,
+          s.desktop,
+          s.shell,
+          HWND::default(),
+          RECT::default(),
+        )
+        .map(|(w, _)| w)
       };
 
       if is_valid_window(s.highlight) {
@@ -332,7 +395,7 @@ unsafe extern "system" fn overlay_window_proc(
       }
 
       if let Some(target) = target_window {
-        with_app(|app| app.toggle_window_by_handle(target));
+        with_app(|app| app.toggle_window(target));
       }
       LRESULT(0)
     }

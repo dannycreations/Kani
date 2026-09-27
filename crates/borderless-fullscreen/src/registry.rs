@@ -52,24 +52,23 @@ pub fn set_autostart_enabled(enable: bool, exe_path: &Path) {
     }
 
     if enable {
-      let exe_os = exe_path.as_os_str();
-      let mut val_wide = Vec::with_capacity(exe_os.len() + 3);
-      val_wide.push(b'"' as u16);
-      val_wide.extend(exe_os.encode_wide());
-      val_wide.push(b'"' as u16);
-      val_wide.push(0);
+      // Run entries are written as a quoted path, because an install
+      // directory may contain spaces.
+      let mut command: Vec<u16> =
+        Vec::with_capacity(exe_path.as_os_str().len() + 3);
+      command.push(b'"' as u16);
+      command.extend(exe_path.as_os_str().encode_wide());
+      command.push(b'"' as u16);
+      command.push(0);
 
-      let byte_len = val_wide.len() * std::mem::size_of::<u16>();
-      let _ = RegSetValueExW(
-        hkey,
-        REGISTRY_RUN_VALUE,
-        Some(0),
-        REG_SZ,
-        Some(std::slice::from_raw_parts(
-          val_wide.as_ptr().cast::<u8>(),
-          byte_len,
-        )),
-      );
+      let byte_len = std::mem::size_of_val(&command[..]);
+      // SAFETY: `REG_SZ` is documented to take a NUL-terminated UTF-16
+      // string, so the same bytes are read back as a `&[u8]`. `command` is
+      // built above, stays alive for the call, and is NUL-terminated.
+      let bytes =
+        std::slice::from_raw_parts(command.as_ptr().cast::<u8>(), byte_len);
+      let _ =
+        RegSetValueExW(hkey, REGISTRY_RUN_VALUE, Some(0), REG_SZ, Some(bytes));
     } else {
       let _ = RegDeleteValueW(hkey, REGISTRY_RUN_VALUE);
     }
