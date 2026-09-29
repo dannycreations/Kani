@@ -33,24 +33,27 @@ pub enum AudioFlow {
   Output,
 }
 
+impl AudioFlow {
+  fn data_flow(self) -> EDataFlow {
+    match self {
+      Self::Input => eCapture,
+      Self::Output => eRender,
+    }
+  }
+}
+
 pub enum EnforcerEvent {
   RebindRole(AudioFlow, ERole),
   VolumeFileChanged,
 }
 
-const ROLE_SLOTS: usize = 3;
+const ROLES: [ERole; 3] = [eConsole, eMultimedia, eCommunications];
 const VOLUME_EPSILON: f32 = 0.005;
 
 fn role_slot(role: ERole) -> usize {
-  match role.0 {
-    v if v == eConsole.0 => 0,
-    v if v == eMultimedia.0 => 1,
-    v if v == eCommunications.0 => 2,
-    _ => 0,
-  }
+  ROLES.iter().position(|&known| known == role).unwrap_or(0)
 }
 
-#[derive(Default)]
 pub struct VolumeState {
   pub input_target: AtomicU32,
   pub output_target: AtomicU32,
@@ -95,12 +98,29 @@ impl VolumeState {
   }
 }
 
+fn is_drifted(current: f32, target: f32) -> bool {
+  (current - target).abs() > VOLUME_EPSILON
+}
+
+fn set_volume(
+  endpoint: &IAudioEndpointVolume,
+  level: f32,
+  context_guid: &GUID,
+) {
+  // SAFETY: `endpoint` is a live interface owned by the caller, and
+  // `context_guid` only tags the change so our own notification callback
+  // can recognise and ignore it. Both stay alive across the call.
+  unsafe {
+    let _ = endpoint.SetMasterVolumeLevelScalar(level, context_guid);
+  }
+}
+
 pub struct AudioEnforcer {
   flow: AudioFlow,
   state: Arc<VolumeState>,
   enumerator: IMMDeviceEnumerator,
   notification_client: Option<IMMNotificationClient>,
-  bindings: [Option<AudioBinding>; ROLE_SLOTS],
+  bindings: [Option<AudioBinding>; ROLES.len()],
   enabled: bool,
   context_guid: GUID,
   event_tx: Sender<EnforcerEvent>,
@@ -114,6 +134,10 @@ struct AudioBinding {
 
 impl Drop for AudioBinding {
   fn drop(&mut self) {
+    // SAFETY: `self.endpoint` is the live interface this binding holds,
+    // and `self.callback` is the interface it was registered with, so
+    // this only unregisters that pair. Both are alive here and the
+    // endpoint refuses the call once it is shutting down.
     unsafe {
       let _ = self.endpoint.UnregisterControlChangeNotify(&self.callback);
     }
@@ -122,7 +146,7 @@ impl Drop for AudioBinding {
 
 impl Drop for AudioEnforcer {
   fn drop(&mut self) {
-    let _ = self.disable();
+    self.disable();
   }
 }
 
@@ -133,6 +157,8 @@ impl AudioEnforcer {
     event_tx: Sender<EnforcerEvent>,
     main_thread_id: u32,
   ) -> Result<Self> {
+    // SAFETY: `MMDeviceEnumerator` is a registered in-process COM class
+    // and needs no outer IUnknown, so `None` is correct here.
     let enumerator: IMMDeviceEnumerator = unsafe {
       CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_INPROC_SERVER)?
     };
@@ -150,18 +176,26 @@ impl AudioEnforcer {
     })
   }
 
+  pub fn flow(&self) -> AudioFlow {
+    self.flow
+  }
+
   pub fn enable(&mut self) -> Result<()> {
     if self.enabled {
       return Ok(());
     }
 
     // Setup device notification client to detect default device changes
-    let client = DeviceNotificationClient::new(
-      self.flow,
-      self.event_tx.clone(),
-      self.main_thread_id,
-    );
-    let client_interface: IMMNotificationClient = client.into();
+    let client_interface: IMMNotificationClient = DeviceNotificationClient {
+      flow: self.flow,
+      event_tx: self.event_tx.clone(),
+      main_thread_id: self.main_thread_id,
+    }
+    .into();
+    // SAFETY: `client_interface` is a live COM interface, and
+    // `self.enumerator` is the enumerator that owns the registration
+    // list. The field keeps the client alive until `disable` unregisters
+    // it, which is what keeps the callback from outliving this struct.
     unsafe {
       self
         .enumerator
@@ -170,21 +204,24 @@ impl AudioEnforcer {
     self.notification_client = Some(client_interface);
 
     // Bind existing active endpoints
-    for role in &[eConsole, eMultimedia, eCommunications] {
-      let _ = self.bind_role(*role);
+    for &role in &ROLES {
+      let _ = self.bind_role(role);
     }
 
     self.enabled = true;
     Ok(())
   }
 
-  pub fn disable(&mut self) -> Result<()> {
+  pub fn disable(&mut self) {
     if !self.enabled {
-      return Ok(());
+      return;
     }
 
     // Unregister notifications
     if let Some(ref client) = self.notification_client {
+      // SAFETY: `client` is the exact interface registered in `enable`
+      // and `self.enumerator` is the same enumerator, so this only
+      // reverses that registration.
       unsafe {
         let _ = self
           .enumerator
@@ -197,14 +234,6 @@ impl AudioEnforcer {
     self.bindings = Default::default();
 
     self.enabled = false;
-    Ok(())
-  }
-
-  fn flow_to_win_flow(flow: AudioFlow) -> EDataFlow {
-    match flow {
-      AudioFlow::Input => eCapture,
-      AudioFlow::Output => eRender,
-    }
   }
 
   pub fn bind_role(&mut self, role: ERole) -> Result<()> {
@@ -213,47 +242,46 @@ impl AudioEnforcer {
     // which unregisters its notify callback).
     self.bindings[slot] = None;
 
+    // SAFETY: the enumerator and the returned default device are live
+    // COM interfaces, and the device only hands out an activated volume
+    // interface that this function immediately registers and keeps
+    // alive through the stored binding.
     unsafe {
-      let win_flow = Self::flow_to_win_flow(self.flow);
-      let default_device =
-        self.enumerator.GetDefaultAudioEndpoint(win_flow, role)?;
-
-      // Let's activate using standard COM interface retrieval
-      let endpoint_volume_obj: IAudioEndpointVolume =
+      let default_device = self
+        .enumerator
+        .GetDefaultAudioEndpoint(self.flow.data_flow(), role)?;
+      let endpoint: IAudioEndpointVolume =
         default_device.Activate(CLSCTX_INPROC_SERVER, None)?;
 
-      let callback = VolumeNotificationCallback::new(
-        endpoint_volume_obj.clone(),
-        self.state.clone(),
-        self.flow,
-        self.context_guid,
-      );
-      let callback_interface: IAudioEndpointVolumeCallback = callback.into();
+      let callback: IAudioEndpointVolumeCallback = VolumeNotificationCallback {
+        endpoint: endpoint.clone(),
+        state: self.state.clone(),
+        flow: self.flow,
+        context_guid: self.context_guid,
+      }
+      .into();
+      endpoint.RegisterControlChangeNotify(&callback)?;
 
-      endpoint_volume_obj.RegisterControlChangeNotify(&callback_interface)?;
-
-      self.bindings[slot] = Some(AudioBinding {
-        endpoint: endpoint_volume_obj,
-        callback: callback_interface,
-      });
+      self.bindings[slot] = Some(AudioBinding { endpoint, callback });
     }
 
     Ok(())
   }
 
   pub fn force_to_target(&self) {
-    let val = self.state.scalar(self.flow);
+    let target = self.state.scalar(self.flow);
     for binding in self.bindings.iter().flatten() {
-      unsafe {
-        let needs_set = match binding.endpoint.GetMasterVolumeLevelScalar() {
-          Ok(current) => (current - val).abs() > VOLUME_EPSILON,
+      // SAFETY: `binding.endpoint` is a live interface owned by the
+      // binding and this getter only reads from it.
+      let needs_set =
+        match unsafe { binding.endpoint.GetMasterVolumeLevelScalar() } {
+          Ok(current) => is_drifted(current, target),
+          // A level that cannot be read counts as drift, so the write
+          // below re-establishes the target.
           Err(_) => true,
         };
-        if needs_set {
-          let _ = binding
-            .endpoint
-            .SetMasterVolumeLevelScalar(val, &self.context_guid);
-        }
+      if needs_set {
+        set_volume(&binding.endpoint, target, &self.context_guid);
       }
     }
   }
@@ -267,22 +295,6 @@ struct VolumeNotificationCallback {
   context_guid: GUID,
 }
 
-impl VolumeNotificationCallback {
-  fn new(
-    endpoint: IAudioEndpointVolume,
-    state: Arc<VolumeState>,
-    flow: AudioFlow,
-    context_guid: GUID,
-  ) -> Self {
-    Self {
-      endpoint,
-      state,
-      flow,
-      context_guid,
-    }
-  }
-}
-
 impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
   fn OnNotify(
     &self,
@@ -291,19 +303,18 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
     if notification_data_ptr.is_null() {
       return Ok(());
     }
+    // SAFETY: the null check above rules out a null pointer, and the
+    // COM contract documents this callback's parameter as a pointer to a
+    // live `AUDIO_VOLUME_NOTIFICATION_DATA` valid for the call.
     let data = unsafe { &*notification_data_ptr };
     // Ignore changes triggered by ourselves
     if data.guidEventContext == self.context_guid {
       return Ok(());
     }
 
-    let target_val = self.state.scalar(self.flow);
-    if (data.fMasterVolume - target_val).abs() > VOLUME_EPSILON {
-      unsafe {
-        let _ = self
-          .endpoint
-          .SetMasterVolumeLevelScalar(target_val, &self.context_guid);
-      }
+    let target = self.state.scalar(self.flow);
+    if is_drifted(data.fMasterVolume, target) {
+      set_volume(&self.endpoint, target, &self.context_guid);
     }
 
     Ok(())
@@ -315,20 +326,6 @@ struct DeviceNotificationClient {
   flow: AudioFlow,
   event_tx: Sender<EnforcerEvent>,
   main_thread_id: u32,
-}
-
-impl DeviceNotificationClient {
-  fn new(
-    flow: AudioFlow,
-    event_tx: Sender<EnforcerEvent>,
-    main_thread_id: u32,
-  ) -> Self {
-    Self {
-      flow,
-      event_tx,
-      main_thread_id,
-    }
-  }
 }
 
 impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
@@ -354,8 +351,7 @@ impl IMMNotificationClient_Impl for DeviceNotificationClient_Impl {
     role: ERole,
     _default_device_id_ptr: &PCWSTR,
   ) -> WinResult<()> {
-    let target_flow = AudioEnforcer::flow_to_win_flow(self.flow);
-    if flow == target_flow {
+    if flow == self.flow.data_flow() {
       let _ = self
         .event_tx
         .send(EnforcerEvent::RebindRole(self.flow, role));

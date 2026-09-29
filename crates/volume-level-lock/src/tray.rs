@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::cell::OnceCell;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use tray_icon::{
@@ -8,7 +8,10 @@ use tray_icon::{
   Icon, TrayIcon, TrayIconBuilder,
 };
 
-use crate::{registry::is_autorun_registered, utils::wake_main_thread};
+use crate::{
+  enforcer::VolumeState, registry::is_autorun_registered,
+  utils::wake_main_thread,
+};
 
 pub enum TrayAction {
   ToggleInput,
@@ -38,6 +41,8 @@ const fn generate_circle_icon(r: u8, g: u8, b: u8) -> [u8; BUFFER_LEN] {
   while y < HEIGHT {
     let mut x = 0;
     while x < WIDTH {
+      // Pixels outside the circle stay at the zero-initialized
+      // transparent value, so only the disc needs writing.
       let idx = ((y * WIDTH + x) * 4) as usize;
       let dx = x as i32 - 8;
       let dy = y as i32 - 8;
@@ -46,11 +51,6 @@ const fn generate_circle_icon(r: u8, g: u8, b: u8) -> [u8; BUFFER_LEN] {
         rgba[idx + 1] = g;
         rgba[idx + 2] = b;
         rgba[idx + 3] = 255;
-      } else {
-        rgba[idx] = 0;
-        rgba[idx + 1] = 0;
-        rgba[idx + 2] = 0;
-        rgba[idx + 3] = 0;
       }
       x += 1;
     }
@@ -63,56 +63,70 @@ const RED_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(220, 20, 60);
 const ORANGE_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(255, 165, 0);
 const GRAY_ICON_RGBA: [u8; BUFFER_LEN] = generate_circle_icon(128, 128, 128);
 
-struct IconSet {
-  red: Icon,
-  orange: Icon,
-  gray: Icon,
+fn status_str(is_paused: bool) -> &'static str {
+  if is_paused {
+    "Paused"
+  } else {
+    "Active"
+  }
 }
 
-thread_local! {
-  static ICONS: OnceCell<IconSet> = const { OnceCell::new() };
+fn toggle_text(is_paused: bool, flow_name: &str) -> String {
+  if is_paused {
+    format!("Resume {} enforcement", flow_name)
+  } else {
+    format!("Pause {} enforcement", flow_name)
+  }
 }
 
-fn with_icon_set<R>(f: impl FnOnce(&IconSet) -> R) -> R {
-  ICONS.with(|cell| {
-    let icons = cell.get_or_init(|| IconSet {
-      red: Icon::from_rgba(RED_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-        .expect("built-in icon RGBA buffer is always valid"),
-      orange: Icon::from_rgba(ORANGE_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-        .expect("built-in icon RGBA buffer is always valid"),
-      gray: Icon::from_rgba(GRAY_ICON_RGBA.to_vec(), WIDTH, HEIGHT)
-        .expect("built-in icon RGBA buffer is always valid"),
-    });
-    f(icons)
-  })
+fn autorun_text_label() -> &'static str {
+  if is_autorun_registered() {
+    "Remove autorun"
+  } else {
+    "Install autorun"
+  }
+}
+
+fn format_tooltip(state: &VolumeState) -> String {
+  format!(
+    "Input: {}% ({})\nOutput: {}% ({})",
+    state.input_target.load(Ordering::SeqCst),
+    status_str(state.input_paused.load(Ordering::SeqCst)),
+    state.output_target.load(Ordering::SeqCst),
+    status_str(state.output_paused.load(Ordering::SeqCst)),
+  )
+}
+
+fn build_icon(input_paused: bool, output_paused: bool) -> Icon {
+  let rgba = match (input_paused, output_paused) {
+    (true, true) => GRAY_ICON_RGBA,
+    (false, false) => RED_ICON_RGBA,
+    _ => ORANGE_ICON_RGBA,
+  };
+  Icon::from_rgba(rgba.to_vec(), WIDTH, HEIGHT)
+    .expect("built-in icon RGBA buffer is always valid")
 }
 
 impl TrayApp {
-  pub fn new(
-    input_target: u32,
-    input_paused: bool,
-    output_target: u32,
-    output_paused: bool,
-    main_thread_id: u32,
-  ) -> Result<Self> {
-    let icon = Self::get_icon_for_state(input_paused, output_paused);
+  pub fn new(state: &VolumeState, main_thread_id: u32) -> Result<Self> {
+    let input_paused = state.input_paused.load(Ordering::SeqCst);
+    let output_paused = state.output_paused.load(Ordering::SeqCst);
 
     let tray_menu = Menu::new();
 
     // 1. Input enforcement item
     let menu_item_toggle_input =
-      MenuItem::new(Self::toggle_text(input_paused, "input"), true, None);
+      MenuItem::new(toggle_text(input_paused, "input"), true, None);
 
     // 2. Output enforcement item
     let menu_item_toggle_output =
-      MenuItem::new(Self::toggle_text(output_paused, "output"), true, None);
+      MenuItem::new(toggle_text(output_paused, "output"), true, None);
 
     // 3. Set target volume
     let menu_item_set_target = MenuItem::new("Edit settings", true, None);
 
     // 4. Install/Remove autorun item
-    let menu_item_autorun =
-      MenuItem::new(Self::autorun_text_label(), true, None);
+    let menu_item_autorun = MenuItem::new(autorun_text_label(), true, None);
 
     // 5. Exit item
     let menu_item_exit = MenuItem::new("Exit", true, None);
@@ -125,17 +139,10 @@ impl TrayApp {
     let _ = tray_menu.append(&PredefinedMenuItem::separator());
     let _ = tray_menu.append(&menu_item_exit);
 
-    let tooltip = Self::format_tooltip(
-      input_target,
-      input_paused,
-      output_target,
-      output_paused,
-    );
-
     let tray_icon = TrayIconBuilder::new()
       .with_menu(Box::new(tray_menu))
-      .with_tooltip(tooltip)
-      .with_icon(icon)
+      .with_tooltip(format_tooltip(state))
+      .with_icon(build_icon(input_paused, output_paused))
       .build()?;
 
     Ok(Self {
@@ -149,113 +156,45 @@ impl TrayApp {
     })
   }
 
-  fn status_str(is_paused: bool) -> &'static str {
-    if is_paused {
-      "Paused"
-    } else {
-      "Active"
-    }
-  }
+  pub fn refresh(&self, state: &VolumeState) {
+    let input_paused = state.input_paused.load(Ordering::SeqCst);
+    let output_paused = state.output_paused.load(Ordering::SeqCst);
 
-  fn toggle_text(is_paused: bool, flow_name: &str) -> String {
-    if is_paused {
-      format!("Resume {} enforcement", flow_name)
-    } else {
-      format!("Pause {} enforcement", flow_name)
-    }
-  }
-
-  fn autorun_text_label() -> &'static str {
-    if is_autorun_registered() {
-      "Remove autorun"
-    } else {
-      "Install autorun"
-    }
-  }
-
-  fn format_tooltip(
-    input_target: u32,
-    input_paused: bool,
-    output_target: u32,
-    output_paused: bool,
-  ) -> String {
-    format!(
-      "Input: {}% ({})\nOutput: {}% ({})",
-      input_target,
-      Self::status_str(input_paused),
-      output_target,
-      Self::status_str(output_paused)
-    )
-  }
-
-  fn get_icon_for_state(input_paused: bool, output_paused: bool) -> Icon {
-    with_icon_set(|icons| {
-      match (input_paused, output_paused) {
-        (true, true) => &icons.gray,
-        (false, false) => &icons.red,
-        _ => &icons.orange,
-      }
-      .clone()
-    })
-  }
-
-  pub fn update_tooltip(
-    &self,
-    input_target: u32,
-    input_paused: bool,
-    output_target: u32,
-    output_paused: bool,
-  ) {
-    let tooltip = Self::format_tooltip(
-      input_target,
-      input_paused,
-      output_target,
-      output_paused,
-    );
-    let _ = self.tray_icon.set_tooltip(Some(tooltip));
-  }
-
-  pub fn update_toggle_input_text(&self, is_paused: bool) {
     self
       .menu_item_toggle_input
-      .set_text(Self::toggle_text(is_paused, "input"));
-  }
-
-  pub fn update_toggle_output_text(&self, is_paused: bool) {
+      .set_text(toggle_text(input_paused, "input"));
     self
       .menu_item_toggle_output
-      .set_text(Self::toggle_text(is_paused, "output"));
-  }
-
-  pub fn update_icon(
-    &self,
-    input_paused: bool,
-    output_paused: bool,
-  ) -> Result<()> {
-    let icon = Self::get_icon_for_state(input_paused, output_paused);
-    self.tray_icon.set_icon(Some(icon))?;
-    Ok(())
+      .set_text(toggle_text(output_paused, "output"));
+    let _ = self
+      .tray_icon
+      .set_icon(Some(build_icon(input_paused, output_paused)));
+    let _ = self.tray_icon.set_tooltip(Some(format_tooltip(state)));
   }
 
   pub fn refresh_autorun_menu(&self) {
-    self.menu_item_autorun.set_text(Self::autorun_text_label());
+    self.menu_item_autorun.set_text(autorun_text_label());
   }
 
   pub fn handle_events(&self) -> Option<TrayAction> {
-    if let Ok(event) = MenuEvent::receiver().try_recv() {
-      wake_main_thread(self.main_thread_id);
-      if event.id == self.menu_item_toggle_input.id() {
-        return Some(TrayAction::ToggleInput);
-      } else if event.id == self.menu_item_toggle_output.id() {
-        return Some(TrayAction::ToggleOutput);
-      } else if event.id == self.menu_item_set_target.id() {
-        return Some(TrayAction::PromptSetTarget);
-      } else if event.id == self.menu_item_autorun.id() {
-        return Some(TrayAction::ToggleAutorun);
-      } else if event.id == self.menu_item_exit.id() {
-        return Some(TrayAction::Exit);
-      }
-    }
-    None
+    let id = MenuEvent::receiver().try_recv().ok()?.id;
+
+    let action = if id == self.menu_item_toggle_input.id() {
+      TrayAction::ToggleInput
+    } else if id == self.menu_item_toggle_output.id() {
+      TrayAction::ToggleOutput
+    } else if id == self.menu_item_set_target.id() {
+      TrayAction::PromptSetTarget
+    } else if id == self.menu_item_autorun.id() {
+      TrayAction::ToggleAutorun
+    } else if id == self.menu_item_exit.id() {
+      TrayAction::Exit
+    } else {
+      return None;
+    };
+
+    // Only a recognised action has a loop waiting on this thread.
+    wake_main_thread(self.main_thread_id);
+    Some(action)
   }
 }

@@ -7,12 +7,13 @@ mod registry;
 mod tray;
 mod utils;
 
+#[cfg(windows)]
 use std::{
   fs,
   process::Command,
   sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::channel,
+    atomic::Ordering,
+    mpsc::{channel, Sender},
     Arc,
   },
   thread,
@@ -20,7 +21,9 @@ use std::{
 };
 
 use anyhow::Result;
+#[cfg(windows)]
 use clap::Parser;
+#[cfg(windows)]
 use config::Config;
 #[cfg(windows)]
 use enforcer::{AudioEnforcer, AudioFlow, EnforcerEvent, VolumeState};
@@ -45,10 +48,16 @@ use windows::{
   },
 };
 
-pub const WM_WAKEUP: u32 = WM_USER + 1;
+#[cfg(windows)]
+const WM_WAKEUP: u32 = WM_USER + 1;
 
-/// Lock default input and output volumes at fixed target levels.
-#[derive(Parser, Debug)]
+#[cfg(windows)]
+const TRIMMER_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+#[cfg(windows)]
+#[derive(Parser)]
 #[command(
   name = "volume-level-lock",
   about = "Locks input and output volume levels"
@@ -73,15 +82,9 @@ struct Args {
   /// Uninstall application from autorun registry
   #[arg(long)]
   uninstall: bool,
-
-  /// Start in background hidden mode
-  #[arg(long)]
-  hidden: bool,
 }
 
 fn main() -> Result<()> {
-  let args = Args::parse();
-
   #[cfg(not(windows))]
   {
     println!("This application is only supported on Windows.");
@@ -89,23 +92,16 @@ fn main() -> Result<()> {
   }
 
   #[cfg(windows)]
-  run_windows(args)
+  run_windows(Args::parse())
 }
 
 #[cfg(windows)]
 fn run_windows(args: Args) -> Result<()> {
-  // 1. Single Instance Check via Named Mutex
-  let _guard = match acquire_single_instance_guard()? {
-    Some(guard) => guard,
-    None => return Ok(()), // Quietly exit if already running
+  // Quietly exit if another instance already holds the guard.
+  let Some(_guard) = acquire_single_instance_guard()? else {
+    return Ok(());
   };
 
-  proceed(args)
-}
-
-#[cfg(windows)]
-fn proceed(args: Args) -> Result<()> {
-  // Load config/settings
   let mut config = Config::load()?;
   let mut dirty = false;
 
@@ -131,25 +127,20 @@ fn proceed(args: Args) -> Result<()> {
   }
 
   if args.install {
-    register_autorun()?;
-    return Ok(());
+    return register_autorun();
   }
 
   if args.uninstall {
-    deregister_autorun()?;
-    return Ok(());
+    return deregister_autorun();
   }
 
-  // Run the main audio lock enforcer
-  run_enforcer(config)?;
-
-  Ok(())
+  run_enforcer(config)
 }
 
 #[cfg(windows)]
 fn apply_enforcer_state(enforcer: &mut AudioEnforcer, paused: bool) {
   if paused {
-    let _ = enforcer.disable();
+    enforcer.disable();
   } else {
     let _ = enforcer.enable();
     enforcer.force_to_target();
@@ -157,42 +148,24 @@ fn apply_enforcer_state(enforcer: &mut AudioEnforcer, paused: bool) {
 }
 
 #[cfg(windows)]
-fn sync_tray_ui(tray_app: &TrayApp, state: &VolumeState) {
-  let input_target = state.input_target.load(Ordering::SeqCst);
-  let input_paused = state.input_paused.load(Ordering::SeqCst);
-  let output_target = state.output_target.load(Ordering::SeqCst);
-  let output_paused = state.output_paused.load(Ordering::SeqCst);
-
-  tray_app.update_toggle_input_text(input_paused);
-  tray_app.update_toggle_output_text(output_paused);
-  let _ = tray_app.update_icon(input_paused, output_paused);
-  tray_app.update_tooltip(
-    input_target,
-    input_paused,
-    output_target,
-    output_paused,
-  );
-}
-
-#[cfg(windows)]
 fn toggle_and_sync(
   enforcer: &mut AudioEnforcer,
-  flow: AudioFlow,
   state: &VolumeState,
   tray_app: &TrayApp,
 ) {
-  let paused_atomic = state.paused(flow);
+  let paused_atomic = state.paused(enforcer.flow());
   let next_paused = !paused_atomic.load(Ordering::SeqCst);
   paused_atomic.store(next_paused, Ordering::SeqCst);
   apply_enforcer_state(enforcer, next_paused);
 
-  sync_tray_ui(tray_app, state);
-
+  tray_app.refresh(state);
   let _ = Config::from_state(state).save();
 }
 
 #[cfg(windows)]
 fn run_enforcer(config: Config) -> Result<()> {
+  // SAFETY: this runs before any other COM use on the main thread, and
+  // `CoUninitialize` runs on every exit path below.
   unsafe {
     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
   }
@@ -203,40 +176,34 @@ fn run_enforcer(config: Config) -> Result<()> {
     config.input_paused,
     config.output_paused,
   ));
+  // SAFETY: the calling thread is the one that owns the message queue
+  // and the tray, and the id stays valid for the life of the process.
   let main_thread_id = unsafe { GetCurrentThreadId() };
 
-  // Setup System Tray icon
-  let tray_app = TrayApp::new(
-    config.input_target,
-    config.input_paused,
-    config.output_target,
-    config.output_paused,
-    main_thread_id,
-  )?;
+  let tray_app = TrayApp::new(&state, main_thread_id)?;
 
-  // Setup CTRL-C handler to exit cleanly
-  let main_thread_id_clone = main_thread_id;
+  // Exit cleanly on CTRL-C by waking the message loop with WM_QUIT.
+  // SAFETY: the message queue belongs to this thread and is drained by
+  // the loop at the end of this function, so the id stays valid.
   ctrlc::set_handler(move || unsafe {
-    let _ =
-      PostThreadMessageW(main_thread_id_clone, WM_QUIT, WPARAM(0), LPARAM(0));
+    let _ = PostThreadMessageW(main_thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
   })?;
 
-  // Setup working set trimmer thread
-  let trimmer_running = Arc::new(AtomicBool::new(true));
-  let trimmer_running_clone = trimmer_running.clone();
-  thread::spawn(move || {
-    while trimmer_running_clone.load(Ordering::Relaxed) {
-      thread::sleep(Duration::from_secs(60));
-      unsafe {
-        let process = GetCurrentProcess();
-        let _ = EmptyWorkingSet(process);
-      }
+  // Detached: this thread ends with the process, so it needs no shutdown
+  // signal. The sleeping happens before the Win32 call, so the handle
+  // below never outlives the process either.
+  thread::spawn(|| loop {
+    thread::sleep(TRIMMER_INTERVAL);
+    // SAFETY: `GetCurrentProcess` returns a process-wide pseudo-handle
+    // that is always valid, and `EmptyWorkingSet` only trims pages, so
+    // it cannot fail in a way that matters here.
+    unsafe {
+      let _ = EmptyWorkingSet(GetCurrentProcess());
     }
   });
 
   let (event_tx, event_rx) = channel::<EnforcerEvent>();
 
-  // Enforcer Core states
   let mut input_enforcer = AudioEnforcer::new(
     AudioFlow::Input,
     state.clone(),
@@ -253,68 +220,10 @@ fn run_enforcer(config: Config) -> Result<()> {
   apply_enforcer_state(&mut input_enforcer, config.input_paused);
   apply_enforcer_state(&mut output_enforcer, config.output_paused);
 
-  // Spawn config file monitor to update target volume dynamically if config changes
-  let watcher_state = state.clone();
-  let event_tx_clone = event_tx.clone();
-  thread::spawn(move || {
-    let mut last_modified = None;
-    let config_path = Config::get_path().ok();
-
-    loop {
-      thread::sleep(Duration::from_millis(1500));
-
-      let Some(ref path) = config_path else {
-        continue;
-      };
-
-      let current_modified = fs::metadata(path).and_then(|m| m.modified()).ok();
-
-      // Nothing changed on disk, skip the reparse entirely.
-      if current_modified.is_some() && current_modified == last_modified {
-        continue;
-      }
-      last_modified = current_modified;
-
-      let Ok(cfg) = Config::load() else {
-        continue;
-      };
-
-      // Compare directly against the live atomics rather than a thread-local shadow copy
-      // that can drift out of sync with tray-driven toggles.
-      let changed = cfg.input_target
-        != watcher_state.input_target.load(Ordering::SeqCst)
-        || cfg.output_target
-          != watcher_state.output_target.load(Ordering::SeqCst)
-        || cfg.input_paused
-          != watcher_state.input_paused.load(Ordering::SeqCst)
-        || cfg.output_paused
-          != watcher_state.output_paused.load(Ordering::SeqCst);
-
-      if !changed {
-        continue;
-      }
-
-      watcher_state
-        .input_target
-        .store(cfg.input_target, Ordering::SeqCst);
-      watcher_state
-        .output_target
-        .store(cfg.output_target, Ordering::SeqCst);
-      watcher_state
-        .input_paused
-        .store(cfg.input_paused, Ordering::SeqCst);
-      watcher_state
-        .output_paused
-        .store(cfg.output_paused, Ordering::SeqCst);
-
-      let _ = event_tx_clone.send(EnforcerEvent::VolumeFileChanged);
-      wake_main_thread(main_thread_id);
-    }
-  });
+  spawn_config_watcher(state.clone(), event_tx, main_thread_id);
 
   let mut msg = MSG::default();
-  let mut exit_loop = false;
-  while !exit_loop {
+  'main: loop {
     // 1. Process all pending queue events (volume watcher updates, default device modifications)
     while let Ok(event) = event_rx.try_recv() {
       match event {
@@ -329,13 +238,15 @@ fn run_enforcer(config: Config) -> Result<()> {
           }
         }
         EnforcerEvent::VolumeFileChanged => {
-          let in_paused = state.input_paused.load(Ordering::SeqCst);
-          let out_paused = state.output_paused.load(Ordering::SeqCst);
-
-          apply_enforcer_state(&mut input_enforcer, in_paused);
-          apply_enforcer_state(&mut output_enforcer, out_paused);
-
-          sync_tray_ui(&tray_app, &state);
+          apply_enforcer_state(
+            &mut input_enforcer,
+            state.input_paused.load(Ordering::SeqCst),
+          );
+          apply_enforcer_state(
+            &mut output_enforcer,
+            state.output_paused.load(Ordering::SeqCst),
+          );
+          tray_app.refresh(&state);
         }
       }
     }
@@ -344,28 +255,17 @@ fn run_enforcer(config: Config) -> Result<()> {
     while let Some(action) = tray_app.handle_events() {
       match action {
         TrayAction::ToggleInput => {
-          toggle_and_sync(
-            &mut input_enforcer,
-            AudioFlow::Input,
-            &state,
-            &tray_app,
-          );
+          toggle_and_sync(&mut input_enforcer, &state, &tray_app);
         }
         TrayAction::ToggleOutput => {
-          toggle_and_sync(
-            &mut output_enforcer,
-            AudioFlow::Output,
-            &state,
-            &tray_app,
-          );
+          toggle_and_sync(&mut output_enforcer, &state, &tray_app);
         }
         TrayAction::PromptSetTarget => {
           if let Ok(path) = Config::get_path() {
-            if let Some(parent) = path.parent() {
-              let _ = fs::create_dir_all(parent);
-            }
+            // Seed a file for the editor only when none exists, so
+            // opening settings never overwrites what is already there.
             if !path.exists() {
-              let _ = fs::write(&path, "input_target=100\noutput_target=100\ninput_paused=false\noutput_paused=false\n");
+              let _ = Config::default().save_to_path(&path);
             }
             let _ = Command::new("notepad.exe").arg(&path).spawn();
           }
@@ -378,33 +278,76 @@ fn run_enforcer(config: Config) -> Result<()> {
           }
           tray_app.refresh_autorun_menu();
         }
-        TrayAction::Exit => {
-          exit_loop = true;
-        }
+        TrayAction::Exit => break 'main,
       }
-    }
-
-    if exit_loop {
-      break;
     }
 
     // 3. Block until a message is received
+    // SAFETY: `msg` is a live `MSG` buffer for the whole call, and
+    // `None` means the thread's own queue, which this thread drains.
+    let received = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+    // 0 means WM_QUIT was retrieved, which is not written into `msg`, and
+    // -1 means the call failed. Neither is a message to dispatch, and
+    // looping on either would spin instead of exit.
+    if received <= 0 {
+      break;
+    }
+
+    // SAFETY: `received > 0` means `msg` holds a message this thread's
+    // queue produced, so it is valid to dispatch.
     unsafe {
-      if GetMessageW(&mut msg, None, 0, 0).as_bool() {
-        if msg.message == WM_QUIT {
-          break;
-        }
-        let _ = DispatchMessageW(&msg);
-      }
+      let _ = DispatchMessageW(&msg);
     }
   }
 
-  trimmer_running.store(false, Ordering::Relaxed);
-  input_enforcer.disable()?;
-  output_enforcer.disable()?;
+  // Disabled explicitly rather than left to `Drop`, because
+  // unregistering the endpoint callbacks is a COM call and those drops
+  // would otherwise run after `CoUninitialize` below.
+  input_enforcer.disable();
+  output_enforcer.disable();
+  // SAFETY: balances the `CoInitializeEx` at the top of this function.
   unsafe {
     CoUninitialize();
   }
 
   Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_config_watcher(
+  state: Arc<VolumeState>,
+  event_tx: Sender<EnforcerEvent>,
+  main_thread_id: u32,
+) {
+  thread::spawn(move || {
+    let Ok(config_path) = Config::get_path() else {
+      return;
+    };
+    let mut last_modified = None;
+
+    loop {
+      thread::sleep(CONFIG_POLL_INTERVAL);
+
+      let current_modified =
+        fs::metadata(&config_path).and_then(|m| m.modified()).ok();
+
+      // Nothing changed on disk, skip the reparse entirely. A file that
+      // does not exist yet compares equal to a missing one, so the first
+      // write after startup is still picked up.
+      if current_modified == last_modified {
+        continue;
+      }
+      last_modified = current_modified;
+
+      let Ok(config) = Config::load_from_path(&config_path) else {
+        continue;
+      };
+      if !config.apply_to(&state) {
+        continue;
+      }
+
+      let _ = event_tx.send(EnforcerEvent::VolumeFileChanged);
+      wake_main_thread(main_thread_id);
+    }
+  });
 }
