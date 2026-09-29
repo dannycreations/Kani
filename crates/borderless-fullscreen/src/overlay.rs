@@ -1,13 +1,14 @@
 use std::{
   cell::Cell,
-  sync::atomic::{AtomicUsize, Ordering},
+  ffi::c_void,
+  sync::atomic::{AtomicPtr, Ordering},
 };
 
 use windows::{
   core::{w, PCWSTR},
   Win32::{
     Foundation::{
-      COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+      COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
     },
     Graphics::Gdi::{
       CombineRgn, CreateRectRgn, CreateSolidBrush, DeleteObject,
@@ -40,7 +41,8 @@ const OVERLAY_WINDOW_CLASS: PCWSTR =
 const HIGHLIGHT_WINDOW_CLASS: PCWSTR =
   w!("BorderlessFullscreen_HighlightWindowClass");
 
-static CROSS_CURSOR_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static CROSS_CURSOR_HANDLE: AtomicPtr<c_void> =
+  AtomicPtr::new(std::ptr::null_mut());
 
 #[derive(Clone, Copy)]
 struct OverlayState {
@@ -49,7 +51,7 @@ struct OverlayState {
   hovered: HWND,
   hovered_rect: RECT,
   last_cursor: POINT,
-  highlight_size: (i32, i32),
+  highlight_size: SIZE,
   desktop: HWND,
   shell: HWND,
 }
@@ -65,7 +67,7 @@ impl Default for OverlayState {
         x: i32::MIN,
         y: i32::MIN,
       },
-      highlight_size: (0, 0),
+      highlight_size: SIZE::default(),
       desktop: HWND::default(),
       shell: HWND::default(),
     }
@@ -76,7 +78,15 @@ thread_local! {
   static STATE: Cell<OverlayState> = Cell::new(OverlayState::default());
 }
 
-#[inline(always)]
+fn with_state<R>(f: impl FnOnce(&mut OverlayState) -> R) -> R {
+  STATE.with(|cell| {
+    let mut state = cell.get();
+    let result = f(&mut state);
+    cell.set(state);
+    result
+  })
+}
+
 fn point_in_rect(pt: POINT, r: RECT) -> bool {
   pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
 }
@@ -84,7 +94,7 @@ fn point_in_rect(pt: POINT, r: RECT) -> bool {
 pub fn register_class(hinstance: HMODULE) {
   unsafe {
     let cross = LoadCursorW(None, IDC_CROSS).unwrap_or_default();
-    CROSS_CURSOR_HANDLE.store(cross.0 as usize, Ordering::Relaxed);
+    CROSS_CURSOR_HANDLE.store(cross.0, Ordering::Relaxed);
 
     let wc = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -112,7 +122,7 @@ pub fn register_class(hinstance: HMODULE) {
 }
 
 pub fn spawn() -> Option<HWND> {
-  STATE.with(|c| c.set(OverlayState::default()));
+  with_state(|s| *s = OverlayState::default());
 
   unsafe {
     let hinstance = GetModuleHandleW(None).unwrap_or_default();
@@ -137,15 +147,10 @@ pub fn spawn() -> Option<HWND> {
     )
     .ok()?;
 
-    let desktop = GetDesktopWindow();
-    let shell = GetShellWindow();
-
-    STATE.with(|c| {
-      let mut s = c.get();
+    with_state(|s| {
       s.overlay = hwnd;
-      s.desktop = desktop;
-      s.shell = shell;
-      c.set(s);
+      s.desktop = GetDesktopWindow();
+      s.shell = GetShellWindow();
     });
 
     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
@@ -155,23 +160,18 @@ pub fn spawn() -> Option<HWND> {
   }
 }
 
-unsafe fn position_highlight(
-  hwnd: HWND,
-  rect: RECT,
-  last_size: &mut (i32, i32),
-) {
+unsafe fn position_highlight(hwnd: HWND, rect: RECT, last_size: SIZE) -> SIZE {
+  // A window narrower or shorter than one border leaves no hollow
+  // interior to outline, so there is nothing to draw.
+  const THICKNESS: i32 = 4;
   let width = rect.right - rect.left;
   let height = rect.bottom - rect.top;
-  if width <= 0 || height <= 0 {
-    return;
-  }
-
-  const THICKNESS: i32 = 4;
   if width <= THICKNESS * 2 || height <= THICKNESS * 2 {
-    return;
+    return last_size;
   }
 
-  if last_size.0 != width || last_size.1 != height {
+  let mut size = last_size;
+  if size.cx != width || size.cy != height {
     let outer = CreateRectRgn(0, 0, width, height);
     let inner = CreateRectRgn(
       THICKNESS,
@@ -184,7 +184,10 @@ unsafe fn position_highlight(
     let _ = DeleteObject(HGDIOBJ(outer.0));
     let _ = DeleteObject(HGDIOBJ(inner.0));
     let _ = SetWindowRgn(hwnd, Some(region), true);
-    *last_size = (width, height);
+    size = SIZE {
+      cx: width,
+      cy: height,
+    };
   }
 
   let _ = SetWindowPos(
@@ -196,12 +199,10 @@ unsafe fn position_highlight(
     height,
     SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
   );
+  size
 }
 
-unsafe fn create_highlight_window(
-  rect: RECT,
-  last_size: &mut (i32, i32),
-) -> Option<HWND> {
+unsafe fn create_highlight_window(rect: RECT) -> Option<HWND> {
   let width = rect.right - rect.left;
   let height = rect.bottom - rect.top;
   if width <= 0 || height <= 0 {
@@ -226,20 +227,17 @@ unsafe fn create_highlight_window(
   .ok()?;
 
   let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-  position_highlight(hwnd, rect, last_size);
-  let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
   Some(hwnd)
 }
 
 fn find_window_under_point(
   pt: POINT,
-  overlay: HWND,
-  highlight: HWND,
-  desktop: HWND,
-  shell: HWND,
-  cached_hovered: HWND,
-  cached_rect: RECT,
+  state: &OverlayState,
 ) -> Option<(HWND, RECT)> {
+  // Below this size a click is far more likely to be aimed at a toolbar
+  // control than at a window the user wants maximized.
+  const MIN_PICKABLE_SIZE: i32 = 32;
+
   unsafe {
     let hit = WindowFromPoint(pt);
     if hit == HWND::default() {
@@ -255,26 +253,26 @@ fn find_window_under_point(
       // Only revalidate the previously hovered window once the walk actually
       // reaches it, so the three Win32 calls below are skipped entirely when
       // the cursor has moved onto a different window.
-      if root == cached_hovered
-        && point_in_rect(pt, cached_rect)
-        && is_valid_window(cached_hovered)
-        && IsWindowVisible(cached_hovered).as_bool()
-        && !IsIconic(cached_hovered).as_bool()
+      if root == state.hovered
+        && point_in_rect(pt, state.hovered_rect)
+        && is_valid_window(state.hovered)
+        && IsWindowVisible(state.hovered).as_bool()
+        && !IsIconic(state.hovered).as_bool()
       {
-        return Some((cached_hovered, cached_rect));
+        return Some((state.hovered, state.hovered_rect));
       }
 
-      if root != overlay
-        && root != highlight
-        && root != desktop
-        && root != shell
+      if root != state.overlay
+        && root != state.highlight
+        && root != state.desktop
+        && root != state.shell
         && IsWindowVisible(root).as_bool()
         && !IsIconic(root).as_bool()
       {
         let mut rect = RECT::default();
         if GetWindowRect(root, &mut rect).is_ok()
-          && (rect.right - rect.left) >= 32
-          && (rect.bottom - rect.top) >= 32
+          && (rect.right - rect.left) >= MIN_PICKABLE_SIZE
+          && (rect.bottom - rect.top) >= MIN_PICKABLE_SIZE
           && point_in_rect(pt, rect)
         {
           return Some((root, rect));
@@ -298,8 +296,8 @@ unsafe extern "system" fn overlay_window_proc(
 ) -> LRESULT {
   match msg {
     WM_SETCURSOR => {
-      let raw = CROSS_CURSOR_HANDLE.load(Ordering::Relaxed);
-      SetCursor(Some(HCURSOR(raw as *mut _)));
+      let cursor = CROSS_CURSOR_HANDLE.load(Ordering::Relaxed);
+      SetCursor(Some(HCURSOR(cursor)));
       LRESULT(1)
     }
     WM_KEYDOWN => {
@@ -312,99 +310,83 @@ unsafe extern "system" fn overlay_window_proc(
       let mut pt = POINT::default();
       let _ = GetCursorPos(&mut pt);
 
-      let mut s = STATE.with(|c| c.get());
-      if s.last_cursor.x == pt.x && s.last_cursor.y == pt.y {
-        return LRESULT(0);
-      }
-      s.last_cursor = pt;
+      with_state(|s| {
+        if s.last_cursor.x == pt.x && s.last_cursor.y == pt.y {
+          return;
+        }
+        s.last_cursor = pt;
 
-      let target = find_window_under_point(
-        pt,
-        s.overlay,
-        s.highlight,
-        s.desktop,
-        s.shell,
-        s.hovered,
-        s.hovered_rect,
-      );
+        match find_window_under_point(pt, s) {
+          Some((root, rect)) => {
+            if root == s.hovered
+              && rect == s.hovered_rect
+              && is_valid_window(s.highlight)
+            {
+              return;
+            }
 
-      match target {
-        Some((root, rect)) => {
-          if root == s.hovered
-            && rect == s.hovered_rect
-            && is_valid_window(s.highlight)
-          {
-            STATE.with(|c| c.set(s));
-            return LRESULT(0);
+            let highlight = if is_valid_window(s.highlight) {
+              Some(s.highlight)
+            } else {
+              create_highlight_window(rect)
+            };
+            if let Some(hwnd) = highlight {
+              s.highlight_size =
+                position_highlight(hwnd, rect, s.highlight_size);
+              let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+              s.highlight = hwnd;
+              s.hovered = root;
+              s.hovered_rect = rect;
+            }
           }
-
-          let highlight_hwnd = if is_valid_window(s.highlight) {
-            position_highlight(s.highlight, rect, &mut s.highlight_size);
-            let _ = ShowWindow(s.highlight, SW_SHOWNOACTIVATE);
-            s.highlight
-          } else {
-            create_highlight_window(rect, &mut s.highlight_size)
-              .unwrap_or_default()
-          };
-
-          if is_valid_window(highlight_hwnd) {
-            s.highlight = highlight_hwnd;
-            s.hovered = root;
-            s.hovered_rect = rect;
+          None => {
+            if is_valid_window(s.highlight) {
+              let _ = ShowWindow(s.highlight, SW_HIDE);
+            }
+            s.hovered = HWND::default();
+            s.hovered_rect = RECT::default();
           }
         }
-        None => {
-          if is_valid_window(s.highlight) {
-            let _ = ShowWindow(s.highlight, SW_HIDE);
-          }
-          s.hovered = HWND::default();
-          s.hovered_rect = RECT::default();
-        }
-      }
-
-      STATE.with(|c| c.set(s));
+      });
       LRESULT(0)
     }
     WM_LBUTTONUP => {
-      let s = STATE.with(|c| c.get());
-      let target_window = if is_valid_window(s.hovered) {
-        Some(s.hovered)
-      } else {
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        find_window_under_point(
-          pt,
-          s.overlay,
-          s.highlight,
-          s.desktop,
-          s.shell,
-          HWND::default(),
-          RECT::default(),
-        )
-        .map(|(w, _)| w)
-      };
+      let target = with_state(|s| {
+        let target = if is_valid_window(s.hovered) {
+          Some(s.hovered)
+        } else {
+          let mut pt = POINT::default();
+          let _ = GetCursorPos(&mut pt);
+          // Re-probe from an empty cache: a stale `hovered` entry would
+          // let the walk return a window the user did not click.
+          let mut uncached = *s;
+          uncached.hovered = HWND::default();
+          uncached.hovered_rect = RECT::default();
+          find_window_under_point(pt, &uncached).map(|(w, _)| w)
+        };
 
-      if is_valid_window(s.highlight) {
-        let _ = DestroyWindow(s.highlight);
-      }
-      let overlay = s.overlay;
-      STATE.with(|c| c.set(OverlayState::default()));
+        if is_valid_window(s.highlight) {
+          let _ = DestroyWindow(s.highlight);
+        }
+        if is_valid_window(s.overlay) {
+          let _ = DestroyWindow(s.overlay);
+        }
+        *s = OverlayState::default();
+        target
+      });
 
-      if is_valid_window(overlay) {
-        let _ = DestroyWindow(overlay);
-      }
-
-      if let Some(target) = target_window {
+      if let Some(target) = target {
         with_app(|app| app.toggle_window(target));
       }
       LRESULT(0)
     }
     WM_DESTROY => {
-      let s = STATE.with(|c| c.get());
-      if is_valid_window(s.highlight) {
-        let _ = DestroyWindow(s.highlight);
-      }
-      STATE.with(|c| c.set(OverlayState::default()));
+      with_state(|s| {
+        if is_valid_window(s.highlight) {
+          let _ = DestroyWindow(s.highlight);
+        }
+        *s = OverlayState::default();
+      });
       LRESULT(0)
     }
     _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -420,14 +402,12 @@ unsafe extern "system" fn highlight_window_proc(
   match msg {
     WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
     WM_DESTROY => {
-      STATE.with(|c| {
-        let mut s = c.get();
+      with_state(|s| {
         if s.highlight == hwnd {
           s.highlight = HWND::default();
           s.hovered = HWND::default();
           s.hovered_rect = RECT::default();
-          s.highlight_size = (0, 0);
-          c.set(s);
+          s.highlight_size = SIZE::default();
         }
       });
       LRESULT(0)

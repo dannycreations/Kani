@@ -1,7 +1,4 @@
-use std::{
-  cell::RefCell,
-  fmt::{Arguments, Write as _},
-};
+use std::{cell::RefCell, fmt::Arguments};
 
 use windows::Win32::{
   Foundation::HANDLE,
@@ -15,66 +12,52 @@ use windows::Win32::{
   },
 };
 
-struct Logger {
-  console: Option<HANDLE>,
-  line: String,
-  wide: Vec<u16>,
-}
-
 thread_local! {
-  static LOGGER: RefCell<Logger> = const {
-    RefCell::new(Logger {
-      console: None,
-      line: String::new(),
-      wide: Vec::new(),
-    })
-  };
+  static CONSOLE_HANDLE: RefCell<Option<HANDLE>> = const { RefCell::new(None) };
 }
 
 pub fn enable_terminal_logging() {
-  if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
-    return;
-  }
-
-  let Ok(handle) = (unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }) else {
-    return;
+  // SAFETY: both calls take only constants and return owned values. No
+  // pointer owned by this process is dereferenced.
+  let handle = unsafe {
+    if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+      return;
+    }
+    let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) else {
+      return;
+    };
+    handle
   };
+
   // The standard output handle cannot change while the process runs, so it
   // is validated once here rather than on every log line.
   if !handle.is_invalid() && !handle.0.is_null() {
-    LOGGER.with(|log| log.borrow_mut().console = Some(handle));
+    CONSOLE_HANDLE.with(|cell| *cell.borrow_mut() = Some(handle));
   }
 }
 
 pub fn console_log(args: Arguments<'_>) {
-  LOGGER.with(|cell| {
-    let b = &mut *cell.borrow_mut();
-    let Some(handle) = b.console else {
+  CONSOLE_HANDLE.with(|cell| {
+    // Nothing is attached, so there is nowhere to write. Returning here
+    // keeps the timestamp and the UTF-16 buffer off every log call.
+    let Some(handle) = *cell.borrow() else {
       return;
     };
 
+    // SAFETY: `GetLocalTime` fills a value it owns and takes no pointers.
     let tm = unsafe { GetLocalTime() };
-
-    b.line.clear();
-    let _ = write!(
-      b.line,
+    let line = format!(
       "[{:02}:{:02}:{:02}] {}\r\n",
       tm.wHour, tm.wMinute, tm.wSecond, args
     );
+    let wide: Vec<u16> = line.encode_utf16().collect();
 
-    b.wide.clear();
-    b.wide.reserve(b.line.len());
-    if b.line.is_ascii() {
-      for &byte in b.line.as_bytes() {
-        b.wide.push(byte as u16);
-      }
-    } else {
-      b.wide.extend(b.line.encode_utf16());
-    }
-
+    // SAFETY: `handle` was validated in `enable_terminal_logging` and the
+    // process cannot outlive it, and both `line` and `wide` are live locals
+    // for the duration of the calls.
     unsafe {
-      if WriteConsoleW(handle, &b.wide, None, None).is_err() {
-        let _ = WriteFile(handle, Some(b.line.as_bytes()), None, None);
+      if WriteConsoleW(handle, &wide, None, None).is_err() {
+        let _ = WriteFile(handle, Some(line.as_bytes()), None, None);
       }
     }
   });
@@ -85,4 +68,17 @@ macro_rules! clog {
   ($($arg:tt)*) => {
     $crate::console::console_log(format_args!($($arg)*))
   };
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn logging_without_a_console_is_a_no_op() {
+    // The test binary never calls `enable_terminal_logging`, which is the
+    // same state the GUI build runs in. Every log call takes this early
+    // return, so a regression here has no other guard.
+    console_log(format_args!("no console attached"));
+  }
 }

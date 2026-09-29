@@ -5,7 +5,7 @@ use windows::{
   Win32::{
     Foundation::{CloseHandle, HWND},
     System::Threading::{
-      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
       PROCESS_QUERY_LIMITED_INFORMATION,
     },
     UI::{
@@ -17,7 +17,6 @@ use windows::{
   },
 };
 
-#[inline(always)]
 pub fn is_valid_window(hwnd: HWND) -> bool {
   !hwnd.0.is_null() && unsafe { IsWindow(Some(hwnd)).as_bool() }
 }
@@ -59,7 +58,7 @@ pub fn get_process_name(pid: u32) -> Option<Rc<str>> {
   let success = unsafe {
     QueryFullProcessImageNameW(
       handle,
-      PROCESS_NAME_FORMAT(0),
+      PROCESS_NAME_WIN32,
       PWSTR(buffer.as_mut_ptr()),
       &mut size,
     )
@@ -81,13 +80,13 @@ pub fn get_process_name(pid: u32) -> Option<Rc<str>> {
     .iter()
     .rposition(|&c| c == b'.' as u16)
     .unwrap_or(file.len());
-  let stem = &file[..stem_len];
+  let stem = String::from_utf16_lossy(&file[..stem_len]);
 
   if stem.is_empty() {
     return None;
   }
-
-  Some(Rc::from(String::from_utf16_lossy(stem)))
+  // `Rc::from(String)` would copy again, so hand over the boxed buffer.
+  Some(Rc::from(stem.into_boxed_str()))
 }
 
 pub fn open_in_default_editor(path: &Path) {

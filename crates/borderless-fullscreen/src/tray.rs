@@ -1,11 +1,10 @@
-use std::fmt::Write as _;
-
+use rustc_hash::FxHashMap;
 use tray_icon::{
   menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
   Icon,
 };
 
-use crate::app::App;
+use crate::app::ManagedWindow;
 
 pub const MENU_ID_RESTORE_ALL: &str = "restore_all";
 pub const MENU_ID_PICK_WINDOW: &str = "pick_window";
@@ -17,77 +16,65 @@ pub const MENU_ID_RESTORE_WINDOW_PREFIX: &str = "restore_window:";
 const TRAY_ICON_SIZE: u32 = 32;
 const TRAY_ICON_LEN: usize = (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize;
 
+// Distance from the icon edge to the corner brackets, in pixels.
+const BRACKET_INSET: i32 = 2;
+// How far each bracket arm reaches along its edge.
+const BRACKET_ARM: i32 = 7;
+const BRACKET_COLOR: [u8; 4] = [0x00, 0xC0, 0xFF, 0xFF];
+const PLATE_COLOR: [u8; 4] = [0x10, 0x18, 0x27, 0xDD];
+
+const fn set_pixel(
+  rgba: &mut [u8; TRAY_ICON_LEN],
+  x: i32,
+  y: i32,
+  color: [u8; 4],
+) {
+  let idx = ((y as u32 * TRAY_ICON_SIZE + x as u32) * 4) as usize;
+  rgba[idx] = color[0];
+  rgba[idx + 1] = color[1];
+  rgba[idx + 2] = color[2];
+  rgba[idx + 3] = color[3];
+}
+
 const fn generate_tray_icon_rgba() -> [u8; TRAY_ICON_LEN] {
   let mut rgba = [0u8; TRAY_ICON_LEN];
-  let color_bracket = [0x00, 0xC0, 0xFF, 0xFF];
-  let color_bg = [0x10, 0x18, 0x27, 0xDD];
+  let size = TRAY_ICON_SIZE as i32;
+  let near = BRACKET_INSET;
+  let far = size - 1 - BRACKET_INSET;
+  let plate_lo = near + 1;
+  let plate_hi = size - near - 1;
 
-  let mut y = 3;
-  while y < 29 {
-    let mut x = 3;
-    while x < 29 {
-      let idx = ((y * TRAY_ICON_SIZE + x) * 4) as usize;
-      rgba[idx] = color_bg[0];
-      rgba[idx + 1] = color_bg[1];
-      rgba[idx + 2] = color_bg[2];
-      rgba[idx + 3] = color_bg[3];
+  let mut y = plate_lo;
+  while y < plate_hi {
+    let mut x = plate_lo;
+    while x < plate_hi {
+      set_pixel(&mut rgba, x, y, PLATE_COLOR);
       x += 1;
     }
     y += 1;
   }
 
-  macro_rules! set_pix {
-    ($rgba:ident, $x:expr, $y:expr, $c:ident) => {
-      let idx = (($y * TRAY_ICON_SIZE + $x) * 4) as usize;
-      $rgba[idx] = $c[0];
-      $rgba[idx + 1] = $c[1];
-      $rgba[idx + 2] = $c[2];
-      $rgba[idx + 3] = $c[3];
-    };
-  }
-
-  let mut i = 2;
-  while i < 9 {
-    set_pix!(rgba, i, 2, color_bracket);
-    set_pix!(rgba, i, 3, color_bracket);
-    set_pix!(rgba, 2, i, color_bracket);
-    set_pix!(rgba, 3, i, color_bracket);
-
-    set_pix!(rgba, TRAY_ICON_SIZE - 1 - i, 2, color_bracket);
-    set_pix!(rgba, TRAY_ICON_SIZE - 1 - i, 3, color_bracket);
-    set_pix!(rgba, TRAY_ICON_SIZE - 3, i, color_bracket);
-    set_pix!(rgba, TRAY_ICON_SIZE - 4, i, color_bracket);
-
-    set_pix!(rgba, i, TRAY_ICON_SIZE - 3, color_bracket);
-    set_pix!(rgba, i, TRAY_ICON_SIZE - 4, color_bracket);
-    set_pix!(rgba, 2, TRAY_ICON_SIZE - 1 - i, color_bracket);
-    set_pix!(rgba, 3, TRAY_ICON_SIZE - 1 - i, color_bracket);
-
-    set_pix!(
-      rgba,
-      TRAY_ICON_SIZE - 1 - i,
-      TRAY_ICON_SIZE - 3,
-      color_bracket
-    );
-    set_pix!(
-      rgba,
-      TRAY_ICON_SIZE - 1 - i,
-      TRAY_ICON_SIZE - 4,
-      color_bracket
-    );
-    set_pix!(
-      rgba,
-      TRAY_ICON_SIZE - 3,
-      TRAY_ICON_SIZE - 1 - i,
-      color_bracket
-    );
-    set_pix!(
-      rgba,
-      TRAY_ICON_SIZE - 4,
-      TRAY_ICON_SIZE - 1 - i,
-      color_bracket
-    );
-    i += 1;
+  // Arms run from a corner toward the plate center, so the corner on the
+  // upper-left side steps `+1` and the one on the lower-right side steps `-1`.
+  let mut corner_y = near;
+  while corner_y <= far {
+    let sy = if corner_y == near { 1 } else { -1 };
+    let mut corner_x = near;
+    while corner_x <= far {
+      let sx = if corner_x == near { 1 } else { -1 };
+      let mut arm = 0;
+      while arm < BRACKET_ARM {
+        let x = corner_x + sx * arm;
+        let y = corner_y + sy * arm;
+        set_pixel(&mut rgba, x, corner_y, BRACKET_COLOR);
+        set_pixel(&mut rgba, x, corner_y + sy, BRACKET_COLOR);
+        set_pixel(&mut rgba, corner_x, y, BRACKET_COLOR);
+        set_pixel(&mut rgba, corner_x + sx, y, BRACKET_COLOR);
+        arm += 1;
+      }
+      corner_x += far - near;
+    }
+    corner_y += far - near;
   }
 
   rgba
@@ -102,25 +89,21 @@ pub fn build_tray_icon() -> Icon {
     })
 }
 
-pub fn build_menu(app: &App, autostart_enabled: bool) -> Menu {
+pub fn build_menu(
+  managed: &FxHashMap<usize, ManagedWindow>,
+  autostart_enabled: bool,
+) -> Menu {
   let menu = Menu::new();
-  let managed = app.managed_windows();
 
-  let mut active_label = String::with_capacity(32);
-  let _ = write!(active_label, "Active Windows ({})", managed.len());
-  let active_submenu = Submenu::new(active_label, true);
+  let active_submenu =
+    Submenu::new(format!("Active Windows ({})", managed.len()), true);
 
   if managed.is_empty() {
     let _ = active_submenu.append(&MenuItem::new("(none)", false, None));
   } else {
     for (&key, meta) in managed {
-      let mut label =
-        String::with_capacity(meta.title.len() + meta.process_name.len() + 3);
-      let _ = write!(label, "{} ({})", meta.title, meta.process_name);
-
-      let mut id =
-        String::with_capacity(MENU_ID_RESTORE_WINDOW_PREFIX.len() + 16);
-      let _ = write!(id, "{MENU_ID_RESTORE_WINDOW_PREFIX}{key:x}");
+      let label = format!("{} ({})", meta.title, meta.process_name);
+      let id = format!("{MENU_ID_RESTORE_WINDOW_PREFIX}{key:x}");
 
       let _ = active_submenu.append(&MenuItem::with_id(id, label, true, None));
     }
@@ -161,4 +144,52 @@ pub fn build_menu(app: &App, autostart_enabled: bool) -> Menu {
   let _ = menu.append(&MenuItem::with_id(MENU_ID_EXIT, "Exit", true, None));
 
   menu
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn pixel(icon: &[u8; TRAY_ICON_LEN], x: u32, y: u32) -> [u8; 4] {
+    let start = ((y * TRAY_ICON_SIZE + x) * 4) as usize;
+    let mut out = [0u8; 4];
+    out.copy_from_slice(&icon[start..start + 4]);
+    out
+  }
+
+  #[test]
+  fn tray_icon_is_a_plate_framed_by_four_corner_brackets() {
+    let icon = &TRAY_ICON_BYTES;
+
+    // Every bracket corner, plus the far end of each of its two arms.
+    for (x, y) in [
+      (2, 2),
+      (8, 2),
+      (8, 3),
+      (2, 8),
+      (29, 2),
+      (23, 2),
+      (23, 3),
+      (29, 8),
+      (2, 29),
+      (8, 29),
+      (8, 28),
+      (2, 23),
+      (29, 29),
+      (23, 29),
+      (23, 28),
+      (29, 23),
+    ] {
+      assert_eq!(pixel(icon, x, y), BRACKET_COLOR, "bracket at {x},{y}");
+    }
+
+    // One pixel past the arm on the plate's top edge, so an arm that
+    // overshoots its length is caught.
+    assert_eq!(pixel(icon, 9, 3), PLATE_COLOR);
+    assert_eq!(pixel(icon, 15, 15), PLATE_COLOR, "plate center");
+
+    // The margin outside the plate stays transparent.
+    assert_eq!(pixel(icon, 1, 1), [0, 0, 0, 0]);
+    assert_eq!(pixel(icon, 30, 30), [0, 0, 0, 0]);
+  }
 }

@@ -9,8 +9,8 @@ mod tray;
 mod utils;
 
 use std::{
-  path::PathBuf,
-  sync::atomic::{AtomicUsize, Ordering},
+  ffi::c_void,
+  sync::atomic::{AtomicPtr, Ordering},
 };
 
 use tray_icon::menu::MenuEvent;
@@ -38,7 +38,7 @@ use crate::{
 const SINGLE_INSTANCE_MUTEX: PCWSTR = w!("BorderlessFullscreen_SingleInstance");
 const MAIN_WINDOW_CLASS: PCWSTR = w!("BorderlessFullscreen_MessageWindowClass");
 
-static MAIN_HWND: AtomicUsize = AtomicUsize::new(0);
+static MAIN_HWND: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 unsafe extern "system" fn main_window_proc(
   hwnd: HWND,
@@ -68,23 +68,32 @@ unsafe extern "system" fn main_window_proc(
 fn main() -> windows::core::Result<()> {
   enable_terminal_logging();
 
-  unsafe {
-    let _mutex = CreateMutexW(None, true, SINGLE_INSTANCE_MUTEX)?;
-    if GetLastError() == ERROR_ALREADY_EXISTS {
+  // The handle must stay open for the life of the process. Closing
+  // the last handle to a named mutex destroys it and frees the name, which
+  // would let a second instance claim it.
+  let _single_instance =
+    unsafe { CreateMutexW(None, true, SINGLE_INSTANCE_MUTEX)? };
+  if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+    unsafe {
       MessageBoxW(
         Some(HWND::default()),
         w!("Borderless Fullscreen is already running.\nCheck the system tray."),
         w!("Borderless Fullscreen"),
         MB_OK | MB_ICONINFORMATION,
       );
-      return Ok(());
     }
+    return Ok(());
   }
 
-  let exe_path = std::env::current_exe()
-    .unwrap_or_else(|_| PathBuf::from("borderless_fullscreen.exe"));
+  // The config path and the autostart entry are both derived from the
+  // executable's own location, so a wrong path here would be written to
+  // disk and to the registry. Fail startup instead of guessing.
+  let exe_path = std::env::current_exe()?;
 
-  unsafe {
+  // SAFETY: startup runs on the process's only thread, the class names
+  // are unique to this binary, and the single-instance mutex above rules
+  // out a second registration.
+  let main_hwnd = unsafe {
     let hinstance = GetModuleHandleW(None).unwrap_or_default();
 
     let main_wc = WNDCLASSEXW {
@@ -99,7 +108,7 @@ fn main() -> windows::core::Result<()> {
 
     overlay::register_class(hinstance);
 
-    let main_hwnd = CreateWindowExW(
+    CreateWindowExW(
       Default::default(),
       MAIN_WINDOW_CLASS,
       w!("BorderlessFullscreen_HiddenDispatcher"),
@@ -112,37 +121,46 @@ fn main() -> windows::core::Result<()> {
       None,
       Some(hinstance.into()),
       None,
-    )?;
+    )?
+  };
 
-    MAIN_HWND.store(main_hwnd.0 as usize, Ordering::Relaxed);
+  MAIN_HWND.store(main_hwnd.0, Ordering::Relaxed);
 
-    let _ = ctrlc::set_handler(|| {
-      let raw = MAIN_HWND.load(Ordering::Relaxed);
-      if raw != 0 {
-        let _ = PostMessageW(
-          Some(HWND(raw as *mut _)),
-          WM_CLOSE,
-          WPARAM(0),
-          LPARAM(0),
-        );
-      }
-    });
+  let _ = ctrlc::set_handler(|| {
+    let hwnd = MAIN_HWND.load(Ordering::Relaxed);
+    if !hwnd.is_null() {
+      // SAFETY: `PostMessageW` only reads the handle and posts a
+      // message. The dispatcher window outlives every thread in the
+      // process, so the handle stays valid for the whole run.
+      let _ = unsafe {
+        PostMessageW(Some(HWND(hwnd)), WM_CLOSE, WPARAM(0), LPARAM(0))
+      };
+    }
+  });
 
-    let mut app = App::new(exe_path);
-    app.initialize(main_hwnd);
-    app::install(app);
+  app::install(App::new(exe_path, main_hwnd));
 
-    let mut msg = MSG::default();
-    let menu_events = MenuEvent::receiver();
-    // `GetMessageW` returns -1 on failure, which `as_bool` would report as
-    // true. Compare against 0 so only real messages continue the loop.
-    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+  let mut msg = MSG::default();
+  let menu_events = MenuEvent::receiver();
+  loop {
+    // SAFETY: `msg` is a live `MSG` and the dispatcher window created
+    // above is never destroyed before the loop ends.
+    let status = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+    // A -1 return means the call failed, and treating it as a message
+    // would spin forever, so stop on anything that is not one.
+    if status <= 0 {
+      break;
+    }
+
+    // SAFETY: dispatching `msg` can only re-enter the window procedures
+    // this process registered.
+    unsafe {
       let _ = TranslateMessage(&msg);
       DispatchMessageW(&msg);
+    }
 
-      while let Ok(event) = menu_events.try_recv() {
-        with_app(|app| app.handle_menu_event(&event.id.0));
-      }
+    while let Ok(event) = menu_events.try_recv() {
+      with_app(|app| app.handle_menu_event(&event.id.0));
     }
   }
 

@@ -1,12 +1,12 @@
-use std::{fmt::Write as _, path::Path};
+use std::{fmt::Write as _, io::ErrorKind, path::Path};
 
-use rustc_hash::FxHashSet;
+use crate::clog;
 
 const DEFAULT_POLLING_INTERVAL_MS: u64 = 2000;
 const DEFAULT_MIN_WINDOW_SIZE: i32 = 800;
 
 #[inline]
-pub fn strip_exe_suffix(s: &str) -> &str {
+fn strip_exe_suffix(s: &str) -> &str {
   if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(".exe") {
     &s[..s.len() - 4]
   } else {
@@ -14,12 +14,11 @@ pub fn strip_exe_suffix(s: &str) -> &str {
   }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Config {
   pub process_names: Vec<String>,
   pub polling_interval_ms: u64,
   pub min_window_size: i32,
-  monitored_lookup: FxHashSet<Box<str>>,
 }
 
 impl Default for Config {
@@ -28,7 +27,6 @@ impl Default for Config {
       process_names: Vec::new(),
       polling_interval_ms: DEFAULT_POLLING_INTERVAL_MS,
       min_window_size: DEFAULT_MIN_WINDOW_SIZE,
-      monitored_lookup: FxHashSet::default(),
     }
   }
 }
@@ -37,10 +35,16 @@ impl Config {
   pub fn load_or_create(path: &Path) -> Self {
     match std::fs::read_to_string(path) {
       Ok(content) => Self::parse_ini(&content),
-      Err(_) => {
+      Err(err) if err.kind() == ErrorKind::NotFound => {
         let default_cfg = Self::default();
-        let _ = std::fs::write(path, default_cfg.serialize_ini());
+        if let Err(err) = default_cfg.save(path) {
+          clog!("Failed to write default config {}: {err}", path.display());
+        }
         default_cfg
+      }
+      Err(err) => {
+        clog!("Failed to read config {}: {err}", path.display());
+        Self::default()
       }
     }
   }
@@ -86,59 +90,31 @@ impl Config {
       }
     }
 
-    cfg.rebuild_lookup();
     cfg
-  }
-
-  fn rebuild_lookup(&mut self) {
-    self.monitored_lookup.clear();
-    // Pre-size the derived set once per rebuild instead of letting it
-    // grow and rehash incrementally as names are pushed.
-    self.monitored_lookup.reserve(self.process_names.len());
-    for name in &self.process_names {
-      self
-        .monitored_lookup
-        .insert(strip_exe_suffix(name).to_ascii_lowercase().into());
-    }
   }
 
   #[inline]
   pub fn is_monitored(&self, name: &str) -> bool {
-    if self.monitored_lookup.is_empty() {
-      return false;
-    }
+    let name = strip_exe_suffix(name);
     self
-      .monitored_lookup
-      .contains(strip_exe_suffix(name).to_ascii_lowercase().as_str())
+      .process_names
+      .iter()
+      .any(|n| n.eq_ignore_ascii_case(name))
   }
 
-  pub fn add_process(&mut self, name: String) -> bool {
-    let stripped = strip_exe_suffix(&name);
-    if self.is_monitored(stripped) {
+  pub fn add_process(&mut self, name: &str) -> bool {
+    if self.is_monitored(name) {
       return false;
     }
-    self.process_names.push(stripped.to_owned());
-    self.rebuild_lookup();
+    self.process_names.push(strip_exe_suffix(name).to_owned());
     true
   }
 
   pub fn remove_process(&mut self, name: &str) -> bool {
-    let stripped = strip_exe_suffix(name);
+    let name = strip_exe_suffix(name);
     let prev_len = self.process_names.len();
-    self
-      .process_names
-      .retain(|n| !n.eq_ignore_ascii_case(stripped));
-    if self.process_names.len() != prev_len {
-      self.rebuild_lookup();
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn clear_processes(&mut self) {
-    self.process_names.clear();
-    self.monitored_lookup.clear();
+    self.process_names.retain(|n| !n.eq_ignore_ascii_case(name));
+    self.process_names.len() != prev_len
   }
 
   fn serialize_ini(&self) -> String {
@@ -186,14 +162,38 @@ mod tests {
   #[test]
   fn add_and_remove_keep_the_lookup_in_sync() {
     let mut config = config_with("game");
-    assert!(!config.add_process("GAME".to_owned()), "duplicate ignored");
+    assert!(!config.add_process("GAME"), "duplicate ignored");
 
-    assert!(config.add_process("notes.exe".to_owned()));
+    assert!(config.add_process("notes.exe"));
+    assert_eq!(config.process_names, vec!["game", "notes"]);
     assert!(config.is_monitored("NOTES.exe"));
 
     assert!(config.remove_process("game.exe"));
     assert!(!config.is_monitored("Game"));
     assert!(!config.remove_process("game"), "already absent");
+  }
+
+  #[test]
+  fn load_or_create_seeds_a_missing_file_and_keeps_an_existing_one() {
+    let path = std::env::temp_dir().join("borderless_fullscreen_cfg_test.ini");
+    let _ = std::fs::remove_file(&path);
+
+    let seeded = Config::load_or_create(&path);
+    assert_eq!(seeded, Config::default());
+    assert_eq!(
+      std::fs::read_to_string(&path).unwrap(),
+      seeded.serialize_ini()
+    );
+
+    let mut edited = seeded;
+    edited.add_process("game.exe");
+    edited.save(&path).unwrap();
+
+    let reloaded = Config::load_or_create(&path);
+    assert!(reloaded.is_monitored("game"), "reloaded keeps the process");
+    assert_eq!(reloaded.polling_interval_ms, edited.polling_interval_ms);
+
+    std::fs::remove_file(&path).unwrap();
   }
 
   #[test]

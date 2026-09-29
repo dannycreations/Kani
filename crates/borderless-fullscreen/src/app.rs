@@ -37,6 +37,8 @@ use crate::{
 const APP_TITLE: &str = "Borderless Fullscreen";
 pub(crate) const TIMER_POLL_ID: usize = 1;
 
+const MAX_CACHED_PROCESSES: usize = 256;
+
 const STRIP_STYLE_MASK: isize =
   !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0 | WS_MINIMIZEBOX.0)
     as isize;
@@ -47,7 +49,6 @@ thread_local! {
   static APP_INSTANCE: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
-#[inline(always)]
 pub fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
   APP_INSTANCE.with(|cell| cell.borrow_mut().as_mut().map(f))
 }
@@ -56,33 +57,27 @@ pub fn install(app: App) {
   APP_INSTANCE.with(|cell| *cell.borrow_mut() = Some(app));
 }
 
-#[derive(Debug)]
 pub struct ManagedWindow {
   pub process_name: Rc<str>,
   pub title: Box<str>,
-  pub original: OriginalWindowMetrics,
-  last_seen: u32,
+  original: OriginalWindowMetrics,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct OriginalWindowMetrics {
-  pub style: isize,
-  pub ex_style: isize,
-  pub rect: RECT,
-  pub menu: HMENU,
+struct OriginalWindowMetrics {
+  style: isize,
+  ex_style: isize,
+  rect: RECT,
+  menu: HMENU,
 }
 
-#[inline(always)]
 fn hwnd_to_key(hwnd: HWND) -> usize {
   hwnd.0 as usize
 }
 
-#[inline(always)]
 fn key_to_hwnd(key: usize) -> HWND {
   HWND(key as *mut _)
 }
 
-#[inline(always)]
 fn move_window_framed(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
   unsafe {
     let _ = SetWindowPos(
@@ -97,83 +92,58 @@ fn move_window_framed(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
   }
 }
 
-struct ProcessCacheEntry {
-  name: Option<Rc<str>>,
-  generation: u32,
-}
-
 #[derive(Default)]
 struct ProcessNameCache {
-  entries: FxHashMap<u32, ProcessCacheEntry>,
-  generation: u32,
+  entries: FxHashMap<u32, Option<Rc<str>>>,
 }
 
 impl ProcessNameCache {
-  #[inline]
-  fn begin_scan(&mut self) -> u32 {
-    self.generation = self.generation.wrapping_add(1);
-    if (self.generation & 63) == 0 && self.entries.len() > 32 {
-      let cur = self.generation;
-      self
-        .entries
-        .retain(|_, v| cur.wrapping_sub(v.generation) < 64);
+  fn get_or_query(&mut self, pid: u32, config: &Config) -> Option<Rc<str>> {
+    if let Some(cached) = self.entries.get(&pid) {
+      return cached.clone();
     }
-    self.generation
+
+    // Bound the map by dropping it whole rather than aging entries out one
+    // at a time. A clear costs one `OpenProcess` per live process, and a
+    // desktop holds far fewer processes than this limit.
+    if self.entries.len() >= MAX_CACHED_PROCESSES {
+      self.entries.clear();
+    }
+
+    let name = get_process_name(pid).filter(|name| config.is_monitored(name));
+    self.entries.insert(pid, name.clone());
+    name
   }
 
-  #[inline]
+  fn monitored_name(&self, pid: u32) -> Option<Rc<str>> {
+    self.entries.get(&pid).cloned().flatten()
+  }
+
   fn clear(&mut self) {
     self.entries.clear();
-  }
-
-  #[inline]
-  fn get_or_query(&mut self, pid: u32, config: &Config) -> Option<Rc<str>> {
-    if let Some(entry) = self.entries.get_mut(&pid) {
-      entry.generation = self.generation;
-      return entry.name.clone();
-    }
-
-    let monitored_name =
-      get_process_name(pid).filter(|name| config.is_monitored(name));
-    self.entries.insert(
-      pid,
-      ProcessCacheEntry {
-        name: monitored_name.clone(),
-        generation: self.generation,
-      },
-    );
-    monitored_name
-  }
-
-  #[inline]
-  fn get_name(&self, pid: u32) -> Option<Rc<str>> {
-    self.entries.get(&pid).and_then(|e| e.name.clone())
   }
 }
 
 struct EnumContext<'a> {
   current_pid: u32,
   min_window_size: i32,
-  generation: u32,
-  last_pid: u32,
-  last_monitored: Option<Rc<str>>,
   managed_windows: &'a mut FxHashMap<usize, ManagedWindow>,
   config: &'a Config,
   cache: &'a mut ProcessNameCache,
-  newly_managed: Vec<(usize, Rc<str>, Box<str>, OriginalWindowMetrics)>,
 }
 
 unsafe extern "system" fn enum_windows_callback(
   hwnd: HWND,
   lparam: LPARAM,
 ) -> BOOL {
+  // SAFETY: `EnumWindows` passes back the `LPARAM` it was given for the
+  // duration of the call, and `main` keeps the context alive and
+  // exclusively borrowed for that whole call.
   let ctx = unsafe { &mut *(lparam.0 as *mut EnumContext) };
 
   let key = hwnd_to_key(hwnd);
-  if let Some(existing) = ctx.managed_windows.get_mut(&key) {
-    // Already managed and still enumerable: mark alive for this scan
-    // generation so the post-scan prune can skip an `IsWindow` call.
-    existing.last_seen = ctx.generation;
+  // Already managed, so its metrics must not be overwritten.
+  if ctx.managed_windows.contains_key(&key) {
     return BOOL(1);
   }
 
@@ -188,25 +158,10 @@ unsafe extern "system" fn enum_windows_callback(
   }
 
   // `EnumWindows` walks in z-order, so consecutive windows frequently share
-  // a process. Reuse the previous verdict for an identical pid instead of
-  // re-entering the name cache.
-  let name = if pid == ctx.last_pid {
-    match &ctx.last_monitored {
-      Some(n) => n.clone(),
-      None => return BOOL(1),
-    }
-  } else {
-    ctx.last_pid = pid;
-    match ctx.cache.get_or_query(pid, ctx.config) {
-      Some(n) => {
-        ctx.last_monitored = Some(n.clone());
-        n
-      }
-      None => {
-        ctx.last_monitored = None;
-        return BOOL(1);
-      }
-    }
+  // a process. The cache already answers a repeat lookup without an
+  // `OpenProcess` round trip, which is the only cost worth avoiding.
+  let Some(name) = ctx.cache.get_or_query(pid, ctx.config) else {
+    return BOOL(1);
   };
 
   let mut rect = RECT::default();
@@ -220,25 +175,27 @@ unsafe extern "system" fn enum_windows_callback(
     return BOOL(1);
   }
 
+  // A window with neither a caption nor a menu is a popup or dialog
+  // frame, not an application window worth maximizing.
   let orig_style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
-  let has_caption = (orig_style as u32 & WS_CAPTION.0) != 0;
-  let known_menu = if has_caption {
-    None
-  } else {
-    let m = unsafe { GetMenu(hwnd) };
-    if m.0.is_null() {
-      return BOOL(1);
-    }
-    Some(m)
-  };
+  if (orig_style as u32 & WS_CAPTION.0) == 0
+    && unsafe { GetMenu(hwnd) }.0.is_null()
+  {
+    return BOOL(1);
+  }
 
   let title = get_window_title(hwnd);
   clog!("Found: {} \"{}\" ({}x{})", name, title, width, height);
 
-  if let Some(metrics) =
-    App::apply_borderless(hwnd, &name, known_menu, Some(orig_style), Some(rect))
-  {
-    ctx.newly_managed.push((key, name, title, metrics));
+  if let Some(original) = App::apply_borderless(hwnd, &name) {
+    ctx.managed_windows.insert(
+      key,
+      ManagedWindow {
+        process_name: name,
+        title,
+        original,
+      },
+    );
   }
 
   BOOL(1)
@@ -258,63 +215,52 @@ pub struct App {
 }
 
 impl App {
-  pub fn new(exe_path: PathBuf) -> Self {
+  pub fn new(exe_path: PathBuf, main_hwnd: HWND) -> Self {
     let config_path = exe_path.with_extension("ini");
     let config = Config::load_or_create(&config_path);
     let current_pid = unsafe { GetCurrentProcessId() };
 
-    Self {
+    let mut app = Self {
       exe_path,
       config_path,
       config,
       current_pid,
-      main_hwnd: HWND::default(),
+      main_hwnd,
       overlay_hwnd: HWND::default(),
       autostart_enabled: is_autostart_enabled(),
       managed_windows: FxHashMap::default(),
       process_name_cache: ProcessNameCache::default(),
       tray_icon: None,
-    }
-  }
+    };
 
-  #[inline(always)]
-  pub fn managed_windows(&self) -> &FxHashMap<usize, ManagedWindow> {
-    &self.managed_windows
-  }
-
-  pub fn initialize(&mut self, hwnd: HWND) {
-    self.main_hwnd = hwnd;
-    clog!("Monitoring: {}", self.config.process_names.join(", "));
-
+    clog!("Monitoring: {}", app.config.process_names.join(", "));
     match TrayIconBuilder::new()
       .with_tooltip(APP_TITLE)
       .with_icon(tray::build_tray_icon())
       .build()
     {
-      Ok(tray) => self.tray_icon = Some(tray),
+      Ok(tray) => app.tray_icon = Some(tray),
       Err(err) => clog!("Failed to create tray icon: {err}"),
     }
-    self.sync_tray();
-    self.start_timer();
+    app.sync_tray();
+    app.start_timer();
+    app
   }
 
   fn sync_tray(&mut self) {
     let Some(tray) = &self.tray_icon else { return };
 
-    if self.managed_windows.is_empty() {
-      let _ = tray.set_tooltip(Some(APP_TITLE));
+    let tooltip = if self.managed_windows.is_empty() {
+      APP_TITLE.to_owned()
     } else {
-      let _ = tray.set_tooltip(Some(&format!(
-        "{APP_TITLE} ({} active)",
-        self.managed_windows.len()
-      )));
-    }
+      format!("{APP_TITLE} ({} active)", self.managed_windows.len())
+    };
+    let _ = tray.set_tooltip(Some(&tooltip));
 
-    let menu = tray::build_menu(self, self.autostart_enabled);
+    let menu = tray::build_menu(&self.managed_windows, self.autostart_enabled);
     tray.set_menu(Some(Box::new(menu)));
   }
 
-  #[inline(always)]
   fn start_timer(&self) {
     unsafe {
       SetTimer(
@@ -326,89 +272,59 @@ impl App {
     }
   }
 
-  #[inline(always)]
   fn stop_timer(&self) {
     unsafe {
       let _ = KillTimer(Some(self.main_hwnd), TIMER_POLL_ID);
     }
   }
 
-  #[inline]
-  fn track_managed_window(
-    &mut self,
-    key: usize,
-    process_name: Rc<str>,
-    title: Box<str>,
-    metrics: OriginalWindowMetrics,
-    generation: u32,
-  ) {
-    self.managed_windows.insert(
-      key,
-      ManagedWindow {
-        process_name,
-        title,
-        original: metrics,
-        last_seen: generation,
-      },
-    );
-  }
-
   pub fn check_monitored_windows(&mut self) {
-    // Nothing configured to monitor. Fall back to a plain
-    // `IsWindow`-based sweep since we won't be running `EnumWindows` below
-    // to piggy-back liveness detection on.
+    // With nothing configured, the enumeration in `scan_windows` would
+    // reject every window on the process-name lookup, so only sweep for
+    // handles that have gone away.
     if self.config.process_names.is_empty() {
-      let removed_any = self.prune_dead_managed_windows();
-      if removed_any {
+      if self.prune_dead_windows() {
         self.sync_tray();
       }
       return;
     }
 
-    let generation = self.process_name_cache.begin_scan();
-
-    // Scoped so the context's borrows of `self` end before the prune and
-    // track steps below, which both need `&mut self`.
-    let newly_managed = {
-      let mut context = EnumContext {
-        current_pid: self.current_pid,
-        min_window_size: self.config.min_window_size,
-        generation,
-        last_pid: 0,
-        last_monitored: None,
-        managed_windows: &mut self.managed_windows,
-        config: &self.config,
-        cache: &mut self.process_name_cache,
-        newly_managed: Vec::new(),
-      };
-
-      unsafe {
-        let ptr = &mut context as *mut EnumContext;
-        let _ = EnumWindows(Some(enum_windows_callback), LPARAM(ptr as isize));
-      }
-
-      std::mem::take(&mut context.newly_managed)
-    };
-
-    let added_any = !newly_managed.is_empty();
-    // Anything not touched by the enumeration above this generation is
-    // either destroyed or otherwise unreachable; confirm with `IsWindow`
-    // only for those stragglers instead of every managed window.
-    let removed_any = self.prune_stale_managed_windows(generation);
-
-    for (key, name, title, metrics) in newly_managed {
-      self.track_managed_window(key, name, title, metrics, generation);
-    }
-
-    if added_any || removed_any {
+    // `sync_tray` rebuilds the whole menu, and this poll runs every couple
+    // of seconds, so only do it when the active-window set actually moved.
+    let added = self.scan_windows();
+    let removed = self.prune_dead_windows();
+    if added || removed {
       self.sync_tray();
     }
   }
 
-  fn prune_dead_managed_windows(&mut self) -> bool {
-    if self.managed_windows.is_empty() {
-      return false;
+  fn scan_windows(&mut self) -> bool {
+    let before = self.managed_windows.len();
+
+    // Scoped so the context's borrows of `self` end before the prune in
+    // `check_monitored_windows`, which needs `&mut self`.
+    {
+      let mut context = EnumContext {
+        current_pid: self.current_pid,
+        min_window_size: self.config.min_window_size,
+        managed_windows: &mut self.managed_windows,
+        config: &self.config,
+        cache: &mut self.process_name_cache,
+      };
+
+      // SAFETY: `context` is borrowed mutably for the whole call, the
+      // callback only touches it through the pointer, and `EnumWindows`
+      // returns before this scope ends.
+      unsafe {
+        let ptr = &mut context as *mut EnumContext;
+        let _ = EnumWindows(Some(enum_windows_callback), LPARAM(ptr as isize));
+      }
     }
+
+    self.managed_windows.len() > before
+  }
+
+  fn prune_dead_windows(&mut self) -> bool {
     let before = self.managed_windows.len();
     self
       .managed_windows
@@ -416,38 +332,17 @@ impl App {
     self.managed_windows.len() != before
   }
 
-  fn prune_stale_managed_windows(&mut self, generation: u32) -> bool {
-    if self.managed_windows.is_empty() {
-      return false;
-    }
-    let before = self.managed_windows.len();
-    self.managed_windows.retain(|&key, w| {
-      w.last_seen == generation || is_valid_window(key_to_hwnd(key))
-    });
-    self.managed_windows.len() != before
-  }
-
-  pub fn apply_borderless(
+  fn apply_borderless(
     hwnd: HWND,
     process_name: &str,
-    known_menu: Option<HMENU>,
-    known_style: Option<isize>,
-    known_rect: Option<RECT>,
   ) -> Option<OriginalWindowMetrics> {
     unsafe {
-      let orig_style =
-        known_style.unwrap_or_else(|| GetWindowLongPtrW(hwnd, GWL_STYLE));
+      let orig_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
       let orig_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-      let orig_rect = match known_rect {
-        Some(r) => r,
-        None => {
-          let mut r = RECT::default();
-          if GetWindowRect(hwnd, &mut r).is_err() {
-            return None;
-          }
-          r
-        }
-      };
+      let mut orig_rect = RECT::default();
+      if GetWindowRect(hwnd, &mut orig_rect).is_err() {
+        return None;
+      }
 
       let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       let mut monitor_info = MONITORINFO {
@@ -467,11 +362,6 @@ impl App {
         }
       };
 
-      let screen_x = screen_rect.left;
-      let screen_y = screen_rect.top;
-      let screen_w = screen_rect.right - screen_rect.left;
-      let screen_h = screen_rect.bottom - screen_rect.top;
-
       let stripped_style = orig_style & STRIP_STYLE_MASK;
       if stripped_style != orig_style {
         SetWindowLongPtrW(hwnd, GWL_STYLE, stripped_style);
@@ -482,7 +372,7 @@ impl App {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, stripped_ex_style);
       }
 
-      let hmenu = known_menu.unwrap_or_else(|| GetMenu(hwnd));
+      let hmenu = GetMenu(hwnd);
       if !hmenu.0.is_null() {
         let _ = SetMenu(hwnd, Some(HMENU::default()));
         let _ = DrawMenuBar(hwnd);
@@ -495,13 +385,10 @@ impl App {
         menu: hmenu,
       };
 
-      let mut target_rect = RECT {
-        left: 0,
-        top: 0,
-        right: screen_w,
-        bottom: screen_h,
-      };
-
+      // `AdjustWindowRectEx` grows a rect outward by the frame borders, so
+      // feeding it the monitor rect in absolute coordinates yields the
+      // borderless client area in absolute coordinates.
+      let mut target_rect = screen_rect;
       let _ = AdjustWindowRectEx(
         &mut target_rect,
         WINDOW_STYLE(stripped_style as u32),
@@ -509,18 +396,19 @@ impl App {
         WINDOW_EX_STYLE(stripped_ex_style as u32),
       );
 
-      let final_x = screen_x + target_rect.left;
-      let final_y = screen_y + target_rect.top;
-      let final_w = target_rect.right - target_rect.left;
-      let final_h = target_rect.bottom - target_rect.top;
-
-      move_window_framed(hwnd, final_x, final_y, final_w, final_h);
+      move_window_framed(
+        hwnd,
+        target_rect.left,
+        target_rect.top,
+        target_rect.right - target_rect.left,
+        target_rect.bottom - target_rect.top,
+      );
 
       clog!(
         "Applied: {} \u{2192} {}x{}",
         process_name,
-        screen_w,
-        screen_h
+        screen_rect.right - screen_rect.left,
+        screen_rect.bottom - screen_rect.top
       );
 
       Some(saved_metrics)
@@ -547,15 +435,16 @@ impl App {
     if let Err(err) = self.config.save(&self.config_path) {
       clog!("Failed to save config: {err}");
     }
+    // Cached verdicts embed the monitored filter, so they are stale now.
     self.process_name_cache.clear();
   }
 
-  pub fn restore_borders(&mut self, hwnd: HWND) {
-    let key = hwnd_to_key(hwnd);
+  fn restore_borders(&mut self, key: usize) {
     let Some(managed) = self.managed_windows.remove(&key) else {
       return;
     };
 
+    let hwnd = key_to_hwnd(key);
     if is_valid_window(hwnd) {
       Self::apply_restore_metrics(hwnd, &managed.original);
       clog!("Restored: {}", managed.title);
@@ -572,7 +461,7 @@ impl App {
     self.sync_tray();
   }
 
-  pub fn restore_all_borders(&mut self) {
+  fn restore_all_borders(&mut self) {
     if self.managed_windows.is_empty() {
       return;
     }
@@ -585,7 +474,7 @@ impl App {
       }
     }
 
-    self.config.clear_processes();
+    self.config.process_names.clear();
     self.persist_config();
 
     self.sync_tray();
@@ -594,49 +483,53 @@ impl App {
   pub fn toggle_window(&mut self, hwnd: HWND) {
     let key = hwnd_to_key(hwnd);
     if self.managed_windows.contains_key(&key) {
-      self.restore_borders(hwnd);
+      self.restore_borders(key);
       return;
     }
 
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    // The cache only answers for monitored processes, so a process the
+    // user picked by hand still needs a fresh lookup.
     let process_name = self
       .process_name_cache
-      .get_name(pid)
+      .monitored_name(pid)
       .or_else(|| get_process_name(pid))
       .unwrap_or_else(|| Rc::from("Unknown"));
 
-    let Some(metrics) =
-      Self::apply_borderless(hwnd, &process_name, None, None, None)
-    else {
+    let Some(original) = Self::apply_borderless(hwnd, &process_name) else {
       return;
     };
 
-    let title = get_window_title(hwnd);
-    let generation = self.process_name_cache.generation;
-    self.track_managed_window(
+    self.managed_windows.insert(
       key,
-      process_name.clone(),
-      title,
-      metrics,
-      generation,
+      ManagedWindow {
+        process_name: process_name.clone(),
+        title: get_window_title(hwnd),
+        original,
+      },
     );
 
     // `add_process` already reports whether the list changed, so there is
     // no need to pre-check `is_monitored` and pay for a second lookup.
-    if self.config.add_process((*process_name).to_owned()) {
+    if self.config.add_process(&process_name) {
       self.persist_config();
     }
     self.sync_tray();
   }
 
-  pub fn start_window_picker(&mut self) {
-    if is_valid_window(self.overlay_hwnd) {
-      unsafe {
-        let _ = DestroyWindow(self.overlay_hwnd);
-      }
-      self.overlay_hwnd = HWND::default();
+  fn destroy_overlay(&mut self) {
+    if !is_valid_window(self.overlay_hwnd) {
+      return;
     }
+    unsafe {
+      let _ = DestroyWindow(self.overlay_hwnd);
+    }
+    self.overlay_hwnd = HWND::default();
+  }
+
+  fn start_window_picker(&mut self) {
+    self.destroy_overlay();
 
     if let Some(hwnd) = overlay::spawn() {
       self.overlay_hwnd = hwnd;
@@ -658,13 +551,15 @@ impl App {
       }
       tray::MENU_ID_EXIT => self.exit_application(),
       other => {
-        if let Some(hex) =
-          other.strip_prefix(tray::MENU_ID_RESTORE_WINDOW_PREFIX)
-        {
-          if let Ok(key) = usize::from_str_radix(hex, 16) {
-            self.restore_borders(key_to_hwnd(key));
-          }
-        }
+        // Restore rows carry the window key as hex after a fixed prefix;
+        // anything else is not an id this build produces.
+        let Some(key) = other
+          .strip_prefix(tray::MENU_ID_RESTORE_WINDOW_PREFIX)
+          .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+        else {
+          return;
+        };
+        self.restore_borders(key);
       }
     }
   }
@@ -672,13 +567,7 @@ impl App {
   pub fn exit_application(&mut self) {
     self.stop_timer();
     self.tray_icon = None;
-
-    if is_valid_window(self.overlay_hwnd) {
-      unsafe {
-        let _ = DestroyWindow(self.overlay_hwnd);
-      }
-      self.overlay_hwnd = HWND::default();
-    }
+    self.destroy_overlay();
 
     unsafe {
       PostQuitMessage(0);
