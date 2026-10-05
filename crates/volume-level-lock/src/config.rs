@@ -2,6 +2,7 @@
 
 use std::{
   env, fs,
+  io::ErrorKind,
   path::{Path, PathBuf},
   sync::atomic::Ordering,
 };
@@ -41,16 +42,16 @@ impl Config {
   }
 
   pub fn load_from_path(path: &Path) -> Result<Self> {
-    // A missing file is left missing; only a present but unusable one
-    // gets rewritten.
-    if !path.exists() {
-      return Ok(Self::default());
-    }
-
-    // An unreadable file is treated the same as a corrupted one, so
-    // both take the same rewrite path.
-    let Ok(content) = fs::read_to_string(path) else {
-      return Ok(Self::reset_to_default(path));
+    let content = match fs::read_to_string(path) {
+      Ok(content) => content,
+      // A missing file is left missing; only a present but unusable one
+      // gets rewritten.
+      Err(err) if err.kind() == ErrorKind::NotFound => {
+        return Ok(Self::default());
+      }
+      // An unreadable file is treated the same as a corrupted one, so
+      // both take the same rewrite path.
+      Err(_) => return Ok(Self::reset_to_default(path)),
     };
 
     Ok(Self::parse(&content).unwrap_or_else(|| Self::reset_to_default(path)))

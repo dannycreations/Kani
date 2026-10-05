@@ -34,6 +34,7 @@ pub struct TrayApp {
 const WIDTH: u32 = 16;
 const HEIGHT: u32 = 16;
 const BUFFER_LEN: usize = (WIDTH * HEIGHT * 4) as usize;
+const ICON_RADIUS: i32 = 6;
 
 const fn generate_circle_icon(r: u8, g: u8, b: u8) -> [u8; BUFFER_LEN] {
   let mut rgba = [0u8; BUFFER_LEN];
@@ -44,9 +45,9 @@ const fn generate_circle_icon(r: u8, g: u8, b: u8) -> [u8; BUFFER_LEN] {
       // Pixels outside the circle stay at the zero-initialized
       // transparent value, so only the disc needs writing.
       let idx = ((y * WIDTH + x) * 4) as usize;
-      let dx = x as i32 - 8;
-      let dy = y as i32 - 8;
-      if dx * dx + dy * dy < 36 {
+      let dx = x as i32 - WIDTH as i32 / 2;
+      let dy = y as i32 - HEIGHT as i32 / 2;
+      if dx * dx + dy * dy < ICON_RADIUS * ICON_RADIUS {
         rgba[idx] = r;
         rgba[idx + 1] = g;
         rgba[idx + 2] = b;

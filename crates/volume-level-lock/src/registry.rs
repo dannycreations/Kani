@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::{
-  env, mem::size_of, os::windows::ffi::OsStrExt, process::Command, slice,
+  env, mem::size_of, os::windows::ffi::OsStrExt, path::PathBuf, slice,
 };
 
 use anyhow::{bail, Result};
@@ -10,7 +10,7 @@ use windows::{
   Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
     RegQueryValueExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-    KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE,
+    KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
   },
 };
 
@@ -44,7 +44,7 @@ fn with_run_key<R>(
   }
 }
 
-pub fn register_autorun() -> Result<()> {
+pub fn register_autorun() -> Result<PathBuf> {
   let executable_path = env::current_exe()?;
 
   // Run entries are stored as a quoted path, because an install
@@ -93,16 +93,10 @@ pub fn register_autorun() -> Result<()> {
     }
   }
 
-  // Start the app so a fresh install is running right away. When an
-  // instance is already up, the single-instance check ends this copy
-  // immediately, so the spawn is best effort either way.
-  let _ = Command::new(&executable_path).spawn();
-
-  Ok(())
+  Ok(executable_path)
 }
 
-pub fn deregister_autorun() -> Result<()> {
-  // A missing key means the value is already gone.
+pub fn deregister_autorun() {
   with_run_key(KEY_WRITE, |key_handle| {
     // SAFETY: `key_handle` is the open key handle `with_run_key` owns
     // for the duration of this call, and the value name is a module
@@ -111,27 +105,16 @@ pub fn deregister_autorun() -> Result<()> {
       let _ = RegDeleteValueW(key_handle, REG_VALUE_NAME);
     }
   });
-
-  Ok(())
 }
 
 pub fn is_autorun_registered() -> bool {
   with_run_key(KEY_READ, |key_handle| {
     // SAFETY: `key_handle` is the open key handle `with_run_key` owns
-    // for the duration of this call, and the query only reads metadata
-    // about a value, writing nothing outside the two out-parameters.
+    // for the duration of this call, and passing no out-parameters asks
+    // only whether the value exists.
     unsafe {
-      let mut value_type = REG_VALUE_TYPE::default();
-      let mut data_len = 0u32;
-      RegQueryValueExW(
-        key_handle,
-        REG_VALUE_NAME,
-        None,
-        Some(&mut value_type),
-        None,
-        Some(&mut data_len),
-      )
-      .is_ok()
+      RegQueryValueExW(key_handle, REG_VALUE_NAME, None, None, None, None)
+        .is_ok()
     }
   })
   .unwrap_or(false)

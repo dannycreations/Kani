@@ -44,7 +44,7 @@ impl AudioFlow {
 
 pub enum EnforcerEvent {
   RebindRole(AudioFlow, ERole),
-  VolumeFileChanged,
+  ConfigChanged,
 }
 
 const ROLES: [ERole; 3] = [eConsole, eMultimedia, eCommunications];
@@ -102,16 +102,23 @@ fn is_drifted(current: f32, target: f32) -> bool {
   (current - target).abs() > VOLUME_EPSILON
 }
 
-fn set_volume(
-  endpoint: &IAudioEndpointVolume,
-  level: f32,
-  context_guid: &GUID,
-) {
-  // SAFETY: `endpoint` is a live interface owned by the caller, and
-  // `context_guid` only tags the change so our own notification callback
-  // can recognise and ignore it. Both stay alive across the call.
-  unsafe {
-    let _ = endpoint.SetMasterVolumeLevelScalar(level, context_guid);
+fn enforce(endpoint: &IAudioEndpointVolume, target: f32, context_guid: &GUID) {
+  // SAFETY: `endpoint` is a live interface owned by the caller, and this
+  // getter only reads from it.
+  let drifted = match unsafe { endpoint.GetMasterVolumeLevelScalar() } {
+    Ok(current) => is_drifted(current, target),
+    // A level that cannot be read counts as drift, so the write below
+    // re-establishes the target.
+    Err(_) => true,
+  };
+
+  if drifted {
+    // SAFETY: as in the read above, plus `context_guid` only tags the
+    // change so our own notification callback can recognise and ignore
+    // it. Both stay alive across the call.
+    unsafe {
+      let _ = endpoint.SetMasterVolumeLevelScalar(target, context_guid);
+    }
   }
 }
 
@@ -121,7 +128,6 @@ pub struct AudioEnforcer {
   enumerator: IMMDeviceEnumerator,
   notification_client: Option<IMMNotificationClient>,
   bindings: [Option<AudioBinding>; ROLES.len()],
-  enabled: bool,
   context_guid: GUID,
   event_tx: Sender<EnforcerEvent>,
   main_thread_id: u32,
@@ -169,7 +175,6 @@ impl AudioEnforcer {
       enumerator,
       notification_client: None,
       bindings: Default::default(),
-      enabled: false,
       context_guid,
       event_tx,
       main_thread_id,
@@ -181,7 +186,7 @@ impl AudioEnforcer {
   }
 
   pub fn enable(&mut self) -> Result<()> {
-    if self.enabled {
+    if self.notification_client.is_some() {
       return Ok(());
     }
 
@@ -208,32 +213,27 @@ impl AudioEnforcer {
       let _ = self.bind_role(role);
     }
 
-    self.enabled = true;
     Ok(())
   }
 
   pub fn disable(&mut self) {
-    if !self.enabled {
+    // A missing client means `enable` never completed, so there is
+    // nothing registered to undo.
+    let Some(client) = self.notification_client.take() else {
       return;
-    }
+    };
 
-    // Unregister notifications
-    if let Some(ref client) = self.notification_client {
-      // SAFETY: `client` is the exact interface registered in `enable`
-      // and `self.enumerator` is the same enumerator, so this only
-      // reverses that registration.
-      unsafe {
-        let _ = self
-          .enumerator
-          .UnregisterEndpointNotificationCallback(client);
-      }
+    // SAFETY: `client` is the exact interface registered in `enable` and
+    // `self.enumerator` is the same enumerator, so this only reverses
+    // that registration.
+    unsafe {
+      let _ = self
+        .enumerator
+        .UnregisterEndpointNotificationCallback(&client);
     }
-    self.notification_client = None;
 
     // Drop all bindings (unregisters each endpoint's notify callback).
     self.bindings = Default::default();
-
-    self.enabled = false;
   }
 
   pub fn bind_role(&mut self, role: ERole) -> Result<()> {
@@ -271,18 +271,7 @@ impl AudioEnforcer {
   pub fn force_to_target(&self) {
     let target = self.state.scalar(self.flow);
     for binding in self.bindings.iter().flatten() {
-      // SAFETY: `binding.endpoint` is a live interface owned by the
-      // binding and this getter only reads from it.
-      let needs_set =
-        match unsafe { binding.endpoint.GetMasterVolumeLevelScalar() } {
-          Ok(current) => is_drifted(current, target),
-          // A level that cannot be read counts as drift, so the write
-          // below re-establishes the target.
-          Err(_) => true,
-        };
-      if needs_set {
-        set_volume(&binding.endpoint, target, &self.context_guid);
-      }
+      enforce(&binding.endpoint, target, &self.context_guid);
     }
   }
 }
@@ -313,9 +302,7 @@ impl IAudioEndpointVolumeCallback_Impl for VolumeNotificationCallback_Impl {
     }
 
     let target = self.state.scalar(self.flow);
-    if is_drifted(data.fMasterVolume, target) {
-      set_volume(&self.endpoint, target, &self.context_guid);
-    }
+    enforce(&self.endpoint, target, &self.context_guid);
 
     Ok(())
   }

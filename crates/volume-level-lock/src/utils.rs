@@ -2,10 +2,10 @@
 
 use windows::Win32::{
   Foundation::{LPARAM, WPARAM},
-  UI::WindowsAndMessaging::PostThreadMessageW,
+  UI::WindowsAndMessaging::{PostThreadMessageW, WM_USER},
 };
 
-use crate::WM_WAKEUP;
+const WM_WAKEUP: u32 = WM_USER + 1;
 
 pub fn to_wide(s: &str) -> Vec<u16> {
   let mut w = Vec::with_capacity(s.len() + 1);

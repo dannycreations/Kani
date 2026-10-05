@@ -44,12 +44,9 @@ use windows::{
   Win32::System::ProcessStatus::EmptyWorkingSet,
   Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId},
   Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostThreadMessageW, MSG, WM_QUIT, WM_USER,
+    DispatchMessageW, GetMessageW, PostThreadMessageW, MSG, WM_QUIT,
   },
 };
-
-#[cfg(windows)]
-const WM_WAKEUP: u32 = WM_USER + 1;
 
 #[cfg(windows)]
 const TRIMMER_INTERVAL: Duration = Duration::from_secs(60);
@@ -97,11 +94,6 @@ fn main() -> Result<()> {
 
 #[cfg(windows)]
 fn run_windows(args: Args) -> Result<()> {
-  // Quietly exit if another instance already holds the guard.
-  let Some(_guard) = acquire_single_instance_guard()? else {
-    return Ok(());
-  };
-
   let mut config = Config::load()?;
   let mut dirty = false;
 
@@ -126,19 +118,31 @@ fn run_windows(args: Args) -> Result<()> {
     config.save()?;
   }
 
+  // Autorun changes are one-shot admin commands, so they run whether or
+  // not the tray app already holds the single-instance guard.
   if args.install {
-    return register_autorun();
+    // Start the app so a fresh install is running right away. When an
+    // instance is already up, the single-instance check ends this copy
+    // immediately, so the spawn is best effort.
+    let _ = Command::new(register_autorun()?).spawn();
+    return Ok(());
   }
 
   if args.uninstall {
-    return deregister_autorun();
+    deregister_autorun();
+    return Ok(());
   }
+
+  // Quietly exit if another instance already holds the guard.
+  let Some(_guard) = acquire_single_instance_guard()? else {
+    return Ok(());
+  };
 
   run_enforcer(config)
 }
 
 #[cfg(windows)]
-fn apply_enforcer_state(enforcer: &mut AudioEnforcer, paused: bool) {
+fn apply_paused_state(enforcer: &mut AudioEnforcer, paused: bool) {
   if paused {
     enforcer.disable();
   } else {
@@ -156,7 +160,7 @@ fn toggle_and_sync(
   let paused_atomic = state.paused(enforcer.flow());
   let next_paused = !paused_atomic.load(Ordering::SeqCst);
   paused_atomic.store(next_paused, Ordering::SeqCst);
-  apply_enforcer_state(enforcer, next_paused);
+  apply_paused_state(enforcer, next_paused);
 
   tray_app.refresh(state);
   let _ = Config::from_state(state).save();
@@ -217,8 +221,8 @@ fn run_enforcer(config: Config) -> Result<()> {
     main_thread_id,
   )?;
 
-  apply_enforcer_state(&mut input_enforcer, config.input_paused);
-  apply_enforcer_state(&mut output_enforcer, config.output_paused);
+  apply_paused_state(&mut input_enforcer, config.input_paused);
+  apply_paused_state(&mut output_enforcer, config.output_paused);
 
   spawn_config_watcher(state.clone(), event_tx, main_thread_id);
 
@@ -237,12 +241,12 @@ fn run_enforcer(config: Config) -> Result<()> {
             enforcer.force_to_target();
           }
         }
-        EnforcerEvent::VolumeFileChanged => {
-          apply_enforcer_state(
+        EnforcerEvent::ConfigChanged => {
+          apply_paused_state(
             &mut input_enforcer,
             state.input_paused.load(Ordering::SeqCst),
           );
-          apply_enforcer_state(
+          apply_paused_state(
             &mut output_enforcer,
             state.output_paused.load(Ordering::SeqCst),
           );
@@ -272,7 +276,7 @@ fn run_enforcer(config: Config) -> Result<()> {
         }
         TrayAction::ToggleAutorun => {
           if is_autorun_registered() {
-            let _ = deregister_autorun();
+            deregister_autorun();
           } else {
             let _ = register_autorun();
           }
@@ -346,7 +350,7 @@ fn spawn_config_watcher(
         continue;
       }
 
-      let _ = event_tx.send(EnforcerEvent::VolumeFileChanged);
+      let _ = event_tx.send(EnforcerEvent::ConfigChanged);
       wake_main_thread(main_thread_id);
     }
   });
