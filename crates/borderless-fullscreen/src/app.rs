@@ -115,10 +115,6 @@ impl ProcessNameCache {
     name
   }
 
-  fn monitored_name(&self, pid: u32) -> Option<Rc<str>> {
-    self.entries.get(&pid).cloned().flatten()
-  }
-
   fn clear(&mut self) {
     self.entries.clear();
   }
@@ -137,7 +133,7 @@ unsafe extern "system" fn enum_windows_callback(
   lparam: LPARAM,
 ) -> BOOL {
   // SAFETY: `EnumWindows` passes back the `LPARAM` it was given for the
-  // duration of the call, and `main` keeps the context alive and
+  // duration of the call, and `scan_windows` keeps the context alive and
   // exclusively borrowed for that whole call.
   let ctx = unsafe { &mut *(lparam.0 as *mut EnumContext) };
 
@@ -164,17 +160,6 @@ unsafe extern "system" fn enum_windows_callback(
     return BOOL(1);
   };
 
-  let mut rect = RECT::default();
-  if unsafe { GetWindowRect(hwnd, &mut rect).is_err() } {
-    return BOOL(1);
-  }
-
-  let width = rect.right - rect.left;
-  let height = rect.bottom - rect.top;
-  if width < ctx.min_window_size || height < ctx.min_window_size {
-    return BOOL(1);
-  }
-
   // A window with neither a caption nor a menu is a popup or dialog
   // frame, not an application window worth maximizing.
   let orig_style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
@@ -184,19 +169,29 @@ unsafe extern "system" fn enum_windows_callback(
     return BOOL(1);
   }
 
+  let mut orig_rect = RECT::default();
+  if unsafe { GetWindowRect(hwnd, &mut orig_rect).is_err() } {
+    return BOOL(1);
+  }
+
+  let width = orig_rect.right - orig_rect.left;
+  let height = orig_rect.bottom - orig_rect.top;
+  if width < ctx.min_window_size || height < ctx.min_window_size {
+    return BOOL(1);
+  }
+
   let title = get_window_title(hwnd);
   clog!("Found: {} \"{}\" ({}x{})", name, title, width, height);
 
-  if let Some(original) = App::apply_borderless(hwnd, &name) {
-    ctx.managed_windows.insert(
-      key,
-      ManagedWindow {
-        process_name: name,
-        title,
-        original,
-      },
-    );
-  }
+  let original = App::apply_borderless(hwnd, &name, orig_style, orig_rect);
+  ctx.managed_windows.insert(
+    key,
+    ManagedWindow {
+      process_name: name,
+      title,
+      original,
+    },
+  );
 
   BOOL(1)
 }
@@ -279,26 +274,22 @@ impl App {
   }
 
   pub fn check_monitored_windows(&mut self) {
-    // With nothing configured, the enumeration in `scan_windows` would
-    // reject every window on the process-name lookup, so only sweep for
-    // handles that have gone away.
-    if self.config.process_names.is_empty() {
-      if self.prune_dead_windows() {
-        self.sync_tray();
-      }
-      return;
-    }
-
     // `sync_tray` rebuilds the whole menu, and this poll runs every couple
     // of seconds, so only do it when the active-window set actually moved.
-    let added = self.scan_windows();
-    let removed = self.prune_dead_windows();
-    if added || removed {
+    let mut changed = self.scan_windows();
+    changed |= self.prune_dead_windows();
+    if changed {
       self.sync_tray();
     }
   }
 
   fn scan_windows(&mut self) -> bool {
+    // With nothing configured, the enumeration would reject every window
+    // on the process-name lookup, so skip the walk entirely.
+    if self.config.process_names.is_empty() {
+      return false;
+    }
+
     let before = self.managed_windows.len();
 
     // Scoped so the context's borrows of `self` end before the prune in
@@ -335,15 +326,11 @@ impl App {
   fn apply_borderless(
     hwnd: HWND,
     process_name: &str,
-  ) -> Option<OriginalWindowMetrics> {
+    orig_style: isize,
+    orig_rect: RECT,
+  ) -> OriginalWindowMetrics {
     unsafe {
-      let orig_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
       let orig_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-      let mut orig_rect = RECT::default();
-      if GetWindowRect(hwnd, &mut orig_rect).is_err() {
-        return None;
-      }
-
       let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       let mut monitor_info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -411,7 +398,7 @@ impl App {
         screen_rect.bottom - screen_rect.top
       );
 
-      Some(saved_metrics)
+      saved_metrics
     }
   }
 
@@ -439,16 +426,20 @@ impl App {
     self.process_name_cache.clear();
   }
 
+  fn restore_window(hwnd: HWND, managed: &ManagedWindow) {
+    if !is_valid_window(hwnd) {
+      return;
+    }
+    Self::apply_restore_metrics(hwnd, &managed.original);
+    clog!("Restored: {}", managed.title);
+  }
+
   fn restore_borders(&mut self, key: usize) {
     let Some(managed) = self.managed_windows.remove(&key) else {
       return;
     };
 
-    let hwnd = key_to_hwnd(key);
-    if is_valid_window(hwnd) {
-      Self::apply_restore_metrics(hwnd, &managed.original);
-      clog!("Restored: {}", managed.title);
-    }
+    Self::restore_window(key_to_hwnd(key), &managed);
 
     let still_managed = self
       .managed_windows
@@ -467,11 +458,7 @@ impl App {
     }
 
     for (key, managed) in self.managed_windows.drain() {
-      let hwnd = key_to_hwnd(key);
-      if is_valid_window(hwnd) {
-        Self::apply_restore_metrics(hwnd, &managed.original);
-        clog!("Restored: {}", managed.title);
-      }
+      Self::restore_window(key_to_hwnd(key), &managed);
     }
 
     self.config.process_names.clear();
@@ -489,18 +476,20 @@ impl App {
 
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    // The cache only answers for monitored processes, so a process the
-    // user picked by hand still needs a fresh lookup.
-    let process_name = self
-      .process_name_cache
-      .monitored_name(pid)
-      .or_else(|| get_process_name(pid))
-      .unwrap_or_else(|| Rc::from("Unknown"));
+    // The cache only holds monitored processes, and this click is the
+    // first look at a window the user picked, so query the process
+    // directly instead of paying for a lookup that can miss.
+    let process_name =
+      get_process_name(pid).unwrap_or_else(|| Rc::from("Unknown"));
 
-    let Some(original) = Self::apply_borderless(hwnd, &process_name) else {
+    let orig_style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    let mut orig_rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut orig_rect) }.is_err() {
       return;
-    };
+    }
 
+    let original =
+      Self::apply_borderless(hwnd, &process_name, orig_style, orig_rect);
     self.managed_windows.insert(
       key,
       ManagedWindow {
@@ -530,10 +519,7 @@ impl App {
 
   fn start_window_picker(&mut self) {
     self.destroy_overlay();
-
-    if let Some(hwnd) = overlay::spawn() {
-      self.overlay_hwnd = hwnd;
-    }
+    self.overlay_hwnd = overlay::spawn().unwrap_or_default();
   }
 
   pub fn handle_menu_event(&mut self, id: &str) {

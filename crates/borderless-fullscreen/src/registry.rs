@@ -1,4 +1,4 @@
-use std::{mem::size_of, os::windows::ffi::OsStrExt, path::Path};
+use std::{mem::size_of, os::windows::ffi::OsStrExt, path::Path, slice};
 
 use windows::{
   core::{w, PCWSTR},
@@ -72,7 +72,7 @@ pub fn set_autostart_enabled(enable: bool, exe_path: &Path) {
         // string, so the same bytes are read back as a `&[u8]`.
         // `command` is built above, stays alive for the call, and is
         // NUL-terminated.
-        let bytes = std::slice::from_raw_parts(
+        let bytes = slice::from_raw_parts(
           command.as_ptr().cast::<u8>(),
           command.len() * size_of::<u16>(),
         );

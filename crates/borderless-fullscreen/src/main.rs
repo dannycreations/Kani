@@ -24,8 +24,8 @@ use windows::{
     UI::WindowsAndMessaging::{
       CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
       MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-      TranslateMessage, CS_HREDRAW, CS_VREDRAW, MB_ICONINFORMATION, MB_OK, MSG,
-      WM_CLOSE, WM_DESTROY, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+      TranslateMessage, MB_ICONINFORMATION, MB_OK, MSG, WM_CLOSE, WM_DESTROY,
+      WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
     },
   },
 };
@@ -96,9 +96,9 @@ fn main() -> windows::core::Result<()> {
   let main_hwnd = unsafe {
     let hinstance = GetModuleHandleW(None).unwrap_or_default();
 
+    // Never shown and never painted, so it carries no redraw styles.
     let main_wc = WNDCLASSEXW {
       cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-      style: CS_HREDRAW | CS_VREDRAW,
       lpfnWndProc: Some(main_window_proc),
       hInstance: hinstance.into(),
       lpszClassName: MAIN_WINDOW_CLASS,

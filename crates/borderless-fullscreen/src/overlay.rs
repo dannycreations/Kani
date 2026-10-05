@@ -48,8 +48,7 @@ static CROSS_CURSOR_HANDLE: AtomicPtr<c_void> =
 struct OverlayState {
   overlay: HWND,
   highlight: HWND,
-  hovered: HWND,
-  hovered_rect: RECT,
+  hovered: Option<(HWND, RECT)>,
   last_cursor: POINT,
   highlight_size: SIZE,
   desktop: HWND,
@@ -61,8 +60,7 @@ impl Default for OverlayState {
     Self {
       overlay: HWND::default(),
       highlight: HWND::default(),
-      hovered: HWND::default(),
-      hovered_rect: RECT::default(),
+      hovered: None,
       last_cursor: POINT {
         x: i32::MIN,
         y: i32::MIN,
@@ -78,6 +76,10 @@ thread_local! {
   static STATE: Cell<OverlayState> = Cell::new(OverlayState::default());
 }
 
+/// Runs `f` on a copy of the state and stores the result back. The copy
+/// is what makes re-entry safe: `DestroyWindow` sends `WM_DESTROY`
+/// synchronously, so both window procedures below re-enter this function
+/// while an outer call is still running. A `RefCell` would panic there.
 fn with_state<R>(f: impl FnOnce(&mut OverlayState) -> R) -> R {
   STATE.with(|cell| {
     let mut state = cell.get();
@@ -230,9 +232,13 @@ unsafe fn create_highlight_window(rect: RECT) -> Option<HWND> {
   Some(hwnd)
 }
 
+/// Walks the z-order from `pt` and returns the first window worth
+/// picking. `hovered` is the previously highlighted window, passed as
+/// `None` to force a fresh walk.
 fn find_window_under_point(
   pt: POINT,
   state: &OverlayState,
+  hovered: Option<(HWND, RECT)>,
 ) -> Option<(HWND, RECT)> {
   // Below this size a click is far more likely to be aimed at a toolbar
   // control than at a window the user wants maximized.
@@ -253,13 +259,15 @@ fn find_window_under_point(
       // Only revalidate the previously hovered window once the walk actually
       // reaches it, so the three Win32 calls below are skipped entirely when
       // the cursor has moved onto a different window.
-      if root == state.hovered
-        && point_in_rect(pt, state.hovered_rect)
-        && is_valid_window(state.hovered)
-        && IsWindowVisible(state.hovered).as_bool()
-        && !IsIconic(state.hovered).as_bool()
-      {
-        return Some((state.hovered, state.hovered_rect));
+      if let Some((window, rect)) = hovered {
+        if root == window
+          && point_in_rect(pt, rect)
+          && is_valid_window(window)
+          && IsWindowVisible(window).as_bool()
+          && !IsIconic(window).as_bool()
+        {
+          return Some((window, rect));
+        }
       }
 
       if root != state.overlay
@@ -316,12 +324,9 @@ unsafe extern "system" fn overlay_window_proc(
         }
         s.last_cursor = pt;
 
-        match find_window_under_point(pt, s) {
+        match find_window_under_point(pt, s, s.hovered) {
           Some((root, rect)) => {
-            if root == s.hovered
-              && rect == s.hovered_rect
-              && is_valid_window(s.highlight)
-            {
+            if s.hovered == Some((root, rect)) && is_valid_window(s.highlight) {
               return;
             }
 
@@ -335,16 +340,14 @@ unsafe extern "system" fn overlay_window_proc(
                 position_highlight(hwnd, rect, s.highlight_size);
               let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
               s.highlight = hwnd;
-              s.hovered = root;
-              s.hovered_rect = rect;
+              s.hovered = Some((root, rect));
             }
           }
           None => {
             if is_valid_window(s.highlight) {
               let _ = ShowWindow(s.highlight, SW_HIDE);
             }
-            s.hovered = HWND::default();
-            s.hovered_rect = RECT::default();
+            s.hovered = None;
           }
         }
       });
@@ -352,17 +355,15 @@ unsafe extern "system" fn overlay_window_proc(
     }
     WM_LBUTTONUP => {
       let target = with_state(|s| {
-        let target = if is_valid_window(s.hovered) {
-          Some(s.hovered)
-        } else {
-          let mut pt = POINT::default();
-          let _ = GetCursorPos(&mut pt);
-          // Re-probe from an empty cache: a stale `hovered` entry would
-          // let the walk return a window the user did not click.
-          let mut uncached = *s;
-          uncached.hovered = HWND::default();
-          uncached.hovered_rect = RECT::default();
-          find_window_under_point(pt, &uncached).map(|(w, _)| w)
+        let target = match s.hovered {
+          Some((window, _)) if is_valid_window(window) => Some(window),
+          // Re-probe with no cache: a stale `hovered` entry would let the
+          // walk return a window the user did not click.
+          _ => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            find_window_under_point(pt, s, None).map(|(window, _)| window)
+          }
         };
 
         if is_valid_window(s.highlight) {
@@ -405,8 +406,7 @@ unsafe extern "system" fn highlight_window_proc(
       with_state(|s| {
         if s.highlight == hwnd {
           s.highlight = HWND::default();
-          s.hovered = HWND::default();
-          s.hovered_rect = RECT::default();
+          s.hovered = None;
           s.highlight_size = SIZE::default();
         }
       });

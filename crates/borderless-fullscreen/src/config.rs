@@ -5,10 +5,16 @@ use crate::clog;
 const DEFAULT_POLLING_INTERVAL_MS: u64 = 2000;
 const DEFAULT_MIN_WINDOW_SIZE: i32 = 800;
 
+const EXE_SUFFIX: &[u8] = b".exe";
+
 #[inline]
 fn strip_exe_suffix(s: &str) -> &str {
-  if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(".exe") {
-    &s[..s.len() - 4]
+  // Compared as bytes: a name whose last four bytes fall inside a
+  // multi-byte character has no `&str` slice at that offset, and this runs
+  // on every enumerated process name.
+  let tail = &s.as_bytes()[s.len().saturating_sub(EXE_SUFFIX.len())..];
+  if tail.eq_ignore_ascii_case(EXE_SUFFIX) {
+    &s[..s.len() - EXE_SUFFIX.len()]
   } else {
     s
   }
@@ -118,8 +124,7 @@ impl Config {
   }
 
   fn serialize_ini(&self) -> String {
-    let mut out = String::with_capacity(64 + self.process_names.len() * 20);
-    out.push_str("[settings]\nprocess_names = ");
+    let mut out = String::from("[settings]\nprocess_names = ");
     for (i, name) in self.process_names.iter().enumerate() {
       if i > 0 {
         out.push_str(", ");
@@ -157,6 +162,18 @@ mod tests {
     for name in ["gam", "games", "notepad2", "ote"] {
       assert!(!config.is_monitored(name), "{name} should not match");
     }
+  }
+
+  #[test]
+  fn matching_handles_names_that_end_mid_character() {
+    // The last four bytes of each of these names fall inside a multi-byte
+    // character, so a suffix check cannot slice them as `&str`.
+    let config = config_with("sp\u{20ac}le, \u{20ac}le.exe, \u{20ac}xe");
+
+    for name in ["sp\u{20ac}le", "\u{20ac}le", "\u{20ac}xe"] {
+      assert!(config.is_monitored(name), "{name} should be monitored");
+    }
+    assert!(!config.is_monitored("le"), "suffix fragment only");
   }
 
   #[test]

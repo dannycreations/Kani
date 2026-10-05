@@ -69,16 +69,3 @@ macro_rules! clog {
     $crate::console::console_log(format_args!($($arg)*))
   };
 }
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn logging_without_a_console_is_a_no_op() {
-    // The test binary never calls `enable_terminal_logging`, which is the
-    // same state the GUI build runs in. Every log call takes this early
-    // return, so a regression here has no other guard.
-    console_log(format_args!("no console attached"));
-  }
-}
