@@ -10,16 +10,14 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
-use crate::{
-  core::DEFAULT_LOUDNORM_CONFIG,
-  ffmpeg::{
-    progress::{
-      FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
-      VolumeType,
-    },
-    settings::RenderSettings,
-    track::{AudioRenderer, TrackStats},
+use crate::ffmpeg::{
+  progress::{
+    FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
+    VolumeType,
   },
+  settings::RenderSettings,
+  track::{AudioRenderer, TrackStats},
+  DEFAULT_CUSTOM_VFLAGS, DEFAULT_LOUDNORM_CONFIG,
 };
 
 const MIX_STEP_NUM: usize = 1;
@@ -41,12 +39,18 @@ fn deregister_child(handle: &SharedChild) {
   }
 }
 
+fn kill_child(slot: &mut Option<Child>) {
+  if let Some(mut child) = slot.take() {
+    let _ = child.kill();
+  }
+}
+
 pub fn kill_all_children() {
+  // Reached from the panic hook, so a poisoned lock must not panic again.
   if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
     for handle in lock.drain(..) {
-      let mut child_lock = handle.lock().unwrap();
-      if let Some(mut child) = child_lock.take() {
-        let _ = child.kill();
+      if let Ok(mut child_lock) = handle.lock() {
+        kill_child(&mut child_lock);
       }
     }
   }
@@ -78,10 +82,7 @@ impl RenderProcess {
   }
 
   pub fn cancel(&self) {
-    let mut lock = self.child_handle.lock().unwrap();
-    if let Some(mut child) = lock.take() {
-      let _ = child.kill();
-    }
+    kill_child(&mut self.child_handle.lock().unwrap());
   }
 
   fn run_command(
@@ -466,7 +467,8 @@ impl RenderProcess {
       ),
     );
 
-    encode_args.extend(settings.custom_vflags.iter().map(|s| s.to_string()));
+    encode_args
+      .extend(DEFAULT_CUSTOM_VFLAGS.iter().map(|flag| flag.to_string()));
     encode_args.push(output_file.to_string());
 
     self.run_step(

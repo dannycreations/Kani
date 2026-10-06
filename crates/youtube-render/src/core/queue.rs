@@ -60,20 +60,24 @@ fn compute_output_path(input_path: &str, queue: &[QueueItem]) -> String {
       || queue.iter().any(|item| &*item.output_path == path)
   };
 
-  if !taken(&candidate.to_string_lossy()) {
-    return candidate.to_string_lossy().into_owned();
+  let candidate = candidate.to_string_lossy().into_owned();
+  if !taken(&candidate) {
+    return candidate;
   }
 
-  let parent = candidate.parent().unwrap_or_else(|| Path::new(""));
-  let stem = candidate
+  let parent = Path::new(&candidate)
+    .parent()
+    .unwrap_or_else(|| Path::new(""));
+  let stem = Path::new(&candidate)
     .file_stem()
     .and_then(|s| s.to_str())
     .unwrap_or("output");
   let mut suffix = 1;
   loop {
     let candidate = parent.join(format!("{stem}_{suffix}.mp4"));
-    if !taken(&candidate.to_string_lossy()) {
-      return candidate.to_string_lossy().into_owned();
+    let candidate = candidate.to_string_lossy().into_owned();
+    if !taken(&candidate) {
+      return candidate;
     }
     suffix += 1;
   }
@@ -115,7 +119,7 @@ impl AppState {
 
   pub fn add_file(&mut self, path: String) {
     let output_path = compute_output_path(&path, &self.queue);
-    let preset_index = Preset::default_index();
+    let preset_index = 0;
     self.queue.push(QueueItem {
       id: self.next_id,
       input_path: Arc::from(path),
@@ -238,7 +242,6 @@ impl AppState {
       settings: RenderSettings {
         audio: item.settings.clone(),
         ffmpeg_path: Arc::clone(&self.ffmpeg_path),
-        custom_vflags: RenderSettings::default_vflags(),
       },
     };
     self

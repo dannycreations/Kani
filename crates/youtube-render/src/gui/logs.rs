@@ -19,13 +19,8 @@ impl RenderApp {
     state: &AppState,
     cx: &mut Context<Self>,
   ) -> impl IntoElement {
-    let target_id = selected_job_id.or_else(|| {
-      if state.active_processes.is_empty() {
-        None
-      } else {
-        Some(state.active_processes[0].0)
-      }
-    });
+    let target_id = selected_job_id
+      .or_else(|| state.active_processes.first().map(|(id, _)| *id));
 
     let display_job = target_id
       .and_then(|id| state.queue.iter().find(|item| item.id == id).cloned());

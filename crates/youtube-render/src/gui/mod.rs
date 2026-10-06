@@ -3,35 +3,26 @@ mod queue;
 mod settings;
 
 use std::{
-  collections::HashSet,
   sync::{mpsc, Arc, Mutex, OnceLock},
   thread,
-  time::Duration,
 };
 
 use gpui_kit::{
   component::{
-    button::{Button, ButtonVariants as _},
     h_flex,
     input::{InputEvent, InputState},
-    scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
-    v_flex, ActiveTheme, Disableable, Selectable,
+    v_flex, ActiveTheme, Selectable,
   },
   div,
   prelude::*,
-  px, AsyncApp, Context, Entity, FontWeight, IntoElement, ParentElement,
+  App, Context, Entity, Focusable, IntoElement, MouseDownEvent, ParentElement,
   Render, Styled, Window,
 };
-use rfd::{
-  FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel,
-};
+use rfd::{MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
 use crate::{
-  core::{
-    assets::IconName,
-    queue::{AppState, QueueItemStatus},
-  },
+  core::queue::AppState,
   ffmpeg::{kill_all_children, AudioSettings},
 };
 
@@ -83,6 +74,19 @@ pub fn confirm_quit() -> bool {
     )
   } else {
     true
+  }
+}
+
+pub(super) fn blur_on_click_outside(
+  input: Entity<InputState>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) {
+  move |_, window, cx| {
+    if input.read(cx).focus_handle(cx).is_focused(window) {
+      input.update(cx, |input, cx| {
+        input.unselect(window, cx);
+      });
+      window.blur(cx);
+    }
   }
 }
 
@@ -253,243 +257,16 @@ impl Render for RenderApp {
     cx: &mut Context<Self>,
   ) -> impl IntoElement {
     let state = self.state.lock().unwrap();
-
     let is_running = state.is_running;
-    let enable_parallel = state.enable_parallel;
-
-    let width = window.viewport_size().width;
-    let use_two_columns = width > px(600.0);
-
     let view = cx.entity().downgrade();
 
-    let start_stop_btn = if is_running {
-      Button::new("stop")
-        .danger()
-        .icon(IconName::Stop)
-        .compact()
-        .tooltip("Stop")
-        .on_click({
-          let view = view.clone();
-          move |_, _, cx| {
-            if confirm_action(
-              "Confirm Stop",
-              "Rendering is currently in progress. Are you sure you want to stop?",
-            ) {
-              if let Some(view) = view.upgrade() {
-                view.update(cx, |this, cx| {
-                  this.state.lock().unwrap().stop();
-                  cx.notify();
-                });
-              }
-            }
-          }
-        })
-    } else {
-      let has_pending = state.queue.iter().any(|item| item.status.is_pending());
-      Button::new("start")
-        .success()
-        .icon(IconName::Play)
-        .compact()
-        .tooltip("Start")
-        .disabled(!has_pending)
-        .on_click({
-          let view = view.clone();
-          move |_, _, cx| {
-            let view_weak = view.clone();
-            if let Some(view) = view.upgrade() {
-              view.update(cx, |this, cx| {
-                AppState::start(&this.state);
-
-                // Spawn a timer loop to refresh the window while running
-                let state_clone = Arc::clone(&this.state);
-                cx.spawn(|_, cx: &mut AsyncApp| {
-                  let cx = cx.clone();
-                  async move {
-                    loop {
-                      let (is_running, active_id) = {
-                        let state = state_clone.lock().unwrap();
-                        let active_id =
-                          state.active_processes.last().map(|(id, _)| *id);
-                        (state.is_running, active_id)
-                      };
-
-                      cx.update(|cx| {
-                        if let Some(view) = view_weak.upgrade() {
-                          view.update(cx, |this, cx| {
-                            if let Some(id) = active_id {
-                              if this.selected_job_id != Some(id) {
-                                this.selected_job_id = Some(id);
-                                cx.notify();
-                              }
-                            }
-                          });
-                        }
-                        cx.refresh_windows();
-                      });
-
-                      if !is_running {
-                        break;
-                      }
-                      cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
-                    }
-                  }
-                })
-                .detach();
-
-                cx.notify();
-              });
-            }
-          }
-        })
+    // Only the visible tab is built; the queue panel alone walks every item.
+    let panel = match self.active_tab {
+      AppTab::Queue => self.render_queue_panel(window, &state, &view, cx),
+      AppTab::Settings => self
+        .render_settings_panel(is_running, state.enable_parallel, &view)
+        .into_any_element(),
     };
-
-    let add_files_btn = Button::new("add_files")
-      .icon(IconName::Plus)
-      .compact()
-      .tooltip("Add Video Files")
-      .on_click({
-        let view = view.clone();
-        move |_, _, cx| {
-          let view = view.clone();
-          cx.spawn(|cx: &mut AsyncApp| {
-            let cx = cx.clone();
-            async move {
-              let files = FileDialog::new()
-                .add_filter(
-                  "Video Files",
-                  &["mkv", "mp4", "avi", "mov", "webm", "flv"],
-                )
-                .pick_files();
-              if let Some(files) = files {
-                cx.update(|cx| {
-                  if let Some(view) = view.upgrade() {
-                    view.update(cx, |this, cx| {
-                      let mut state = this.state.lock().unwrap();
-                      for file in files {
-                        state.add_file(file.to_string_lossy().to_string());
-                      }
-                      cx.notify();
-                    });
-                  }
-                });
-              }
-            }
-          })
-          .detach();
-        }
-      });
-
-    let has_completed = state
-      .queue
-      .iter()
-      .any(|item| matches!(item.status, QueueItemStatus::Completed { .. }));
-    let has_items = !state.queue.is_empty();
-
-    let clear_completed_btn = Button::new("clear_completed")
-      .warning()
-      .icon(IconName::Check)
-      .compact()
-      .tooltip("Clear Completed")
-      .disabled(!has_completed)
-      .on_click({
-        let view = view.clone();
-        move |_, _, cx| {
-          if let Some(view) = view.upgrade() {
-            view.update(cx, |this, cx| {
-              this.state.lock().unwrap().clear_completed();
-              let queue_ids: HashSet<usize> = this
-                .state
-                .lock()
-                .unwrap()
-                .queue
-                .iter()
-                .map(|item| item.id)
-                .collect();
-              this.item_inputs.retain(|(id, _)| queue_ids.contains(id));
-              if let Some(expanded_id) = this.expanded_job_id {
-                if !queue_ids.contains(&expanded_id) {
-                  this.expanded_job_id = None;
-                }
-              }
-              if let Some(selected_id) = this.selected_job_id {
-                if !queue_ids.contains(&selected_id) {
-                  this.selected_job_id = None;
-                }
-              }
-              cx.notify();
-            });
-          }
-        }
-      });
-
-    let clear_all_btn = Button::new("clear_all")
-      .danger()
-      .icon(IconName::Delete)
-      .compact()
-      .tooltip("Clear All")
-      .disabled(!has_items)
-      .on_click({
-        let view = view.clone();
-        move |_, _, cx| {
-          if let Some(view) = view.upgrade() {
-            view.update(cx, |this, cx| {
-              this.state.lock().unwrap().clear_all();
-              this.item_inputs.clear();
-              this.expanded_job_id = None;
-              this.selected_job_id = None;
-              cx.notify();
-            });
-          }
-        }
-      });
-
-    let mut queue_items_elements = Vec::new();
-    if state.queue.is_empty() {
-      queue_items_elements.push(
-        div()
-          .text_color(cx.theme().muted_foreground)
-          .child("Queue is empty. Add video files to begin.")
-          .into_any_element(),
-      );
-    } else {
-      let queue_len = state.queue.len();
-      for (item_idx, item) in state.queue.iter().enumerate() {
-        let queue_item_el = self
-          .render_queue_item(item, item_idx, queue_len, is_running, &view, cx);
-
-        queue_items_elements.push(queue_item_el.into_any_element());
-      }
-    }
-
-    let left_col = v_flex()
-      .gap_2()
-      .h_full()
-      .child(
-        div()
-          .font_weight(FontWeight::BOLD)
-          .text_lg()
-          .child("Job Queue"),
-      )
-      .child(
-        h_flex()
-          .gap_2()
-          .child(add_files_btn)
-          .child(start_stop_btn)
-          .child(clear_completed_btn)
-          .child(clear_all_btn),
-      )
-      .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
-      .child(
-        v_flex()
-          .flex_1()
-          .overflow_y_scrollbar()
-          .gap_2()
-          .children(queue_items_elements),
-      );
-
-    let right_col = self.render_logs_panel(self.selected_job_id, &state, cx);
 
     let status_indicator = if is_running {
       div().text_color(cx.theme().info).child("Running")
@@ -497,97 +274,53 @@ impl Render for RenderApp {
       div().text_color(cx.theme().muted_foreground).child("Idle")
     };
 
-    let app_tab_bar = h_flex()
-      .w_full()
-      .justify_between()
-      .items_center()
-      .child(
-        TabBar::new("app_tabs")
-          .underline()
-          .child(
-            Tab::new()
-              .label("Queue")
-              .selected(self.active_tab == AppTab::Queue)
-              .on_click({
-                let view = view.clone();
-                move |_, _, cx| {
-                  if let Some(view) = view.upgrade() {
-                    view.update(cx, |this, cx| {
-                      this.active_tab = AppTab::Queue;
-                      cx.notify();
-                    });
-                  }
-                }
-              }),
-          )
-          .child(
-            Tab::new()
-              .label("Settings")
-              .selected(self.active_tab == AppTab::Settings)
-              .on_click({
-                let view = view.clone();
-                move |_, _, cx| {
-                  if let Some(view) = view.upgrade() {
-                    view.update(cx, |this, cx| {
-                      this.active_tab = AppTab::Settings;
-                      cx.notify();
-                    });
-                  }
-                }
-              }),
-          ),
-      )
-      .child(status_indicator);
-
-    let queue_panel = if use_two_columns {
-      div()
-        .flex()
-        .flex_row()
-        .w_full()
-        .flex_grow(1.0)
-        .h_full()
-        .gap_4()
-        .child(div().flex().flex_col().flex_1().h_full().child(left_col))
-        .child(div().flex().flex_col().flex_1().h_full().child(right_col))
-    } else {
-      div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .flex_grow(1.0)
-        .h_full()
-        .gap_4()
-        .child(
-          div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .h(px(250.0))
-            .child(left_col),
-        )
-        .child(
-          div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .flex_grow(1.0)
-            .h_full()
-            .child(right_col),
-        )
-    };
-
-    let panel = match self.active_tab {
-      AppTab::Queue => queue_panel.into_any_element(),
-      AppTab::Settings => self
-        .render_settings_panel(is_running, enable_parallel, &view)
-        .into_any_element(),
-    };
-
     v_flex()
       .p_4()
       .gap_4()
       .size_full()
-      .child(app_tab_bar)
+      .child(
+        h_flex()
+          .w_full()
+          .justify_between()
+          .items_center()
+          .child(
+            TabBar::new("app_tabs")
+              .underline()
+              .child(
+                Tab::new()
+                  .label("Queue")
+                  .selected(self.active_tab == AppTab::Queue)
+                  .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                      if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                          this.active_tab = AppTab::Queue;
+                          cx.notify();
+                        });
+                      }
+                    }
+                  }),
+              )
+              .child(
+                Tab::new()
+                  .label("Settings")
+                  .selected(self.active_tab == AppTab::Settings)
+                  .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                      if let Some(view) = view.upgrade() {
+                        view.update(cx, |this, cx| {
+                          this.active_tab = AppTab::Settings;
+                          cx.notify();
+                        });
+                      }
+                    }
+                  }),
+              ),
+          )
+          .child(status_indicator),
+      )
       .child(panel)
   }
 }

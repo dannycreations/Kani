@@ -1,4 +1,4 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{collections::HashSet, fs, path::Path, sync::Arc, time::Duration};
 
 use gpui_kit::{
   component::{
@@ -7,25 +7,321 @@ use gpui_kit::{
     h_flex,
     input::{Input, InputState},
     progress::Progress,
+    scroll::ScrollableElement as _,
     v_flex, ActiveTheme, Disableable,
   },
   div,
   prelude::*,
-  px, AnyElement, AsyncApp, Context, Entity, Focusable, IntoElement,
-  ParentElement, SharedString, Styled, WeakEntity,
+  px, AnyElement, AsyncApp, Context, Entity, FontWeight, IntoElement,
+  ParentElement, SharedString, Styled, WeakEntity, Window,
 };
 use rfd::FileDialog;
 
 use crate::{
   core::{
     assets::IconName,
-    queue::{QueueItem, QueueItemStatus},
+    queue::{AppState, QueueItem, QueueItemStatus},
   },
   ffmpeg::{AudioSettings, Preset},
-  gui::{confirm_action, RenderApp},
+  gui::{blur_on_click_outside, confirm_action, RenderApp},
 };
 
 impl RenderApp {
+  pub(super) fn render_queue_panel(
+    &self,
+    window: &Window,
+    state: &AppState,
+    view: &WeakEntity<Self>,
+    cx: &mut Context<Self>,
+  ) -> AnyElement {
+    let is_running = state.is_running;
+    let use_two_columns = window.viewport_size().width > px(600.0);
+
+    let start_stop_btn = if is_running {
+      Button::new("stop")
+        .danger()
+        .icon(IconName::Stop)
+        .compact()
+        .tooltip("Stop")
+        .on_click({
+          let view = view.clone();
+          move |_, _, cx| {
+            if confirm_action(
+              "Confirm Stop",
+              "Rendering is currently in progress. Are you sure you want to stop?",
+            ) {
+              if let Some(view) = view.upgrade() {
+                view.update(cx, |this, cx| {
+                  this.state.lock().unwrap().stop();
+                  cx.notify();
+                });
+              }
+            }
+          }
+        })
+    } else {
+      let has_pending = state.queue.iter().any(|item| item.status.is_pending());
+      Button::new("start")
+        .success()
+        .icon(IconName::Play)
+        .compact()
+        .tooltip("Start")
+        .disabled(!has_pending)
+        .on_click({
+          let view = view.clone();
+          move |_, _, cx| {
+            let view_weak = view.clone();
+            if let Some(view) = view.upgrade() {
+              view.update(cx, |this, cx| {
+                AppState::start(&this.state);
+
+                // Spawn a timer loop to refresh the window while running
+                let state_clone = Arc::clone(&this.state);
+                cx.spawn(|_, cx: &mut AsyncApp| {
+                  let cx = cx.clone();
+                  async move {
+                    loop {
+                      let (is_running, active_id) = {
+                        let state = state_clone.lock().unwrap();
+                        let active_id =
+                          state.active_processes.last().map(|(id, _)| *id);
+                        (state.is_running, active_id)
+                      };
+
+                      cx.update(|cx| {
+                        if let Some(view) = view_weak.upgrade() {
+                          view.update(cx, |this, cx| {
+                            if let Some(id) = active_id {
+                              if this.selected_job_id != Some(id) {
+                                this.selected_job_id = Some(id);
+                                cx.notify();
+                              }
+                            }
+                          });
+                        }
+                        cx.refresh_windows();
+                      });
+
+                      if !is_running {
+                        break;
+                      }
+                      cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    }
+                  }
+                })
+                .detach();
+
+                cx.notify();
+              });
+            }
+          }
+        })
+    };
+
+    let add_files_btn = Button::new("add_files")
+      .icon(IconName::Plus)
+      .compact()
+      .tooltip("Add Video Files")
+      .on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+          let view = view.clone();
+          cx.spawn(|cx: &mut AsyncApp| {
+            let cx = cx.clone();
+            async move {
+              let files = FileDialog::new()
+                .add_filter(
+                  "Video Files",
+                  &["mkv", "mp4", "avi", "mov", "webm", "flv"],
+                )
+                .pick_files();
+              if let Some(files) = files {
+                cx.update(|cx| {
+                  if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| {
+                      let mut state = this.state.lock().unwrap();
+                      for file in files {
+                        state.add_file(file.to_string_lossy().to_string());
+                      }
+                      cx.notify();
+                    });
+                  }
+                });
+              }
+            }
+          })
+          .detach();
+        }
+      });
+
+    let has_completed = state
+      .queue
+      .iter()
+      .any(|item| matches!(item.status, QueueItemStatus::Completed { .. }));
+
+    let clear_completed_btn = Button::new("clear_completed")
+      .warning()
+      .icon(IconName::Check)
+      .compact()
+      .tooltip("Clear Completed")
+      .disabled(!has_completed)
+      .on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+          if let Some(view) = view.upgrade() {
+            view.update(cx, |this, cx| {
+              let queue_ids: HashSet<usize> = {
+                let mut state = this.state.lock().unwrap();
+                state.clear_completed();
+                state.queue.iter().map(|item| item.id).collect()
+              };
+              this.item_inputs.retain(|(id, _)| queue_ids.contains(id));
+              if let Some(expanded_id) = this.expanded_job_id {
+                if !queue_ids.contains(&expanded_id) {
+                  this.expanded_job_id = None;
+                }
+              }
+              if let Some(selected_id) = this.selected_job_id {
+                if !queue_ids.contains(&selected_id) {
+                  this.selected_job_id = None;
+                }
+              }
+              cx.notify();
+            });
+          }
+        }
+      });
+
+    let clear_all_btn = Button::new("clear_all")
+      .danger()
+      .icon(IconName::Delete)
+      .compact()
+      .tooltip("Clear All")
+      .disabled(state.queue.is_empty())
+      .on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+          if let Some(view) = view.upgrade() {
+            view.update(cx, |this, cx| {
+              this.state.lock().unwrap().clear_all();
+              this.item_inputs.clear();
+              this.expanded_job_id = None;
+              this.selected_job_id = None;
+              cx.notify();
+            });
+          }
+        }
+      });
+
+    let mut queue_items_elements = Vec::new();
+    if state.queue.is_empty() {
+      queue_items_elements.push(
+        div()
+          .text_color(cx.theme().muted_foreground)
+          .child("Queue is empty. Add video files to begin.")
+          .into_any_element(),
+      );
+    } else {
+      let queue_len = state.queue.len();
+      for (item_idx, item) in state.queue.iter().enumerate() {
+        queue_items_elements.push(
+          self
+            .render_queue_item(item, item_idx, queue_len, is_running, view, cx)
+            .into_any_element(),
+        );
+      }
+    }
+
+    let left_col = v_flex()
+      .gap_2()
+      .h_full()
+      .child(
+        div()
+          .font_weight(FontWeight::BOLD)
+          .text_lg()
+          .child("Job Queue"),
+      )
+      .child(
+        h_flex()
+          .gap_2()
+          .child(add_files_btn)
+          .child(start_stop_btn)
+          .child(clear_completed_btn)
+          .child(clear_all_btn),
+      )
+      .child(div().h(px(1.0)).w_full().bg(cx.theme().border))
+      .child(
+        v_flex()
+          .flex_1()
+          .overflow_y_scrollbar()
+          .gap_2()
+          .children(queue_items_elements),
+      );
+
+    let right_col = self.render_logs_panel(self.selected_job_id, state, cx);
+
+    if use_two_columns {
+      div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .flex_grow(1.0)
+        .h_full()
+        .gap_4()
+        .child(div().flex().flex_col().flex_1().h_full().child(left_col))
+        .child(div().flex().flex_col().flex_1().h_full().child(right_col))
+        .into_any_element()
+    } else {
+      div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .flex_grow(1.0)
+        .h_full()
+        .gap_4()
+        .child(
+          div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(250.0))
+            .child(left_col),
+        )
+        .child(
+          div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .flex_grow(1.0)
+            .h_full()
+            .child(right_col),
+        )
+        .into_any_element()
+    }
+  }
+
+  fn swap_tracks(
+    &mut self,
+    id: usize,
+    track_idx: usize,
+    other_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    {
+      let mut state = self.state.lock().unwrap();
+      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+        if other_idx < item.settings.tracks.len() {
+          item.settings.tracks.swap(track_idx, other_idx);
+        }
+      }
+    }
+    self.rebuild_input_states(id, window, cx);
+    cx.notify();
+  }
+
   pub(super) fn render_queue_item(
     &self,
     item: &QueueItem,
@@ -252,7 +548,7 @@ impl RenderApp {
       );
 
       if let Some(track_input) = inputs.get(track_idx) {
-        let state = track_input.clone();
+        let blur_on_click_outside = blur_on_click_outside(track_input.clone());
         row = row.child(
           div()
             .id(SharedString::from(format!(
@@ -261,14 +557,7 @@ impl RenderApp {
             )))
             .w(px(50.0))
             .child(Input::new(track_input).disabled(controls_disabled))
-            .on_mouse_down_out(move |_, window, cx| {
-              if state.read(cx).focus_handle(cx).is_focused(window) {
-                state.update(cx, |input, cx| {
-                  input.unselect(window, cx);
-                });
-                window.blur(cx);
-              }
-            }),
+            .on_mouse_down_out(blur_on_click_outside),
         );
       }
 
@@ -283,21 +572,12 @@ impl RenderApp {
           .tooltip("Move Track Up")
           .disabled(controls_disabled || is_first)
           .on_click(move |_, window, cx| {
+            if track_idx == 0 {
+              return;
+            }
             if let Some(view) = item_view_track_up.upgrade() {
               view.update(cx, |this, cx| {
-                {
-                  let mut state = this.state.lock().unwrap();
-                  if let Some(item) =
-                    state.queue.iter_mut().find(|item| item.id == id)
-                  {
-                    if track_idx > 0 {
-                      item.settings.tracks.swap(track_idx, track_idx - 1);
-                    }
-                  }
-                }
-                // Rebuild inputs to match the new track order
-                this.rebuild_input_states(id, window, cx);
-                cx.notify();
+                this.swap_tracks(id, track_idx, track_idx - 1, window, cx);
               });
             }
           }),
@@ -314,19 +594,7 @@ impl RenderApp {
           .on_click(move |_, window, cx| {
             if let Some(view) = item_view_track_down.upgrade() {
               view.update(cx, |this, cx| {
-                {
-                  let mut state = this.state.lock().unwrap();
-                  if let Some(item) =
-                    state.queue.iter_mut().find(|item| item.id == id)
-                  {
-                    if track_idx + 1 < item.settings.tracks.len() {
-                      item.settings.tracks.swap(track_idx, track_idx + 1);
-                    }
-                  }
-                }
-                // Rebuild inputs to match the new track order
-                this.rebuild_input_states(id, window, cx);
-                cx.notify();
+                this.swap_tracks(id, track_idx, track_idx + 1, window, cx);
               });
             }
           }),

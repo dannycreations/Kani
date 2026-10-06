@@ -76,10 +76,6 @@ thread_local! {
   static STATE: Cell<OverlayState> = Cell::new(OverlayState::default());
 }
 
-/// Runs `f` on a copy of the state and stores the result back. The copy
-/// is what makes re-entry safe: `DestroyWindow` sends `WM_DESTROY`
-/// synchronously, so both window procedures below re-enter this function
-/// while an outer call is still running. A `RefCell` would panic there.
 fn with_state<R>(f: impl FnOnce(&mut OverlayState) -> R) -> R {
   STATE.with(|cell| {
     let mut state = cell.get();
@@ -232,9 +228,6 @@ unsafe fn create_highlight_window(rect: RECT) -> Option<HWND> {
   Some(hwnd)
 }
 
-/// Walks the z-order from `pt` and returns the first window worth
-/// picking. `hovered` is the previously highlighted window, passed as
-/// `None` to force a fresh walk.
 fn find_window_under_point(
   pt: POINT,
   state: &OverlayState,

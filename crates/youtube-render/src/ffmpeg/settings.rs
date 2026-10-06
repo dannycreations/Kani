@@ -1,14 +1,8 @@
-use std::{
-  fmt::Write as _,
-  sync::{Arc, LazyLock},
-};
+use std::{fmt::Write as _, sync::Arc};
 
 use anyhow::{anyhow, Result};
 
-use crate::{
-  core::DEFAULT_CUSTOM_VFLAGS,
-  ffmpeg::{ini::IniDocument, preset::Preset},
-};
+use crate::ffmpeg::{ini::IniDocument, preset::Preset};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackConfig {
@@ -29,7 +23,7 @@ impl AudioSettings {
       .tracks
       .iter()
       .map(|t| TrackConfig {
-        name: Arc::clone(&t.name),
+        name: Arc::from(t.name),
         index: t.index,
         offset: t.default_offset,
       })
@@ -98,22 +92,8 @@ impl AudioSettings {
   }
 }
 
-static DEFAULT_VFLAGS: LazyLock<Arc<[Arc<str>]>> = LazyLock::new(|| {
-  DEFAULT_CUSTOM_VFLAGS
-    .iter()
-    .map(|&flag| Arc::from(flag))
-    .collect()
-});
-
 #[derive(Debug, Clone)]
 pub struct RenderSettings {
   pub audio: AudioSettings,
   pub ffmpeg_path: Arc<str>,
-  pub custom_vflags: Arc<[Arc<str>]>,
-}
-
-impl RenderSettings {
-  pub fn default_vflags() -> Arc<[Arc<str>]> {
-    Arc::clone(&DEFAULT_VFLAGS)
-  }
 }
