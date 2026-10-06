@@ -10,4 +10,3 @@ anyhow.workspace = true
 ctrlc.workspace = true
 gpui-kit = "0.6.6"
 rfd = "0.17.2"
-serde = { version = "1.0.229", features = ["derive"] }

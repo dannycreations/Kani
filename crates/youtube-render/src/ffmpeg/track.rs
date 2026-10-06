@@ -1,8 +1,11 @@
-use serde::{Deserialize, Serialize};
-
 use crate::ffmpeg::{settings::TrackConfig, AudioSettings};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+const MIN_GAIN_DB: f32 = -100.0;
+const MAX_GAIN_DB: f32 = 30.0;
+const SILENCE_FLOOR_DB: f32 = -45.0;
+const SILENCE_REFERENCE_DB: f32 = -20.0;
+
+#[derive(Debug, Default, Clone)]
 pub struct TrackStats {
   pub mean: Option<f32>,
   pub peak: Option<f32>,
@@ -11,45 +14,26 @@ pub struct TrackStats {
 pub struct AudioRenderer;
 
 impl AudioRenderer {
-  pub fn clamp(val: f32, min: f32, max: f32) -> f32 {
-    if val < min {
-      min
-    } else if val > max {
-      max
-    } else {
-      val
-    }
-  }
-
-  pub fn build_mix_filter_complex(
+  fn build_mix_filter_complex(
     tracks: &[TrackConfig],
     volumes: &[f32],
     loudnorm_suffix: &str,
   ) -> String {
+    let mut inputs = String::new();
     let mut filter_parts = Vec::new();
-    let mut amix_inputs = Vec::new();
     for (i, track) in tracks.iter().enumerate() {
-      let idx = track.index;
       let label = track.name.to_lowercase();
       let vol = volumes.get(i).copied().unwrap_or(0.0);
-      filter_parts.push(format!("[0:a:{idx}]volume={vol:.1}dB[{label}]"));
-      amix_inputs.push(format!("[{label}]"));
+      filter_parts
+        .push(format!("[0:a:{}]volume={vol:.1}dB[{label}]", track.index));
+      inputs.push_str(&format!("[{label}]"));
     }
-    let amix_inputs_str = amix_inputs.join("");
-    let n_inputs = tracks.len();
-    let weights = vec!["1"; n_inputs].join(" ");
-    let suffix = if loudnorm_suffix.contains("[out]") {
-      loudnorm_suffix.to_string()
-    } else {
-      format!("{loudnorm_suffix}[out]")
-    };
+
     format!(
-      "{};{}amix=inputs={}:weights='{}':dropout_transition=2:normalize=0[mixed];[mixed]{}",
+      "{};{inputs}amix=inputs={}:weights='{}':dropout_transition=2:normalize=0[mixed];[mixed]{loudnorm_suffix}[out]",
       filter_parts.join(";"),
-      amix_inputs_str,
-      n_inputs,
-      weights,
-      suffix
+      tracks.len(),
+      vec!["1"; tracks.len()].join(" "),
     )
   }
 
@@ -59,18 +43,23 @@ impl AudioRenderer {
     volumes: Option<&[f32]>,
     loudnorm_config: &str,
   ) {
-    if let Some(vols) = volumes {
-      let mix_filter =
-        Self::build_mix_filter_complex(tracks, vols, loudnorm_config);
-      args.push("-filter_complex".to_string());
-      args.push(mix_filter);
-      args.push("-map".to_string());
-      args.push("0:v:0".to_string());
-      args.push("-map".to_string());
-      args.push("[out]".to_string());
-    } else {
-      args.push("-af".to_string());
-      args.push(loudnorm_config.to_string());
+    match volumes {
+      Some(vols) => {
+        args.push("-filter_complex".to_string());
+        args.push(Self::build_mix_filter_complex(
+          tracks,
+          vols,
+          loudnorm_config,
+        ));
+        args.push("-map".to_string());
+        args.push("0:v:0".to_string());
+        args.push("-map".to_string());
+        args.push("[out]".to_string());
+      }
+      None => {
+        args.push("-af".to_string());
+        args.push(loudnorm_config.to_string());
+      }
     }
   }
 
@@ -78,55 +67,43 @@ impl AudioRenderer {
     settings: &AudioSettings,
     track_stats: &[TrackStats],
   ) -> Option<Vec<f32>> {
-    let tracks = &settings.tracks;
-    if tracks.is_empty() {
+    if settings.tracks.is_empty() {
       return None;
     }
 
-    let threshold = -45.0;
+    let mut volumes = Vec::with_capacity(settings.tracks.len());
+    let mut reference_level: Option<f32> = None;
+    let mut previous_offset = 0.0;
 
-    let all_means_present = tracks
-      .iter()
-      .enumerate()
-      .all(|(i, _)| i < track_stats.len() && track_stats[i].mean.is_some());
+    for (i, track) in settings.tracks.iter().enumerate() {
+      let mean = track_stats.get(i)?.mean?;
+      let offset_gain = track.offset.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
 
-    if !all_means_present {
-      return None;
-    }
-
-    let mut computed_vols = vec![0.0_f32; tracks.len()];
-    let mut ref_posts = vec![0.0_f32; tracks.len()];
-
-    // First track: apply its offset directly
-    let first_offset = tracks[0].offset;
-    let vol = Self::clamp(first_offset, -100.0, 30.0);
-    let mean = track_stats[0].mean.unwrap();
-    let ref_post = if mean >= threshold {
-      mean + vol
-    } else {
-      -20.0 + vol
-    };
-    computed_vols[0] = vol;
-    ref_posts[0] = ref_post;
-
-    // Remaining tracks: each relative to the previous
-    for i in 1..tracks.len() {
-      let offset = tracks[i].offset;
-      let prev_offset = tracks[i - 1].offset;
-      let prev_ref_post = ref_posts[i - 1];
-      let mean = track_stats[i].mean.unwrap();
-      let target = prev_ref_post + (offset - prev_offset);
-      let (vol, ref_post) = if mean >= threshold {
-        let v = Self::clamp(target - mean, -100.0, 30.0);
-        (v, mean + v)
-      } else {
-        let v = Self::clamp(offset, -100.0, 30.0);
-        (v, target)
+      let (gain, new_reference) = match reference_level {
+        None => {
+          let level = if mean >= SILENCE_FLOOR_DB {
+            mean
+          } else {
+            SILENCE_REFERENCE_DB
+          };
+          (offset_gain, level + offset_gain)
+        }
+        Some(reference) => {
+          let target = reference + (track.offset - previous_offset);
+          if mean >= SILENCE_FLOOR_DB {
+            let gain = (target - mean).clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+            (gain, mean + gain)
+          } else {
+            (offset_gain, target)
+          }
+        }
       };
-      computed_vols[i] = vol;
-      ref_posts[i] = ref_post;
+
+      volumes.push(gain);
+      reference_level = Some(new_reference);
+      previous_offset = track.offset;
     }
 
-    Some(computed_vols)
+    Some(volumes)
   }
 }

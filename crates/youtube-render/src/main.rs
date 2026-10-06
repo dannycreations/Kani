@@ -14,7 +14,7 @@ use gpui_kit::{
   component::{init as init_gpui_component, Root},
   px, size, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 };
-use gui::{confirm_quit, set_active_app_state, RenderApp};
+use gui::{confirm_quit, RenderApp};
 
 fn main() {
   // Set up panic hook to ensure spawned children are killed if we panic
@@ -36,10 +36,11 @@ fn main() {
   app.run(move |cx| {
     init_gpui_component(cx);
 
-    let bounds = Bounds::centered(None, size(px(1280.0), px(720.0)), cx);
+    let window_size = size(px(1280.0), px(720.0));
+    let bounds = Bounds::centered(None, window_size, cx);
     let options = WindowOptions {
       window_bounds: Some(WindowBounds::Windowed(bounds)),
-      window_min_size: Some(size(px(1280.0), px(720.0))),
+      window_min_size: Some(window_size),
       titlebar: Some(TitlebarOptions {
         title: Some("YouTube Video Renderer".into()),
         ..Default::default()
@@ -49,8 +50,6 @@ fn main() {
 
     cx.open_window(options, |window, cx| {
       let view = cx.new(|cx| RenderApp::new(window, cx));
-      let state_arc = view.read(cx).state();
-      set_active_app_state(state_arc.clone());
 
       window.on_window_should_close(cx, move |_, _| confirm_quit());
 

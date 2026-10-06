@@ -4,7 +4,6 @@ mod settings;
 
 use std::{
   collections::HashSet,
-  path::Path,
   sync::{mpsc, Arc, Mutex, OnceLock},
   thread,
   time::Duration,
@@ -42,33 +41,17 @@ pub enum AppTab {
   Settings,
 }
 
-pub struct TrackInputState {
-  pub input_state: Entity<InputState>,
-}
-
-pub struct ItemInputStates {
-  pub tracks: Vec<TrackInputState>,
-}
-
 pub struct RenderApp {
   pub(super) state: Arc<Mutex<AppState>>,
   pub(super) selected_job_id: Option<usize>,
   pub(super) expanded_job_id: Option<usize>,
   pub(super) active_tab: AppTab,
-
-  // Per-video config input states mapped by job ID
-  pub(super) item_inputs: Vec<(usize, ItemInputStates)>,
-
-  // Global config input state
+  pub(super) item_inputs: Vec<(usize, Vec<Entity<InputState>>)>,
   pub(super) ffmpeg_path_state: Entity<InputState>,
   pub(super) parallel_jobs_state: Entity<InputState>,
 }
 
-pub static ACTIVE_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
-
-pub fn set_active_app_state(state: Arc<Mutex<AppState>>) {
-  let _ = ACTIVE_STATE.set(state);
-}
+static ACTIVE_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 
 pub fn confirm_action(title: &str, description: &str) -> bool {
   let (tx, rx) = mpsc::channel();
@@ -104,12 +87,9 @@ pub fn confirm_quit() -> bool {
 }
 
 impl RenderApp {
-  pub fn state(&self) -> &Arc<Mutex<AppState>> {
-    &self.state
-  }
-
   pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
     let state = Arc::new(Mutex::new(AppState::new()));
+    let _ = ACTIVE_STATE.set(Arc::clone(&state));
 
     let ffmpeg_path_state =
       cx.new(|cx| InputState::new(window, cx).default_value("ffmpeg"));
@@ -150,20 +130,19 @@ impl RenderApp {
     }
   }
 
-  pub(super) fn get_inputs(&self, id: usize) -> Option<&ItemInputStates> {
+  pub(super) fn get_inputs(
+    &self,
+    id: usize,
+  ) -> Option<&Vec<Entity<InputState>>> {
     self
       .item_inputs
       .iter()
-      .find(|(k, _)| *k == id)
-      .map(|(_, v)| v)
-  }
-
-  pub(super) fn has_inputs(&self, id: usize) -> bool {
-    self.item_inputs.iter().any(|(k, _)| *k == id)
+      .find(|(job_id, _)| *job_id == id)
+      .map(|(_, inputs)| inputs)
   }
 
   pub(super) fn remove_inputs(&mut self, id: usize) {
-    self.item_inputs.retain(|(k, _)| *k != id);
+    self.item_inputs.retain(|(job_id, _)| *job_id != id);
   }
 
   pub(super) fn rebuild_input_states(
@@ -193,20 +172,17 @@ impl RenderApp {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    if self.has_inputs(id) {
+    if self.get_inputs(id).is_some() {
       return;
     }
 
-    let mut tracks_vec = Vec::new();
+    let mut inputs = Vec::new();
 
     for (track_idx, track_config) in settings.tracks.iter().enumerate() {
-      let val = track_config.offset;
+      let offset = track_config.offset;
       let input_state = cx.new(|cx| {
-        InputState::new(window, cx).default_value(format!("{:.0}", val))
+        InputState::new(window, cx).default_value(format!("{:.0}", offset))
       });
-
-      // Capture default offset for the blur/reset fallback
-      let default_offset = val;
 
       // Subscribe to input changes/blur
       cx.subscribe_in(
@@ -229,7 +205,7 @@ impl RenderApp {
             }
           }
           InputEvent::Blur | InputEvent::PressEnter { .. } => {
-            let mut current_offset = default_offset;
+            let mut current_offset = offset;
             {
               let state = this.state.lock().unwrap();
               if let Some(item) = state.queue.iter().find(|item| item.id == id)
@@ -240,8 +216,8 @@ impl RenderApp {
               }
             }
             if let Some(inputs) = this.get_inputs(id) {
-              if let Some(track_input) = inputs.tracks.get(track_idx) {
-                track_input.input_state.update(cx, |input, cx| {
+              if let Some(input) = inputs.get(track_idx) {
+                input.update(cx, |input, cx| {
                   input.set_value(
                     format!("{:.0}", current_offset),
                     _window,
@@ -257,12 +233,10 @@ impl RenderApp {
       )
       .detach();
 
-      tracks_vec.push(TrackInputState { input_state });
+      inputs.push(input_state);
     }
 
-    self
-      .item_inputs
-      .push((id, ItemInputStates { tracks: tracks_vec }));
+    self.item_inputs.push((id, inputs));
   }
 }
 
@@ -281,16 +255,12 @@ impl Render for RenderApp {
     let state = self.state.lock().unwrap();
 
     let is_running = state.is_running;
-    let _selected_id = self.selected_job_id;
+    let enable_parallel = state.enable_parallel;
 
     let width = window.viewport_size().width;
     let use_two_columns = width > px(600.0);
 
     let view = cx.entity().downgrade();
-
-    let enable_parallel = state.enable_parallel;
-    let settings_panel =
-      self.render_settings_panel(is_running, enable_parallel, &view);
 
     let start_stop_btn = if is_running {
       Button::new("stop")
@@ -315,10 +285,7 @@ impl Render for RenderApp {
           }
         })
     } else {
-      let has_pending = state
-        .queue
-        .iter()
-        .any(|item| matches!(item.status, QueueItemStatus::Pending));
+      let has_pending = state.queue.iter().any(|item| item.status.is_pending());
       Button::new("start")
         .success()
         .icon(IconName::Play)
@@ -331,8 +298,7 @@ impl Render for RenderApp {
             let view_weak = view.clone();
             if let Some(view) = view.upgrade() {
               view.update(cx, |this, cx| {
-                let state_clone = Arc::clone(&this.state);
-                this.state.lock().unwrap().start(state_clone);
+                AppState::start(&this.state);
 
                 // Spawn a timer loop to refresh the window while running
                 let state_clone = Arc::clone(&this.state);
@@ -488,30 +454,10 @@ impl Render for RenderApp {
           .into_any_element(),
       );
     } else {
+      let queue_len = state.queue.len();
       for (item_idx, item) in state.queue.iter().enumerate() {
-        let is_selected = self.selected_job_id == Some(item.id);
-        let is_expanded = self.expanded_job_id == Some(item.id);
-
-        let filename = Path::new(&*item.input_path)
-          .file_name()
-          .and_then(|f| f.to_str())
-          .unwrap_or(&item.input_path)
-          .to_string();
-        let display_name = format!("{}. {}", item_idx + 1, filename);
-        let is_first = item_idx == 0;
-        let is_last = item_idx == state.queue.len() - 1;
-
-        let queue_item_el = self.render_queue_item(
-          item,
-          is_selected,
-          is_expanded,
-          is_running,
-          is_first,
-          is_last,
-          display_name,
-          &view,
-          cx,
-        );
+        let queue_item_el = self
+          .render_queue_item(item, item_idx, queue_len, is_running, &view, cx);
 
         queue_items_elements.push(queue_item_el.into_any_element());
       }
@@ -630,11 +576,18 @@ impl Render for RenderApp {
         )
     };
 
-    v_flex().p_4().gap_4().size_full().child(app_tab_bar).child(
-      match self.active_tab {
-        AppTab::Queue => queue_panel.into_any_element(),
-        AppTab::Settings => settings_panel.into_any_element(),
-      },
-    )
+    let panel = match self.active_tab {
+      AppTab::Queue => queue_panel.into_any_element(),
+      AppTab::Settings => self
+        .render_settings_panel(is_running, enable_parallel, &view)
+        .into_any_element(),
+    };
+
+    v_flex()
+      .p_4()
+      .gap_4()
+      .size_full()
+      .child(app_tab_bar)
+      .child(panel)
   }
 }

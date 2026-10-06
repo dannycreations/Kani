@@ -4,7 +4,7 @@ use std::{
   path::Path,
   process::{Child, Command, Stdio},
   str::from_utf8,
-  sync::{mpsc::Sender, Arc, LazyLock, Mutex},
+  sync::{mpsc::Sender, Arc, LazyLock, Mutex, OnceLock},
   thread,
 };
 
@@ -15,11 +15,14 @@ use crate::{
   ffmpeg::{
     progress::{
       FfmpegParser, JobProgress, LoudnormResult, ProgressInfo, StepType,
+      VolumeType,
     },
     settings::RenderSettings,
     track::{AudioRenderer, TrackStats},
   },
 };
+
+const MIX_STEP_NUM: usize = 1;
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -32,7 +35,7 @@ pub fn register_child(handle: SharedChild) {
   }
 }
 
-pub fn deregister_child(handle: &SharedChild) {
+fn deregister_child(handle: &SharedChild) {
   if let Ok(mut lock) = ACTIVE_CHILDREN.lock() {
     lock.retain(|h| !Arc::ptr_eq(h, handle));
   }
@@ -90,12 +93,10 @@ impl RenderProcess {
     on_line: &mut dyn FnMut(&str),
   ) -> Result<()> {
     let mut cmd = Command::new(ffmpeg_path);
-    // Append -progress - to arguments to output structured progress reports to stdout
-    let mut final_args = args.to_vec();
-    final_args.push("-progress".to_string());
-    final_args.push("-".to_string());
     cmd
-      .args(&final_args)
+      .args(args)
+      // Ask ffmpeg for structured progress reports on stdout.
+      .args(["-progress", "-"])
       .stdout(Stdio::piped())
       .stderr(Stdio::piped());
 
@@ -133,45 +134,45 @@ impl RenderProcess {
       (stdout, stderr)
     };
 
-    let duration = Arc::new(Mutex::new(None));
-    let duration_clone = Arc::clone(&duration);
-    let tx_clone = tx.clone();
-    let step_clone = step.clone();
+    // ffmpeg reports the media duration once on stderr; the stdout reader needs it
+    // to turn timestamps into a percentage.
+    let duration = Arc::new(OnceLock::<f32>::new());
+    let stdout_thread = {
+      let duration = Arc::clone(&duration);
+      let tx = tx.clone();
+      let step = step.clone();
 
-    // Spawn a background thread to read stdout and parse progress reports
-    let stdout_thread = thread::spawn(move || {
-      let reader = BufReader::new(stdout_pipe);
-      let mut progress_info = ProgressInfo::new();
+      thread::spawn(move || {
+        let reader = BufReader::new(stdout_pipe);
+        let mut progress_info = ProgressInfo::new();
 
-      for line in reader.lines() {
-        let line = match line {
-          Ok(l) => l,
-          Err(_) => break, // process killed or closed pipe
-        };
-
-        if progress_info.parse_line(&line) {
-          let dur_opt = *duration_clone.lock().unwrap();
-          let pct = if let Some(dur) = dur_opt {
-            if dur > 0.0 {
-              let current_secs =
-                progress_info.out_time_us.unwrap_or(0) as f32 / 1_000_000.0;
-              AudioRenderer::clamp(current_secs / dur, 0.0, 1.0)
-            } else {
-              0.0
-            }
-          } else {
-            0.0
+        for line in reader.lines() {
+          let Ok(line) = line else {
+            break; // process killed or closed pipe
           };
 
-          let _ = tx_clone.send(JobProgress::Progress {
-            step: step_clone.clone(),
-            percent: pct,
+          if !progress_info.parse_line(&line) {
+            continue;
+          }
+
+          let percent = match duration.get().copied() {
+            Some(total) if total > 0.0 => {
+              let elapsed =
+                progress_info.out_time_us.unwrap_or(0) as f32 / 1_000_000.0;
+              (elapsed / total).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+          };
+
+          let _ = tx.send(JobProgress::Progress {
+            step: step.clone(),
+            percent,
             speed: progress_info.speed.clone(),
             time_str: progress_info.out_time.clone(),
           });
         }
-      }
-    });
+      })
+    };
 
     let mut reader = BufReader::new(stderr_pipe);
     let mut buf = Vec::new();
@@ -198,10 +199,9 @@ impl RenderProcess {
 
         on_line(line);
 
-        let mut dur_lock = duration.lock().unwrap();
-        if dur_lock.is_none() {
+        if duration.get().is_none() {
           if let Some(d) = FfmpegParser::parse_duration(line) {
-            *dur_lock = Some(d);
+            let _ = duration.set(d);
           }
         }
       }
@@ -230,17 +230,42 @@ impl RenderProcess {
     Ok(())
   }
 
+  #[allow(clippy::too_many_arguments)]
+  fn run_step(
+    &self,
+    ffmpeg_path: &str,
+    args: &[String],
+    step: StepType,
+    step_num: usize,
+    total_steps: usize,
+    tx: &Sender<JobProgress>,
+    on_line: &mut dyn FnMut(&str),
+  ) -> Result<()> {
+    let _ = tx.send(JobProgress::Starting(step.clone()));
+    let _ = tx.send(JobProgress::Log(Arc::from(format!(
+      "Starting Step [{}/{}]: {}...",
+      step_num,
+      total_steps,
+      step.name()
+    ))));
+
+    self
+      .run_command(ffmpeg_path, args, step, tx, on_line)
+      .inspect_err(|e| {
+        let _ = tx.send(JobProgress::Failed(Arc::from(format!(
+          "Step {} Failed: {}",
+          step_num, e
+        ))));
+      })
+  }
+
   fn run_mix_computation(
     &self,
     input_file: &str,
     settings: &RenderSettings,
+    total_steps: usize,
     tx: &Sender<JobProgress>,
   ) -> Result<Vec<f32>> {
-    let _ = tx.send(JobProgress::Starting(StepType::MixComputation));
-    let _ = tx.send(JobProgress::Log(Arc::from(
-      "Starting Step [1/3]: Mix Computation...",
-    )));
-
     let audio_tracks = &settings.audio.tracks;
     let track_count = audio_tracks.len();
 
@@ -267,48 +292,38 @@ impl RenderProcess {
     mix_args.push("-".to_string());
 
     let mut track_stats = vec![TrackStats::default(); track_count];
-    let res = self.run_command(
+    self.run_step(
       &settings.ffmpeg_path,
       &mix_args,
       StepType::MixComputation,
+      MIX_STEP_NUM,
+      total_steps,
       tx,
       &mut |line| {
-        if let Some((idx, is_mean, val)) =
-          FfmpegParser::parse_volume_detect(line)
-        {
-          if idx < track_stats.len() {
-            if is_mean {
-              track_stats[idx].mean = Some(val);
-            } else {
-              track_stats[idx].peak = Some(val);
-            }
-          }
+        let Some(info) = FfmpegParser::parse_volume_detect(line) else {
+          return;
+        };
+        let Some(stats) = track_stats.get_mut(info.track_index) else {
+          return;
+        };
+        match info.volume_type {
+          VolumeType::Mean => stats.mean = Some(info.volume_db),
+          VolumeType::Max => stats.peak = Some(info.volume_db),
         }
       },
-    );
-
-    if let Err(e) = res {
-      let _ = tx.send(JobProgress::Failed(Arc::from(format!(
-        "Step 1 Failed: {}",
-        e
-      ))));
-      return Err(e);
-    }
+    )?;
 
     // Print parsed values
-    for (i, t) in track_stats.iter().enumerate() {
+    let show_db = |value: Option<f32>| {
+      value.map_or_else(|| "-".to_owned(), |v| format!("{:.1} dBFS", v))
+    };
+    for (i, stats) in track_stats.iter().enumerate() {
       let name = &audio_tracks[i].name;
-      let mean_str = t
-        .mean
-        .map(|v| format!("{:.1} dBFS", v))
-        .unwrap_or_else(|| "-".to_string());
-      let peak_str = t
-        .peak
-        .map(|v| format!("{:.1} dBFS", v))
-        .unwrap_or_else(|| "-".to_string());
       let _ = tx.send(JobProgress::Log(Arc::from(format!(
         "  {}  mean: {}   peak: {}",
-        name, mean_str, peak_str
+        name,
+        show_db(stats.mean),
+        show_db(stats.peak)
       ))));
     }
 
@@ -317,12 +332,13 @@ impl RenderProcess {
     {
       let _ =
         tx.send(JobProgress::Log(Arc::from("Computed volume adjustments:")));
-      for (i, vol) in computed.iter().enumerate() {
-        let name = &audio_tracks[i].name;
-        let mean = track_stats[i].mean.unwrap();
+      for ((vol, stats), track) in
+        computed.iter().zip(&track_stats).zip(audio_tracks)
+      {
+        let Some(mean) = stats.mean else { continue };
         let _ = tx.send(JobProgress::Log(Arc::from(format!(
           "  {:<9} {:.1}dB  →  {:.1} dBFS mean",
-          &**name,
+          &*track.name,
           vol,
           mean + vol
         ))));
@@ -345,12 +361,6 @@ impl RenderProcess {
     total_steps: usize,
     tx: &Sender<JobProgress>,
   ) -> Result<LoudnormResult> {
-    let _ = tx.send(JobProgress::Starting(StepType::AudioAnalysis));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "Starting Step [{}/{}]: Audio Analysis...",
-      step_num, total_steps
-    ))));
-
     let mut analysis_args = vec!["-i".to_string(), input_file.to_string()];
     AudioRenderer::append_filter_args(
       &mut analysis_args,
@@ -368,61 +378,44 @@ impl RenderProcess {
     let mut input_thresh = None;
     let mut target_offset = None;
 
-    let raw_analysis = self.run_command(
+    self.run_step(
       &settings.ffmpeg_path,
       &analysis_args,
       StepType::AudioAnalysis,
+      step_num,
+      total_steps,
       tx,
       &mut |line| {
-        if input_i.is_none() {
-          input_i = FfmpegParser::extract_loudnorm_val(line, "\"input_i\"");
-        }
-        if input_lra.is_none() {
-          input_lra = FfmpegParser::extract_loudnorm_val(line, "\"input_lra\"");
-        }
-        if input_tp.is_none() {
-          input_tp = FfmpegParser::extract_loudnorm_val(line, "\"input_tp\"");
-        }
-        if input_thresh.is_none() {
-          input_thresh =
-            FfmpegParser::extract_loudnorm_val(line, "\"input_thresh\"");
-        }
-        if target_offset.is_none() {
-          target_offset =
-            FfmpegParser::extract_loudnorm_val(line, "\"target_offset\"");
+        let slots = [
+          ("\"input_i\"", &mut input_i),
+          ("\"input_lra\"", &mut input_lra),
+          ("\"input_tp\"", &mut input_tp),
+          ("\"input_thresh\"", &mut input_thresh),
+          ("\"target_offset\"", &mut target_offset),
+        ];
+        for (key, slot) in slots {
+          if slot.is_none() {
+            *slot = FfmpegParser::extract_loudnorm_val(line, key);
+          }
         }
       },
-    );
+    )?;
 
-    if let Err(e) = raw_analysis {
-      let _ = tx.send(JobProgress::Failed(Arc::from(format!(
-        "Step {} Failed: {}",
-        step_num, e
-      ))));
-      return Err(e);
-    }
+    let require = |value: Option<f32>| -> Result<f32> {
+      value.ok_or_else(|| {
+        let _ = tx.send(JobProgress::Failed(Arc::from(
+          "Failed to parse loudnorm JSON output from ffmpeg.",
+        )));
+        anyhow!("Failed to parse loudnorm JSON output from ffmpeg.")
+      })
+    };
 
-    let res = match (input_i, input_lra, input_tp, input_thresh, target_offset)
-    {
-      (
-        Some(input_i),
-        Some(input_lra),
-        Some(input_tp),
-        Some(input_thresh),
-        Some(target_offset),
-      ) => LoudnormResult {
-        input_i,
-        input_lra,
-        input_tp,
-        input_thresh,
-        target_offset,
-      },
-      _ => {
-        let err_msg =
-          "Failed to parse loudnorm JSON output from ffmpeg.".to_string();
-        let _ = tx.send(JobProgress::Failed(Arc::from(err_msg.clone())));
-        return Err(anyhow!(err_msg));
-      }
+    let res = LoudnormResult {
+      input_i: require(input_i)?,
+      input_lra: require(input_lra)?,
+      input_tp: require(input_tp)?,
+      input_thresh: require(input_thresh)?,
+      target_offset: require(target_offset)?,
     };
 
     let _ = tx.send(JobProgress::Log(Arc::from(format!(
@@ -461,14 +454,6 @@ impl RenderProcess {
     total_steps: usize,
     tx: &Sender<JobProgress>,
   ) -> Result<()> {
-    let _ = tx.send(JobProgress::Starting(StepType::VideoEncoding));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "Starting Step [{}/{}]: Video Encoding...",
-      step_num, total_steps
-    ))));
-
-    let output_file_str = output_file.to_string();
-
     let mut encode_args =
       vec!["-y".to_string(), "-i".to_string(), input_file.to_string()];
     AudioRenderer::append_filter_args(
@@ -482,29 +467,23 @@ impl RenderProcess {
     );
 
     encode_args.extend(settings.custom_vflags.iter().map(|s| s.to_string()));
-    encode_args.push(output_file_str.clone());
+    encode_args.push(output_file.to_string());
 
-    let res_encode = self.run_command(
+    self.run_step(
       &settings.ffmpeg_path,
       &encode_args,
       StepType::VideoEncoding,
+      step_num,
+      total_steps,
       tx,
       &mut |_| {},
-    );
-
-    if let Err(e) = res_encode {
-      let _ = tx.send(JobProgress::Failed(Arc::from(format!(
-        "Step {} Failed: {}",
-        step_num, e
-      ))));
-      return Err(e);
-    }
+    )?;
 
     let _ = tx.send(JobProgress::Log(Arc::from(format!(
       "Output at {}",
-      output_file_str
+      output_file
     ))));
-    let _ = tx.send(JobProgress::Completed(Arc::from(output_file_str)));
+    let _ = tx.send(JobProgress::Completed(Arc::from(output_file)));
 
     Ok(())
   }
@@ -516,8 +495,7 @@ impl RenderProcess {
     settings: &RenderSettings,
     tx: Sender<JobProgress>,
   ) -> Result<()> {
-    let input_path = Path::new(input_file);
-    if !input_path.exists() {
+    if !Path::new(input_file).exists() {
       let _ = tx.send(JobProgress::Failed(Arc::from(format!(
         "Input file not found: {}",
         input_file
@@ -527,15 +505,14 @@ impl RenderProcess {
 
     let single_track = settings.audio.single_track;
     let total_steps = if single_track { 2 } else { 3 };
+    let analysis_step_num = if single_track { MIX_STEP_NUM } else { 2 };
 
-    let volumes = if !single_track {
-      let vols = self.run_mix_computation(input_file, settings, &tx)?;
-      Some(vols)
-    } else {
+    let volumes = if single_track {
       None
+    } else {
+      Some(self.run_mix_computation(input_file, settings, total_steps, &tx)?)
     };
 
-    let analysis_step_num = if single_track { 1 } else { 2 };
     let loudnorm_res = self.run_audio_analysis(
       input_file,
       settings,
@@ -545,24 +522,17 @@ impl RenderProcess {
       &tx,
     )?;
 
-    let encode_step_num = if single_track { 2 } else { 3 };
     self.run_video_encoding(
       input_file,
       output_file,
       settings,
       &loudnorm_res,
       volumes.as_deref(),
-      encode_step_num,
+      analysis_step_num + 1,
       total_steps,
       &tx,
     )?;
 
     Ok(())
-  }
-}
-
-impl Default for RenderProcess {
-  fn default() -> Self {
-    Self::new()
   }
 }

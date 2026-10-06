@@ -4,13 +4,11 @@ use std::{
   thread,
 };
 
-use serde::{Deserialize, Serialize};
-
 use crate::ffmpeg::{
   AudioSettings, JobProgress, Preset, RenderProcess, RenderSettings,
 };
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum QueueItemStatus {
   Pending,
   Processing {
@@ -26,38 +24,62 @@ pub enum QueueItemStatus {
   Cancelled,
 }
 
-fn compute_output_path(
-  input_path: &str,
-  existing_outputs: &[Arc<str>],
-) -> String {
-  let mut p = PathBuf::from(input_path);
-  p.set_extension("mp4");
-  let parent = p.parent().unwrap_or_else(|| Path::new(""));
-  let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
-  let ext = "mp4";
-
-  let path_exists = |path_str: &str| -> bool {
-    Path::new(path_str).exists()
-      || existing_outputs.iter().any(|out| &**out == path_str)
-  };
-
-  let mut output_str = p.to_string_lossy().to_string();
-  if path_exists(&output_str) {
-    let mut i = 1;
-    loop {
-      let candidate = parent.join(format!("{}_{}.{}", stem, i, ext));
-      let candidate_str = candidate.to_string_lossy().to_string();
-      if !path_exists(&candidate_str) {
-        output_str = candidate_str;
-        break;
-      }
-      i += 1;
+impl QueueItemStatus {
+  fn processing(
+    step: &str,
+    percent: f32,
+    speed: Arc<str>,
+    time_str: Arc<str>,
+  ) -> Self {
+    Self::Processing {
+      step: Arc::from(step),
+      percent,
+      speed,
+      time_str,
     }
   }
-  output_str
+
+  pub fn is_pending(&self) -> bool {
+    matches!(self, Self::Pending)
+  }
+
+  pub fn is_finished(&self) -> bool {
+    matches!(
+      self,
+      Self::Completed { .. } | Self::Failed(_) | Self::Cancelled
+    )
+  }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn compute_output_path(input_path: &str, queue: &[QueueItem]) -> String {
+  let mut candidate = PathBuf::from(input_path);
+  candidate.set_extension("mp4");
+
+  let taken = |path: &str| {
+    Path::new(path).exists()
+      || queue.iter().any(|item| &*item.output_path == path)
+  };
+
+  if !taken(&candidate.to_string_lossy()) {
+    return candidate.to_string_lossy().into_owned();
+  }
+
+  let parent = candidate.parent().unwrap_or_else(|| Path::new(""));
+  let stem = candidate
+    .file_stem()
+    .and_then(|s| s.to_str())
+    .unwrap_or("output");
+  let mut suffix = 1;
+  loop {
+    let candidate = parent.join(format!("{stem}_{suffix}.mp4"));
+    if !taken(&candidate.to_string_lossy()) {
+      return candidate.to_string_lossy().into_owned();
+    }
+    suffix += 1;
+  }
+}
+
+#[derive(Debug, Clone)]
 pub struct QueueItem {
   pub id: usize,
   pub input_path: Arc<str>,
@@ -68,7 +90,6 @@ pub struct QueueItem {
   pub logs: Vec<Arc<str>>,
 }
 
-#[derive(Default)]
 pub struct AppState {
   pub queue: Vec<QueueItem>,
   pub ffmpeg_path: Arc<str>,
@@ -93,12 +114,7 @@ impl AppState {
   }
 
   pub fn add_file(&mut self, path: String) {
-    let existing_outputs: Vec<Arc<str>> = self
-      .queue
-      .iter()
-      .map(|item| Arc::clone(&item.output_path))
-      .collect();
-    let output_path = compute_output_path(&path, &existing_outputs);
+    let output_path = compute_output_path(&path, &self.queue);
     let preset_index = Preset::default_index();
     self.queue.push(QueueItem {
       id: self.next_id,
@@ -133,12 +149,7 @@ impl AppState {
   }
 
   pub fn clear_completed(&mut self) {
-    self.queue.retain(|item| {
-      matches!(
-        item.status,
-        QueueItemStatus::Pending | QueueItemStatus::Processing { .. }
-      )
-    });
+    self.queue.retain(|item| !item.status.is_finished());
   }
 
   pub fn clear_all(&mut self) {
@@ -147,178 +158,183 @@ impl AppState {
     self.next_id = 1;
   }
 
-  pub fn move_up(&mut self, id: usize) {
-    if let Some(pos) = self.queue.iter().position(|item| item.id == id) {
-      if pos > 0
-        && matches!(self.queue[pos].status, QueueItemStatus::Pending)
-        && matches!(self.queue[pos - 1].status, QueueItemStatus::Pending)
-      {
-        self.queue.swap(pos, pos - 1);
-      }
-    }
-  }
-
-  pub fn move_down(&mut self, id: usize) {
-    if let Some(pos) = self.queue.iter().position(|item| item.id == id) {
-      if pos + 1 < self.queue.len()
-        && matches!(self.queue[pos].status, QueueItemStatus::Pending)
-        && matches!(self.queue[pos + 1].status, QueueItemStatus::Pending)
-      {
-        self.queue.swap(pos, pos + 1);
-      }
-    }
-  }
-
-  pub fn start(&mut self, state_arc: Arc<Mutex<AppState>>) {
-    if self.is_running {
+  pub fn move_item(&mut self, id: usize, offset: isize) {
+    let Some(from) = self.queue.iter().position(|item| item.id == id) else {
+      return;
+    };
+    let to = from as isize + offset;
+    if to < 0 || to as usize >= self.queue.len() {
       return;
     }
+    let to = to as usize;
 
-    // Check if there are any pending items to run
-    let has_pending = self
+    if self.queue[from].status.is_pending()
+      && self.queue[to].status.is_pending()
+    {
+      self.queue.swap(from, to);
+    }
+  }
+
+  pub fn start(state: &Arc<Mutex<AppState>>) {
+    {
+      let mut state = state.lock().unwrap();
+      if state.is_running || !state.has_pending() {
+        return;
+      }
+      state.is_running = true;
+    }
+
+    Self::pump_queue(state);
+  }
+
+  fn has_pending(&self) -> bool {
+    self.queue.iter().any(|item| item.status.is_pending())
+  }
+
+  fn pump_queue(state: &Arc<Mutex<AppState>>) {
+    loop {
+      let job = {
+        let mut state = state.lock().unwrap();
+        if !state.is_running {
+          return;
+        }
+        let max_jobs = if state.enable_parallel {
+          state.parallel_jobs.max(1)
+        } else {
+          1
+        };
+        if state.active_processes.len() >= max_jobs {
+          return;
+        }
+        match state.claim_next_pending() {
+          Some(job) => job,
+          None => return,
+        }
+      };
+
+      // The state lock is released before spawning so the new worker can report
+      // progress right away.
+      let job_state = Arc::clone(state);
+      thread::spawn(move || Self::run_job(job_state, job));
+    }
+  }
+
+  fn claim_next_pending(&mut self) -> Option<Job> {
+    let pos = self
       .queue
       .iter()
-      .any(|item| matches!(item.status, QueueItemStatus::Pending));
-    if !has_pending {
-      return;
-    }
+      .position(|item| item.status.is_pending())?;
+    let item = &mut self.queue[pos];
 
-    self.is_running = true;
+    item.status =
+      QueueItemStatus::processing("Starting...", 0.0, "".into(), "".into());
+    item.logs.clear();
 
-    thread::spawn(move || {
-      Self::pump_queue(state_arc);
-    });
+    let job = Job {
+      id: item.id,
+      process: Arc::new(RenderProcess::new()),
+      input_path: Arc::clone(&item.input_path),
+      output_path: Arc::clone(&item.output_path),
+      settings: RenderSettings {
+        audio: item.settings.clone(),
+        ffmpeg_path: Arc::clone(&self.ffmpeg_path),
+        custom_vflags: RenderSettings::default_vflags(),
+      },
+    };
+    self
+      .active_processes
+      .push((job.id, Arc::clone(&job.process)));
+    Some(job)
   }
 
-  pub fn pump_queue(state_arc: Arc<Mutex<AppState>>) {
-    let mut state = state_arc.lock().unwrap();
-    if !state.is_running {
-      return;
+  fn run_job(state: Arc<Mutex<AppState>>, job: Job) {
+    let Job {
+      id,
+      process,
+      input_path,
+      output_path,
+      settings,
+    } = job;
+    let (tx, rx) = channel();
+
+    let worker = thread::spawn(move || {
+      // Progress travels over `tx`, so failures are already on screen by the
+      // time this returns an error.
+      let _ = process.execute(&input_path, &output_path, &settings, tx);
+    });
+
+    while let Ok(progress) = rx.recv() {
+      let mut state = state.lock().unwrap();
+      if !state.is_running || !state.is_job_active(id) {
+        break;
+      }
+      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+        item.apply_progress(progress);
+      }
     }
 
-    let max_jobs = if state.enable_parallel {
-      state.parallel_jobs.max(1)
-    } else {
-      1
-    };
+    let _ = worker.join();
 
-    while state.active_processes.len() < max_jobs {
-      let next_pos = state
-        .queue
-        .iter()
-        .position(|item| matches!(item.status, QueueItemStatus::Pending));
+    {
+      let mut state = state.lock().unwrap();
+      state.active_processes.retain(|(job_id, _)| *job_id != id);
+      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+        if let QueueItemStatus::Processing { .. } = item.status {
+          item.status = QueueItemStatus::Cancelled;
+          item.logs.push(Arc::from("Job cancelled or stopped."));
+        }
+      }
 
-      if let Some(pos) = next_pos {
-        let job_id = state.queue[pos].id;
-        let proc = Arc::new(RenderProcess::new());
-        state.active_processes.push((job_id, Arc::clone(&proc)));
+      if !state.has_pending() && state.active_processes.is_empty() {
+        state.is_running = false;
+      }
+    }
 
-        let ffmpeg_path = Arc::clone(&state.ffmpeg_path);
+    Self::pump_queue(&state);
+  }
 
-        let item = &mut state.queue[pos];
-        item.status = QueueItemStatus::Processing {
-          step: Arc::from("Starting..."),
-          percent: 0.0,
-          speed: Arc::from(""),
-          time_str: Arc::from(""),
-        };
-        item.logs.clear();
+  fn is_job_active(&self, id: usize) -> bool {
+    self
+      .active_processes
+      .iter()
+      .any(|(job_id, _)| *job_id == id)
+  }
+}
 
-        let input_path = Arc::clone(&item.input_path);
-        let output_path = Arc::clone(&item.output_path);
-        let settings = RenderSettings {
-          audio: item.settings.clone(),
-          ffmpeg_path,
-          custom_vflags: RenderSettings::default().custom_vflags,
-        };
+struct Job {
+  id: usize,
+  process: Arc<RenderProcess>,
+  input_path: Arc<str>,
+  output_path: Arc<str>,
+  settings: RenderSettings,
+}
 
-        let tx_state_arc = Arc::clone(&state_arc);
-        thread::spawn(move || {
-          let (tx, rx) = channel();
-          let proc_clone = Arc::clone(&proc);
-          let input_clone = Arc::clone(&input_path);
-          let output_clone = Arc::clone(&output_path);
-
-          let handle = thread::spawn(move || {
-            let _ =
-              proc_clone.execute(&input_clone, &output_clone, &settings, tx);
-          });
-
-          while let Ok(progress) = rx.recv() {
-            let mut state = tx_state_arc.lock().unwrap();
-            if !state.is_running
-              || !state.active_processes.iter().any(|(id, _)| *id == job_id)
-            {
-              break;
-            }
-
-            if let Some(item) =
-              state.queue.iter_mut().find(|item| item.id == job_id)
-            {
-              match progress {
-                JobProgress::Starting(step_type) => {
-                  item.status = QueueItemStatus::Processing {
-                    step: Arc::from(step_type.name()),
-                    percent: 0.0,
-                    speed: Arc::from(""),
-                    time_str: Arc::from(""),
-                  };
-                }
-                JobProgress::Log(log_line) => {
-                  item.logs.push(log_line);
-                }
-                JobProgress::Progress {
-                  step,
-                  percent,
-                  speed,
-                  time_str,
-                } => {
-                  item.status = QueueItemStatus::Processing {
-                    step: Arc::from(step.name()),
-                    percent,
-                    speed: speed.unwrap_or_default(),
-                    time_str: time_str.unwrap_or_default(),
-                  };
-                }
-                JobProgress::Completed(out_path) => {
-                  item.status = QueueItemStatus::Completed {
-                    output_path: out_path,
-                  };
-                }
-                JobProgress::Failed(err) => {
-                  item.status = QueueItemStatus::Failed(err);
-                }
-              }
-            }
-          }
-
-          let _ = handle.join();
-
-          {
-            let mut state = tx_state_arc.lock().unwrap();
-            state.active_processes.retain(|(id, _)| *id != job_id);
-            if let Some(item) =
-              state.queue.iter_mut().find(|item| item.id == job_id)
-            {
-              if let QueueItemStatus::Processing { .. } = item.status {
-                item.status = QueueItemStatus::Cancelled;
-                item.logs.push(Arc::from("Job cancelled or stopped."));
-              }
-            }
-
-            let has_pending = state
-              .queue
-              .iter()
-              .any(|item| matches!(item.status, QueueItemStatus::Pending));
-            if !has_pending && state.active_processes.is_empty() {
-              state.is_running = false;
-            }
-          }
-
-          Self::pump_queue(tx_state_arc);
-        });
-      } else {
-        break;
+impl QueueItem {
+  fn apply_progress(&mut self, progress: JobProgress) {
+    match progress {
+      JobProgress::Starting(step) => {
+        self.status =
+          QueueItemStatus::processing(step.name(), 0.0, "".into(), "".into());
+      }
+      JobProgress::Log(line) => self.logs.push(line),
+      JobProgress::Progress {
+        step,
+        percent,
+        speed,
+        time_str,
+      } => {
+        self.status = QueueItemStatus::processing(
+          step.name(),
+          percent,
+          speed.unwrap_or_default(),
+          time_str.unwrap_or_default(),
+        );
+      }
+      JobProgress::Completed(output_path) => {
+        self.status = QueueItemStatus::Completed { output_path };
+      }
+      JobProgress::Failed(error) => {
+        self.status = QueueItemStatus::Failed(error)
       }
     }
   }
@@ -357,12 +373,12 @@ mod tests {
 
     // Test move_up
     let second_id = state.queue[1].id;
-    state.move_up(second_id);
+    state.move_item(second_id, -1);
     assert_eq!(&*state.queue[0].input_path, "file2.mkv");
     assert_eq!(&*state.queue[1].input_path, "file1.mkv");
 
     // Test move_down
-    state.move_down(2);
+    state.move_item(2, 1);
     assert_eq!(&*state.queue[0].input_path, "file1.mkv");
     assert_eq!(&*state.queue[1].input_path, "file2.mkv");
 

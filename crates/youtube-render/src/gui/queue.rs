@@ -1,18 +1,18 @@
-use std::{fs, sync::Arc};
+use std::{fs, path::Path, sync::Arc};
 
 use gpui_kit::{
   component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::Input,
+    input::{Input, InputState},
     progress::Progress,
     v_flex, ActiveTheme, Disableable,
   },
   div,
   prelude::*,
-  px, AnyElement, AsyncApp, Context, Focusable, IntoElement, ParentElement,
-  SharedString, Styled, WeakEntity,
+  px, AnyElement, AsyncApp, Context, Entity, Focusable, IntoElement,
+  ParentElement, SharedString, Styled, WeakEntity,
 };
 use rfd::FileDialog;
 
@@ -22,24 +22,31 @@ use crate::{
     queue::{QueueItem, QueueItemStatus},
   },
   ffmpeg::{AudioSettings, Preset},
-  gui::{confirm_action, ItemInputStates, RenderApp},
+  gui::{confirm_action, RenderApp},
 };
 
 impl RenderApp {
-  #[allow(clippy::too_many_arguments)]
   pub(super) fn render_queue_item(
     &self,
     item: &QueueItem,
-    is_selected: bool,
-    is_expanded: bool,
+    item_idx: usize,
+    queue_len: usize,
     is_running: bool,
-    is_first: bool,
-    is_last: bool,
-    display_name: String,
     view: &WeakEntity<Self>,
     cx: &mut Context<Self>,
   ) -> impl IntoElement {
     let id = item.id;
+    let is_selected = self.selected_job_id == Some(id);
+    let is_expanded = self.expanded_job_id == Some(id);
+    let is_first = item_idx == 0;
+    let is_last = item_idx + 1 == queue_len;
+
+    let filename = Path::new(&*item.input_path)
+      .file_name()
+      .and_then(|f| f.to_str())
+      .unwrap_or(&item.input_path);
+    let display_name = format!("{}. {}", item_idx + 1, filename);
+
     let item_view = view.clone();
     let item_view_click = view.clone();
 
@@ -108,17 +115,16 @@ impl RenderApp {
     controls_disabled: bool,
     item_view: &WeakEntity<Self>,
   ) -> impl IntoElement {
-    let builtins = Preset::builtins();
-    let mut preset_row = h_flex()
+    let mut presets = h_flex()
       .gap_2()
       .items_center()
       .child(div().text_xs().child("Preset:"));
 
-    for (preset_idx, preset) in builtins.iter().enumerate() {
+    for (preset_idx, preset) in Preset::builtins().iter().enumerate() {
       let is_active_preset = current_preset_idx == preset_idx;
       let preset_name = preset.name.to_string();
       let item_view_preset = item_view.clone();
-      preset_row = preset_row.child(
+      presets = presets.child(
         Button::new(SharedString::from(format!(
           "preset_{}_{}",
           id, preset_idx
@@ -130,29 +136,20 @@ impl RenderApp {
         .on_click(move |_, window, cx| {
           if let Some(view) = item_view_preset.upgrade() {
             view.update(cx, |this, cx| {
+              let new_settings =
+                AudioSettings::from_preset(&Preset::builtins()[preset_idx]);
+              let mut state = this.state.lock().unwrap();
+              if let Some(item) =
+                state.queue.iter_mut().find(|item| item.id == id)
               {
-                let mut state = this.state.lock().unwrap();
-                if let Some(item) =
-                  state.queue.iter_mut().find(|item| item.id == id)
-                {
-                  item.preset_index = preset_idx;
-                  item.settings =
-                    AudioSettings::from_preset(&Preset::builtins()[preset_idx]);
-                }
+                item.preset_index = preset_idx;
+                item.settings = new_settings.clone();
               }
+              drop(state);
+
               // Rebuild inputs for the new preset's track layout
               this.remove_inputs(id);
-              let new_settings = {
-                let state = this.state.lock().unwrap();
-                state
-                  .queue
-                  .iter()
-                  .find(|item| item.id == id)
-                  .map(|item| item.settings.clone())
-              };
-              if let Some(settings) = new_settings {
-                this.ensure_input_states(id, &settings, window, cx);
-              }
+              this.ensure_input_states(id, &new_settings, window, cx);
               cx.notify();
             });
           }
@@ -162,77 +159,73 @@ impl RenderApp {
 
     // Export button
     let settings_for_export = item_settings.clone();
-    preset_row = preset_row.child(
-      Button::new(SharedString::from(format!("export_{}", id)))
-        .icon(IconName::ExternalLink)
-        .compact()
-        .tooltip("Export Preset")
-        .disabled(controls_disabled)
-        .on_click(move |_, _, cx| {
-          let ini_content = settings_for_export.to_ini();
-          cx.spawn(|_: &mut AsyncApp| async move {
-            let file = FileDialog::new()
-              .add_filter("INI files", &["ini"])
-              .set_file_name("preset.ini")
-              .save_file();
-            if let Some(path) = file {
-              let _ = fs::write(path, ini_content);
-            }
-          })
-          .detach();
-        }),
-    );
+    let export_btn = Button::new(SharedString::from(format!("export_{}", id)))
+      .icon(IconName::ExternalLink)
+      .compact()
+      .tooltip("Export Preset")
+      .disabled(controls_disabled)
+      .on_click(move |_, _, cx| {
+        let ini_content = settings_for_export.to_ini();
+        cx.spawn(|_: &mut AsyncApp| async move {
+          let file = FileDialog::new()
+            .add_filter("INI files", &["ini"])
+            .set_file_name("preset.ini")
+            .save_file();
+          if let Some(path) = file {
+            let _ = fs::write(path, ini_content);
+          }
+        })
+        .detach();
+      });
 
     // Import button
     let item_view_import = item_view.clone();
-    preset_row = preset_row.child(
-      Button::new(SharedString::from(format!("import_{}", id)))
-        .icon(IconName::FolderOpen)
-        .compact()
-        .tooltip("Import Preset")
-        .disabled(controls_disabled)
-        .on_click(move |_, _, cx| {
-          let view = item_view_import.clone();
-          cx.spawn(move |cx: &mut AsyncApp| {
-            let cx = cx.clone();
-            async move {
-              let file = FileDialog::new()
-                .add_filter("INI files", &["ini"])
-                .pick_file();
-              let Some(path) = file else { return };
-              let Ok(content) = fs::read_to_string(&path) else {
-                return;
-              };
-              let Ok(new_settings) = AudioSettings::from_ini(&content) else {
-                return;
-              };
-              cx.update(|cx| {
-                if let Some(view) = view.upgrade() {
-                  view.update(cx, |this, cx| {
+    let import_btn = Button::new(SharedString::from(format!("import_{}", id)))
+      .icon(IconName::FolderOpen)
+      .compact()
+      .tooltip("Import Preset")
+      .disabled(controls_disabled)
+      .on_click(move |_, _, cx| {
+        let view = item_view_import.clone();
+        cx.spawn(move |cx: &mut AsyncApp| {
+          let cx = cx.clone();
+          async move {
+            let file = FileDialog::new()
+              .add_filter("INI files", &["ini"])
+              .pick_file();
+            let Some(path) = file else { return };
+            let Ok(content) = fs::read_to_string(&path) else {
+              return;
+            };
+            let Ok(new_settings) = AudioSettings::from_ini(&content) else {
+              return;
+            };
+            cx.update(|cx| {
+              if let Some(view) = view.upgrade() {
+                view.update(cx, |this, cx| {
+                  {
+                    let mut state = this.state.lock().unwrap();
+                    if let Some(item) =
+                      state.queue.iter_mut().find(|item| item.id == id)
                     {
-                      let mut state = this.state.lock().unwrap();
-                      if let Some(item) =
-                        state.queue.iter_mut().find(|item| item.id == id)
-                      {
-                        item.settings = new_settings;
-                      }
+                      item.settings = new_settings;
                     }
-                    // Invalidate inputs and collapse panel so they are recreated on next expand
-                    this.remove_inputs(id);
-                    if this.expanded_job_id == Some(id) {
-                      this.expanded_job_id = None;
-                    }
-                    cx.notify();
-                  });
-                }
-              });
-            }
-          })
-          .detach();
-        }),
-    );
+                  }
+                  // Invalidate inputs and collapse panel so they are recreated on next expand
+                  this.remove_inputs(id);
+                  if this.expanded_job_id == Some(id) {
+                    this.expanded_job_id = None;
+                  }
+                  cx.notify();
+                });
+              }
+            });
+          }
+        })
+        .detach();
+      });
 
-    preset_row
+    presets.child(export_btn).child(import_btn)
   }
 
   fn render_track_list(
@@ -240,7 +233,7 @@ impl RenderApp {
     id: usize,
     item_settings: &AudioSettings,
     controls_disabled: bool,
-    inputs: &ItemInputStates,
+    inputs: &[Entity<InputState>],
     item_view: &WeakEntity<Self>,
   ) -> impl IntoElement {
     let track_count = item_settings.tracks.len();
@@ -258,8 +251,8 @@ impl RenderApp {
         )),
       );
 
-      if let Some(track_input) = inputs.tracks.get(track_idx) {
-        let state = track_input.input_state.clone();
+      if let Some(track_input) = inputs.get(track_idx) {
+        let state = track_input.clone();
         row = row.child(
           div()
             .id(SharedString::from(format!(
@@ -267,9 +260,7 @@ impl RenderApp {
               id, track_idx
             )))
             .w(px(50.0))
-            .child(
-              Input::new(&track_input.input_state).disabled(controls_disabled),
-            )
+            .child(Input::new(track_input).disabled(controls_disabled))
             .on_mouse_down_out(move |_, window, cx| {
               if state.read(cx).focus_handle(cx).is_focused(window) {
                 state.update(cx, |input, cx| {
@@ -365,8 +356,7 @@ impl RenderApp {
       .get_inputs(id)
       .expect("inputs should exist for expanded item");
     let single_track = item_settings.single_track;
-    let controls_disabled =
-      is_running || !matches!(item.status, QueueItemStatus::Pending);
+    let controls_disabled = is_running || !item.status.is_pending();
 
     let preset_row = self.render_preset_row(
       id,
@@ -459,7 +449,7 @@ impl RenderApp {
   ) -> impl IntoElement {
     let id = item.id;
     let item_settings = item.settings.clone();
-    let is_pending = matches!(item.status, QueueItemStatus::Pending);
+    let is_pending = item.status.is_pending();
 
     let view_for_up = item_view.clone();
     let view_for_down = item_view.clone();
@@ -481,7 +471,7 @@ impl RenderApp {
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_up.upgrade() {
                   view.update(cx, |this, cx| {
-                    this.state.lock().unwrap().move_up(id);
+                    this.state.lock().unwrap().move_item(id, -1);
                     cx.notify();
                   });
                 }
@@ -496,7 +486,7 @@ impl RenderApp {
               .on_click(move |_, _, cx| {
                 if let Some(view) = view_for_down.upgrade() {
                   view.update(cx, |this, cx| {
-                    this.state.lock().unwrap().move_down(id);
+                    this.state.lock().unwrap().move_item(id, 1);
                     cx.notify();
                   });
                 }

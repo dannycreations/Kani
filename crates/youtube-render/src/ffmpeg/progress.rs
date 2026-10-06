@@ -89,13 +89,7 @@ impl FfmpegParser {
     }
   }
 
-  pub fn parse_volume_detect(line: &str) -> Option<(usize, bool, f32)> {
-    let info = Self::parse_volume_detect_typed(line)?;
-    let is_mean = info.volume_type == VolumeType::Mean;
-    Some((info.track_index, is_mean, info.volume_db))
-  }
-
-  pub fn parse_volume_detect_typed(line: &str) -> Option<VolumeDetectInfo> {
+  pub fn parse_volume_detect(line: &str) -> Option<VolumeDetectInfo> {
     let pos = line.find("volumedetect_")?;
     let sub = &line[pos + 13..];
 

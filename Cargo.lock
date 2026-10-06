@@ -9147,7 +9147,6 @@ dependencies = [
  "ctrlc",
  "gpui-kit",
  "rfd",
- "serde",
 ]
 
 [[package]]

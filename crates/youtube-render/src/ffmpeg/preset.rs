@@ -1,15 +1,13 @@
 use std::sync::{Arc, LazyLock};
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct TrackDef {
   pub name: Arc<str>,
   pub index: usize,
   pub default_offset: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Preset {
   pub name: Arc<str>,
   pub tracks: Vec<TrackDef>,

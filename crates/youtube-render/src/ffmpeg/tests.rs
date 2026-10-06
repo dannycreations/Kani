@@ -66,30 +66,27 @@ fn test_parse_volume_detect() {
     FfmpegParser::parse_volume_detect(
       "[Parsed_volumedetect_0 @ 0x123] mean_volume: -24.3 dB"
     ),
-    Some((0, true, -24.3))
+    Some(VolumeDetectInfo {
+      track_index: 0,
+      volume_type: VolumeType::Mean,
+      volume_db: -24.3,
+    })
   );
   assert_eq!(
     FfmpegParser::parse_volume_detect(
       "[Parsed_volumedetect_2 @ 0x456] max_volume: -0.1 dB"
     ),
-    Some((2, false, -0.1))
+    Some(VolumeDetectInfo {
+      track_index: 2,
+      volume_type: VolumeType::Max,
+      volume_db: -0.1,
+    })
   );
   assert_eq!(
     FfmpegParser::parse_volume_detect(
       "[Parsed_someotherfilter] mean_volume: -24.3 dB"
     ),
     None
-  );
-
-  assert_eq!(
-    FfmpegParser::parse_volume_detect_typed(
-      "[Parsed_volumedetect_0 @ 0x123] mean_volume: -24.3 dB"
-    ),
-    Some(VolumeDetectInfo {
-      track_index: 0,
-      volume_type: VolumeType::Mean,
-      volume_db: -24.3,
-    })
   );
 }
 
@@ -252,6 +249,39 @@ fn test_compute_mix_hierarchy() {
   assert_eq!(mic_vol, -2.0);
   assert_eq!(discord_vol, -1.0);
   assert_eq!(game_vol, -6.0);
+}
+
+#[test]
+fn test_append_filter_args() {
+  let tracks = three_track_settings(-2.0, -6.0, -16.0).tracks;
+
+  let mut mixed = Vec::new();
+  AudioRenderer::append_filter_args(
+    &mut mixed,
+    &tracks,
+    Some(&[-2.0, -1.0, -6.0]),
+    "loudnorm=I=-14",
+  );
+  assert_eq!(
+    mixed,
+    [
+      "-filter_complex",
+      "[0:a:1]volume=-2.0dB[mic];[0:a:2]volume=-1.0dB[discord];[0:a:0]volume=-6.0dB[game];[mic][discord][game]amix=inputs=3:weights='1 1 1':dropout_transition=2:normalize=0[mixed];[mixed]loudnorm=I=-14[out]",
+      "-map",
+      "0:v:0",
+      "-map",
+      "[out]",
+    ]
+  );
+
+  let mut loudnorm_only = Vec::new();
+  AudioRenderer::append_filter_args(
+    &mut loudnorm_only,
+    &tracks,
+    None,
+    "loudnorm=I=-14",
+  );
+  assert_eq!(loudnorm_only, ["-af", "loudnorm=I=-14"]);
 }
 
 #[test]
