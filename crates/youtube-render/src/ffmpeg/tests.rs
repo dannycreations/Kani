@@ -128,7 +128,7 @@ fn test_extract_loudnorm_val() {
 
 #[test]
 fn test_progress_info_parsing() {
-  let mut info = ProgressInfo::new();
+  let mut info = ProgressInfo::default();
 
   // First block
   assert!(!info.parse_line("frame=150"));

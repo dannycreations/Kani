@@ -159,7 +159,7 @@ impl RenderApp {
     let has_completed = state
       .queue
       .iter()
-      .any(|item| matches!(item.status, QueueItemStatus::Completed { .. }));
+      .any(|item| matches!(item.status, QueueItemStatus::Completed));
 
     let clear_completed_btn = Button::new("clear_completed")
       .warning()
@@ -312,7 +312,7 @@ impl RenderApp {
   ) {
     {
       let mut state = self.state.lock().unwrap();
-      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+      if let Some(item) = state.item_mut(id) {
         if other_idx < item.settings.tracks.len() {
           item.settings.tracks.swap(track_idx, other_idx);
         }
@@ -435,9 +435,7 @@ impl RenderApp {
               let new_settings =
                 AudioSettings::from_preset(&Preset::builtins()[preset_idx]);
               let mut state = this.state.lock().unwrap();
-              if let Some(item) =
-                state.queue.iter_mut().find(|item| item.id == id)
-              {
+              if let Some(item) = state.item_mut(id) {
                 item.preset_index = preset_idx;
                 item.settings = new_settings.clone();
               }
@@ -501,9 +499,7 @@ impl RenderApp {
                 view.update(cx, |this, cx| {
                   {
                     let mut state = this.state.lock().unwrap();
-                    if let Some(item) =
-                      state.queue.iter_mut().find(|item| item.id == id)
-                    {
+                    if let Some(item) = state.item_mut(id) {
                       item.settings = new_settings;
                     }
                   }
@@ -620,9 +616,8 @@ impl RenderApp {
     let id = item.id;
     let item_settings = item.settings.clone();
     let item_preset_index = item.preset_index;
-    let inputs = self
-      .get_inputs(id)
-      .expect("inputs should exist for expanded item");
+    // Inputs are built when the panel expands; skip the panel if they are gone.
+    let inputs = self.get_inputs(id)?;
     let single_track = item_settings.single_track;
     let controls_disabled = is_running || !item.status.is_pending();
 
@@ -662,9 +657,7 @@ impl RenderApp {
               if let Some(view) = item_view_cb.upgrade() {
                 view.update(cx, |this, cx| {
                   let mut state = this.state.lock().unwrap();
-                  if let Some(item) =
-                    state.queue.iter_mut().find(|item| item.id == id)
-                  {
+                  if let Some(item) = state.item_mut(id) {
                     item.settings.single_track = *checked;
                   }
                   cx.notify();
@@ -691,7 +684,7 @@ impl RenderApp {
         .text_color(cx.theme().info)
         .text_xs()
         .child(format!("{} ({:.0}%)", &**step, percent * 100.0)),
-      QueueItemStatus::Completed { .. } => div()
+      QueueItemStatus::Completed => div()
         .text_color(cx.theme().success)
         .text_xs()
         .child("Completed"),
@@ -799,7 +792,7 @@ impl RenderApp {
             if let Some(view) = view_for_remove.upgrade() {
               let is_active = {
                 let state = view.read(cx).state.lock().unwrap();
-                state.active_processes.iter().any(|(pid, _)| *pid == id)
+                state.is_job_active(id)
               };
 
               let should_remove = if is_active {
@@ -842,8 +835,6 @@ impl RenderApp {
         ..
       } => {
         let percent = *percent;
-        let speed = Arc::clone(speed);
-        let time_str = Arc::clone(time_str);
         Some(
           v_flex()
             .mt_2()
@@ -862,10 +853,10 @@ impl RenderApp {
                   h_flex()
                     .gap_2()
                     .when(!speed.is_empty(), |this| {
-                      this.child(format!("Speed: {}", &*speed))
+                      this.child(format!("Speed: {}", &**speed))
                     })
                     .when(!time_str.is_empty(), |this| {
-                      this.child(format!("Time: {}", &*time_str))
+                      this.child(format!("Time: {}", &**time_str))
                     }),
                 ),
             )

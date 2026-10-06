@@ -1,4 +1,5 @@
 use std::{
+  mem,
   path::{Path, PathBuf},
   sync::{mpsc::channel, Arc, Mutex},
   thread,
@@ -17,9 +18,7 @@ pub enum QueueItemStatus {
     speed: Arc<str>,
     time_str: Arc<str>,
   },
-  Completed {
-    output_path: Arc<str>,
-  },
+  Completed,
   Failed(Arc<str>),
   Cancelled,
 }
@@ -44,10 +43,7 @@ impl QueueItemStatus {
   }
 
   pub fn is_finished(&self) -> bool {
-    matches!(
-      self,
-      Self::Completed { .. } | Self::Failed(_) | Self::Cancelled
-    )
+    matches!(self, Self::Completed | Self::Failed(_) | Self::Cancelled)
   }
 }
 
@@ -117,6 +113,21 @@ impl AppState {
     }
   }
 
+  pub fn item(&self, id: usize) -> Option<&QueueItem> {
+    self.queue.iter().find(|item| item.id == id)
+  }
+
+  pub fn item_mut(&mut self, id: usize) -> Option<&mut QueueItem> {
+    self.queue.iter_mut().find(|item| item.id == id)
+  }
+
+  pub fn is_job_active(&self, id: usize) -> bool {
+    self
+      .active_processes
+      .iter()
+      .any(|(job_id, _)| *job_id == id)
+  }
+
   pub fn add_file(&mut self, path: String) {
     let output_path = compute_output_path(&path, &self.queue);
     let preset_index = 0;
@@ -143,9 +154,10 @@ impl AppState {
 
   pub fn stop(&mut self) {
     self.is_running = false;
-    for (job_id, proc) in self.active_processes.drain(..) {
+    let active = mem::take(&mut self.active_processes);
+    for (job_id, proc) in active {
       proc.cancel();
-      if let Some(item) = self.queue.iter_mut().find(|item| item.id == job_id) {
+      if let Some(item) = self.item_mut(job_id) {
         item.status = QueueItemStatus::Cancelled;
         item.logs.push(Arc::from("Processing stopped by user."));
       }
@@ -271,7 +283,7 @@ impl AppState {
       if !state.is_running || !state.is_job_active(id) {
         break;
       }
-      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+      if let Some(item) = state.item_mut(id) {
         item.apply_progress(progress);
       }
     }
@@ -281,7 +293,7 @@ impl AppState {
     {
       let mut state = state.lock().unwrap();
       state.active_processes.retain(|(job_id, _)| *job_id != id);
-      if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
+      if let Some(item) = state.item_mut(id) {
         if let QueueItemStatus::Processing { .. } = item.status {
           item.status = QueueItemStatus::Cancelled;
           item.logs.push(Arc::from("Job cancelled or stopped."));
@@ -294,13 +306,6 @@ impl AppState {
     }
 
     Self::pump_queue(&state);
-  }
-
-  fn is_job_active(&self, id: usize) -> bool {
-    self
-      .active_processes
-      .iter()
-      .any(|(job_id, _)| *job_id == id)
   }
 }
 
@@ -333,9 +338,7 @@ impl QueueItem {
           time_str.unwrap_or_default(),
         );
       }
-      JobProgress::Completed(output_path) => {
-        self.status = QueueItemStatus::Completed { output_path };
-      }
+      JobProgress::Completed => self.status = QueueItemStatus::Completed,
       JobProgress::Failed(error) => {
         self.status = QueueItemStatus::Failed(error)
       }
@@ -347,55 +350,70 @@ impl QueueItem {
 mod tests {
   use super::*;
 
+  fn add_three(state: &mut AppState) {
+    for name in ["file1.mkv", "file2.mkv", "file3.mkv"] {
+      state.add_file(name.to_string());
+    }
+  }
+
+  fn inputs(state: &AppState) -> Vec<&str> {
+    state.queue.iter().map(|item| &*item.input_path).collect()
+  }
+
+  fn outputs(state: &AppState) -> Vec<&str> {
+    state.queue.iter().map(|item| &*item.output_path).collect()
+  }
+
   #[test]
-  fn test_queue_operations() {
+  fn add_file_seeds_settings_from_the_default_preset() {
     let mut state = AppState::new();
-    assert_eq!(state.queue.len(), 0);
-
-    // Test add_file
     state.add_file("file1.mkv".to_string());
-    state.add_file("file2.mkv".to_string());
-    state.add_file("file3.mkv".to_string());
-    assert_eq!(state.queue.len(), 3);
-    assert_eq!(&*state.queue[0].input_path, "file1.mkv");
-    assert_eq!(&*state.queue[1].input_path, "file2.mkv");
-    assert_eq!(&*state.queue[2].input_path, "file3.mkv");
 
-    // Per-item settings default check (from default preset, sorted by index)
-    assert!(!state.queue[0].settings.single_track);
-    assert_eq!(state.queue[0].settings.tracks.len(), 3);
-    assert_eq!(&*state.queue[0].settings.tracks[0].name, "Game");
-    assert_eq!(state.queue[0].settings.tracks[0].offset, -16.0);
-    assert_eq!(&*state.queue[0].settings.tracks[2].name, "Discord");
-    assert_eq!(state.queue[0].settings.tracks[2].offset, -6.0);
+    let settings = &state.queue[0].settings;
+    assert!(!settings.single_track);
+    assert_eq!(settings.tracks.len(), 3);
+    // The preset lists Mic/Discord/Game, sorted into input-stream order.
+    assert_eq!(&*settings.tracks[0].name, "Game");
+    assert_eq!(settings.tracks[0].offset, -16.0);
+    assert_eq!(&*settings.tracks[2].name, "Discord");
+    assert_eq!(settings.tracks[2].offset, -6.0);
+  }
 
-    // Test output_path uniqueness/incrementing logic (assuming files don't exist on disk)
-    assert_eq!(&*state.queue[0].output_path, "file1.mp4");
-    assert_eq!(&*state.queue[1].output_path, "file2.mp4");
-    assert_eq!(&*state.queue[2].output_path, "file3.mp4");
+  #[test]
+  fn each_input_gets_its_own_mp4_output() {
+    let mut state = AppState::new();
+    add_three(&mut state);
+    assert_eq!(outputs(&state), ["file1.mp4", "file2.mp4", "file3.mp4"]);
+  }
 
-    // Test move_up
+  #[test]
+  fn pending_items_reorder_and_ignore_out_of_range_moves() {
+    let mut state = AppState::new();
+    add_three(&mut state);
+
     let second_id = state.queue[1].id;
     state.move_item(second_id, -1);
-    assert_eq!(&*state.queue[0].input_path, "file2.mkv");
-    assert_eq!(&*state.queue[1].input_path, "file1.mkv");
+    assert_eq!(inputs(&state), ["file2.mkv", "file1.mkv", "file3.mkv"]);
 
-    // Test move_down
-    state.move_item(2, 1);
-    assert_eq!(&*state.queue[0].input_path, "file1.mkv");
-    assert_eq!(&*state.queue[1].input_path, "file2.mkv");
+    state.move_item(second_id, 1);
+    assert_eq!(inputs(&state), ["file1.mkv", "file2.mkv", "file3.mkv"]);
 
-    // Test remove_item
-    state.remove_item(1); // removes file1
-    assert_eq!(state.queue.len(), 2);
-    assert_eq!(&*state.queue[0].input_path, "file2.mkv");
+    state.move_item(second_id, 5);
+    assert_eq!(inputs(&state), ["file1.mkv", "file2.mkv", "file3.mkv"]);
 
-    // Test clear_completed
-    state.queue[0].status = QueueItemStatus::Completed {
-      output_path: Arc::from("file2.mp4"),
-    };
+    state.remove_item(state.queue[0].id);
+    assert_eq!(inputs(&state), ["file2.mkv", "file3.mkv"]);
+  }
+
+  #[test]
+  fn clear_completed_drops_only_finished_items() {
+    let mut state = AppState::new();
+    add_three(&mut state);
+
+    state.item_mut(state.queue[0].id).unwrap().status =
+      QueueItemStatus::Completed;
     state.clear_completed();
-    assert_eq!(state.queue.len(), 1);
-    assert_eq!(&*state.queue[0].input_path, "file3.mkv");
+
+    assert_eq!(inputs(&state), ["file2.mkv", "file3.mkv"]);
   }
 }

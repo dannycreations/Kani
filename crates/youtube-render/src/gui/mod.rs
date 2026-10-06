@@ -158,11 +158,7 @@ impl RenderApp {
     self.remove_inputs(id);
     let settings = {
       let state = self.state.lock().unwrap();
-      state
-        .queue
-        .iter()
-        .find(|item| item.id == id)
-        .map(|item| item.settings.clone())
+      state.item(id).map(|item| item.settings.clone())
     };
     if let Some(settings) = settings {
       self.ensure_input_states(id, &settings, window, cx);
@@ -198,9 +194,7 @@ impl RenderApp {
             if let Ok(val) = val_str.parse::<f32>() {
               let clamped_val = val.clamp(-30.0, 0.0);
               let mut state = this.state.lock().unwrap();
-              if let Some(item) =
-                state.queue.iter_mut().find(|item| item.id == id)
-              {
+              if let Some(item) = state.item_mut(id) {
                 if let Some(tc) = item.settings.tracks.get_mut(track_idx) {
                   tc.offset = clamped_val;
                 }
@@ -212,8 +206,7 @@ impl RenderApp {
             let mut current_offset = offset;
             {
               let state = this.state.lock().unwrap();
-              if let Some(item) = state.queue.iter().find(|item| item.id == id)
-              {
+              if let Some(item) = state.item(id) {
                 if let Some(tc) = item.settings.tracks.get(track_idx) {
                   current_offset = tc.offset;
                 }

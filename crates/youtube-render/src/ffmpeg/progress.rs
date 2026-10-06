@@ -36,7 +36,7 @@ pub enum JobProgress {
     speed: Option<Arc<str>>,
     time_str: Option<Arc<str>>,
   },
-  Completed(Arc<str>),
+  Completed,
   Failed(Arc<str>),
 }
 
@@ -129,10 +129,6 @@ pub struct ProgressInfo {
 }
 
 impl ProgressInfo {
-  pub fn new() -> Self {
-    Self::default()
-  }
-
   pub fn parse_line(&mut self, line: &str) -> bool {
     let line = line.trim();
     if let Some(val) = line.strip_prefix("out_time_us=") {

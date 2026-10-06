@@ -1,5 +1,6 @@
 use std::{
   borrow::Cow,
+  fmt::Write as _,
   io::{BufRead, BufReader},
   path::Path,
   process::{Child, Command, Stdio},
@@ -21,6 +22,13 @@ use crate::ffmpeg::{
 };
 
 const MIX_STEP_NUM: usize = 1;
+
+struct Step<'a> {
+  kind: StepType,
+  number: usize,
+  total: usize,
+  progress: &'a Sender<JobProgress>,
+}
 
 type SharedChild = Arc<Mutex<Option<Child>>>;
 
@@ -82,7 +90,10 @@ impl RenderProcess {
   }
 
   pub fn cancel(&self) {
-    kill_child(&mut self.child_handle.lock().unwrap());
+    // `Drop` calls this, so a poisoned lock must not panic a second time.
+    if let Ok(mut slot) = self.child_handle.lock() {
+      kill_child(&mut slot);
+    }
   }
 
   fn run_command(
@@ -145,7 +156,7 @@ impl RenderProcess {
 
       thread::spawn(move || {
         let reader = BufReader::new(stdout_pipe);
-        let mut progress_info = ProgressInfo::new();
+        let mut progress_info = ProgressInfo::default();
 
         for line in reader.lines() {
           let Ok(line) = line else {
@@ -231,31 +242,27 @@ impl RenderProcess {
     Ok(())
   }
 
-  #[allow(clippy::too_many_arguments)]
   fn run_step(
     &self,
     ffmpeg_path: &str,
     args: &[String],
-    step: StepType,
-    step_num: usize,
-    total_steps: usize,
-    tx: &Sender<JobProgress>,
+    step: &Step,
     on_line: &mut dyn FnMut(&str),
   ) -> Result<()> {
-    let _ = tx.send(JobProgress::Starting(step.clone()));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
+    let _ = step.progress.send(JobProgress::Starting(step.kind.clone()));
+    let _ = step.progress.send(JobProgress::Log(Arc::from(format!(
       "Starting Step [{}/{}]: {}...",
-      step_num,
-      total_steps,
-      step.name()
+      step.number,
+      step.total,
+      step.kind.name()
     ))));
 
     self
-      .run_command(ffmpeg_path, args, step, tx, on_line)
+      .run_command(ffmpeg_path, args, step.kind.clone(), step.progress, on_line)
       .inspect_err(|e| {
-        let _ = tx.send(JobProgress::Failed(Arc::from(format!(
+        let _ = step.progress.send(JobProgress::Failed(Arc::from(format!(
           "Step {} Failed: {}",
-          step_num, e
+          step.number, e
         ))));
       })
   }
@@ -264,8 +271,7 @@ impl RenderProcess {
     &self,
     input_file: &str,
     settings: &RenderSettings,
-    total_steps: usize,
-    tx: &Sender<JobProgress>,
+    step: &Step,
   ) -> Result<Vec<f32>> {
     let audio_tracks = &settings.audio.tracks;
     let track_count = audio_tracks.len();
@@ -293,26 +299,18 @@ impl RenderProcess {
     mix_args.push("-".to_string());
 
     let mut track_stats = vec![TrackStats::default(); track_count];
-    self.run_step(
-      &settings.ffmpeg_path,
-      &mix_args,
-      StepType::MixComputation,
-      MIX_STEP_NUM,
-      total_steps,
-      tx,
-      &mut |line| {
-        let Some(info) = FfmpegParser::parse_volume_detect(line) else {
-          return;
-        };
-        let Some(stats) = track_stats.get_mut(info.track_index) else {
-          return;
-        };
-        match info.volume_type {
-          VolumeType::Mean => stats.mean = Some(info.volume_db),
-          VolumeType::Max => stats.peak = Some(info.volume_db),
-        }
-      },
-    )?;
+    self.run_step(&settings.ffmpeg_path, &mix_args, step, &mut |line| {
+      let Some(info) = FfmpegParser::parse_volume_detect(line) else {
+        return;
+      };
+      let Some(stats) = track_stats.get_mut(info.track_index) else {
+        return;
+      };
+      match info.volume_type {
+        VolumeType::Mean => stats.mean = Some(info.volume_db),
+        VolumeType::Max => stats.peak = Some(info.volume_db),
+      }
+    })?;
 
     // Print parsed values
     let show_db = |value: Option<f32>| {
@@ -320,7 +318,7 @@ impl RenderProcess {
     };
     for (i, stats) in track_stats.iter().enumerate() {
       let name = &audio_tracks[i].name;
-      let _ = tx.send(JobProgress::Log(Arc::from(format!(
+      let _ = step.progress.send(JobProgress::Log(Arc::from(format!(
         "  {}  mean: {}   peak: {}",
         name,
         show_db(stats.mean),
@@ -331,13 +329,14 @@ impl RenderProcess {
     if let Some(computed) =
       AudioRenderer::compute_mix_volumes(&settings.audio, &track_stats)
     {
-      let _ =
-        tx.send(JobProgress::Log(Arc::from("Computed volume adjustments:")));
+      let _ = step
+        .progress
+        .send(JobProgress::Log(Arc::from("Computed volume adjustments:")));
       for ((vol, stats), track) in
         computed.iter().zip(&track_stats).zip(audio_tracks)
       {
         let Some(mean) = stats.mean else { continue };
-        let _ = tx.send(JobProgress::Log(Arc::from(format!(
+        let _ = step.progress.send(JobProgress::Log(Arc::from(format!(
           "  {:<9} {:.1}dB  →  {:.1} dBFS mean",
           &*track.name,
           vol,
@@ -346,7 +345,7 @@ impl RenderProcess {
       }
       Ok(computed)
     } else {
-      let _ = tx.send(JobProgress::Log(Arc::from(
+      let _ = step.progress.send(JobProgress::Log(Arc::from(
         "Warning: track levels unreadable; falling back to 0dB adjustments",
       )));
       Ok(vec![0.0; track_count])
@@ -358,9 +357,7 @@ impl RenderProcess {
     input_file: &str,
     settings: &RenderSettings,
     volumes: Option<&[f32]>,
-    step_num: usize,
-    total_steps: usize,
-    tx: &Sender<JobProgress>,
+    step: &Step,
   ) -> Result<LoudnormResult> {
     let mut analysis_args = vec!["-i".to_string(), input_file.to_string()];
     AudioRenderer::append_filter_args(
@@ -382,10 +379,7 @@ impl RenderProcess {
     self.run_step(
       &settings.ffmpeg_path,
       &analysis_args,
-      StepType::AudioAnalysis,
-      step_num,
-      total_steps,
-      tx,
+      step,
       &mut |line| {
         let slots = [
           ("\"input_i\"", &mut input_i),
@@ -402,12 +396,14 @@ impl RenderProcess {
       },
     )?;
 
+    const UNREADABLE: &str =
+      "Failed to parse loudnorm JSON output from ffmpeg.";
     let require = |value: Option<f32>| -> Result<f32> {
       value.ok_or_else(|| {
-        let _ = tx.send(JobProgress::Failed(Arc::from(
-          "Failed to parse loudnorm JSON output from ffmpeg.",
-        )));
-        anyhow!("Failed to parse loudnorm JSON output from ffmpeg.")
+        let _ = step
+          .progress
+          .send(JobProgress::Failed(Arc::from(UNREADABLE)));
+        anyhow!(UNREADABLE)
       })
     };
 
@@ -419,31 +415,23 @@ impl RenderProcess {
       target_offset: require(target_offset)?,
     };
 
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "  Integrated Loudness (I) : {} LUFS",
-      res.input_i
-    ))));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "  Loudness Range  (LRA)   : {} LU",
-      res.input_lra
-    ))));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "  True Peak       (TP)    : {} dB",
-      res.input_tp
-    ))));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "  Threshold               : {}",
-      res.input_thresh
-    ))));
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
-      "  Offset                  : {}",
-      res.target_offset
-    ))));
+    for (label, value, unit) in [
+      ("Integrated Loudness (I)", res.input_i, "LUFS"),
+      ("Loudness Range  (LRA)", res.input_lra, "LU"),
+      ("True Peak       (TP)", res.input_tp, "dB"),
+      ("Threshold", res.input_thresh, ""),
+      ("Offset", res.target_offset, ""),
+    ] {
+      let mut entry = format!("  {label:<24}: {value}");
+      if !unit.is_empty() {
+        let _ = write!(entry, " {unit}");
+      }
+      let _ = step.progress.send(JobProgress::Log(Arc::from(entry)));
+    }
 
     Ok(res)
   }
 
-  #[allow(clippy::too_many_arguments)]
   fn run_video_encoding(
     &self,
     input_file: &str,
@@ -451,9 +439,7 @@ impl RenderProcess {
     settings: &RenderSettings,
     res: &LoudnormResult,
     volumes: Option<&[f32]>,
-    step_num: usize,
-    total_steps: usize,
-    tx: &Sender<JobProgress>,
+    step: &Step,
   ) -> Result<()> {
     let mut encode_args =
       vec!["-y".to_string(), "-i".to_string(), input_file.to_string()];
@@ -471,21 +457,13 @@ impl RenderProcess {
       .extend(DEFAULT_CUSTOM_VFLAGS.iter().map(|flag| flag.to_string()));
     encode_args.push(output_file.to_string());
 
-    self.run_step(
-      &settings.ffmpeg_path,
-      &encode_args,
-      StepType::VideoEncoding,
-      step_num,
-      total_steps,
-      tx,
-      &mut |_| {},
-    )?;
+    self.run_step(&settings.ffmpeg_path, &encode_args, step, &mut |_| {})?;
 
-    let _ = tx.send(JobProgress::Log(Arc::from(format!(
+    let _ = step.progress.send(JobProgress::Log(Arc::from(format!(
       "Output at {}",
       output_file
     ))));
-    let _ = tx.send(JobProgress::Completed(Arc::from(output_file)));
+    let _ = step.progress.send(JobProgress::Completed);
 
     Ok(())
   }
@@ -507,21 +485,38 @@ impl RenderProcess {
 
     let single_track = settings.audio.single_track;
     let total_steps = if single_track { 2 } else { 3 };
-    let analysis_step_num = if single_track { MIX_STEP_NUM } else { 2 };
+    let analysis_number = if single_track { MIX_STEP_NUM } else { 2 };
+
+    let mix_step = Step {
+      kind: StepType::MixComputation,
+      number: MIX_STEP_NUM,
+      total: total_steps,
+      progress: &tx,
+    };
+    let analysis_step = Step {
+      kind: StepType::AudioAnalysis,
+      number: analysis_number,
+      total: total_steps,
+      progress: &tx,
+    };
+    let encode_step = Step {
+      kind: StepType::VideoEncoding,
+      number: analysis_number + 1,
+      total: total_steps,
+      progress: &tx,
+    };
 
     let volumes = if single_track {
       None
     } else {
-      Some(self.run_mix_computation(input_file, settings, total_steps, &tx)?)
+      Some(self.run_mix_computation(input_file, settings, &mix_step)?)
     };
 
     let loudnorm_res = self.run_audio_analysis(
       input_file,
       settings,
       volumes.as_deref(),
-      analysis_step_num,
-      total_steps,
-      &tx,
+      &analysis_step,
     )?;
 
     self.run_video_encoding(
@@ -530,9 +525,7 @@ impl RenderProcess {
       settings,
       &loudnorm_res,
       volumes.as_deref(),
-      analysis_step_num + 1,
-      total_steps,
-      &tx,
+      &encode_step,
     )?;
 
     Ok(())
