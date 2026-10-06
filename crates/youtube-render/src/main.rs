@@ -11,7 +11,7 @@ use std::{
 use ffmpeg::kill_all_children;
 use gpui_kit::{
   application,
-  component::{init as init_gpui_component, Root},
+  component::{init as init_gpui_component, Root, Theme, ThemeMode},
   px, size, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use gui::{confirm_quit, RenderApp};
@@ -35,6 +35,7 @@ fn main() {
   let app = application().with_assets(EmbedAssets);
   app.run(move |cx| {
     init_gpui_component(cx);
+    Theme::change(ThemeMode::Dark, None, cx);
 
     let window_size = size(px(1280.0), px(720.0));
     let bounds = Bounds::centered(None, window_size, cx);
