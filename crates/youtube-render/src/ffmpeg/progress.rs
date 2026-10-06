@@ -1,5 +1,9 @@
 use std::sync::Arc;
 
+#[cfg(test)]
+#[path = "progress_test.rs"]
+mod progress_test;
+
 #[derive(Debug, Clone)]
 pub struct LoudnormResult {
   pub input_i: f32,

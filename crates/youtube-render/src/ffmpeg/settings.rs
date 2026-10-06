@@ -4,6 +4,10 @@ use anyhow::{anyhow, Result};
 
 use crate::ffmpeg::{ini::IniDocument, preset::Preset};
 
+#[cfg(test)]
+#[path = "settings_test.rs"]
+mod settings_test;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrackConfig {
   pub name: Arc<str>,

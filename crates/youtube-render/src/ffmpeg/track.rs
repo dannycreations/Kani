@@ -1,5 +1,9 @@
 use crate::ffmpeg::{settings::TrackConfig, AudioSettings};
 
+#[cfg(test)]
+#[path = "track_test.rs"]
+mod track_test;
+
 const MIN_GAIN_DB: f32 = -100.0;
 const MAX_GAIN_DB: f32 = 30.0;
 const SILENCE_FLOOR_DB: f32 = -45.0;

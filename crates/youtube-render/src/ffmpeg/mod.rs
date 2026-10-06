@@ -100,6 +100,3 @@ pub const DEFAULT_CUSTOM_VFLAGS: &[&str] = &[
   "-r",
   "60",
 ];
-
-#[cfg(test)]
-mod tests;

@@ -21,6 +21,10 @@ use crate::ffmpeg::{
   DEFAULT_CUSTOM_VFLAGS, DEFAULT_LOUDNORM_CONFIG,
 };
 
+#[cfg(test)]
+#[path = "process_test.rs"]
+mod process_test;
+
 const MIX_STEP_NUM: usize = 1;
 
 struct Step<'a> {

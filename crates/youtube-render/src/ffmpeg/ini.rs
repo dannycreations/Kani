@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+#[path = "ini_test.rs"]
+mod ini_test;
+
 #[derive(Debug, Default)]
 pub struct IniDocument {
   pub sections: BTreeMap<String, BTreeMap<String, String>>,
