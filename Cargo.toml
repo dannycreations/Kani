@@ -4,6 +4,7 @@ members = [
     "crates/borderless-fullscreen",
     "crates/excel-unprotect",
     "crates/image-transformer",
+    "crates/proxy-scorer",
     "crates/volume-level-lock",
     "crates/youtube-render",
 ]
