@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 ctrlc.workspace = true
 rustc-hash = "2.1.3"
-tray-icon = { version = "0.25.1", default-features = false }
+tray-icon = { version = "0.26.1", default-features = false }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

@@ -9,7 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 ctrlc.workspace = true
-tray-icon = { version = "0.25.1", default-features = false }
+tray-icon = { version = "0.26.1", default-features = false }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",

@@ -146,7 +146,7 @@ pub fn remove_protection_and_save<R: Read + Seek>(
 
   for i in 0..archive.len() {
     let mut file = archive.by_index(i)?;
-    let name = file.name().to_string();
+    let name = file.name()?.to_string();
 
     if is_vba_file(&name) {
       if disable_macros {

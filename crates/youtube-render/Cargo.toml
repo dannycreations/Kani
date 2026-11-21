@@ -8,5 +8,5 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 ctrlc.workspace = true
-gpui-kit = "0.6.6"
-rfd = "0.17.2"
+gpui-kit = "0.10.0"
+rfd = "0.18.0"
