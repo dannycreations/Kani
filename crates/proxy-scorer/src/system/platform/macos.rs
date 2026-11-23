@@ -6,7 +6,7 @@ use crate::system::{config::ProxyConfig, Endpoint};
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 
-fn run(args: &[&str]) -> Result<()> {
+fn networksetup(args: &[&str]) -> Result<String> {
   let output = Command::new(NETWORKSETUP)
     .args(args)
     .output()
@@ -18,26 +18,11 @@ fn run(args: &[&str]) -> Result<()> {
       String::from_utf8_lossy(&output.stderr).trim()
     );
   }
-  Ok(())
-}
-
-fn output(args: &[&str]) -> Result<String> {
-  let result = Command::new(NETWORKSETUP)
-    .args(args)
-    .output()
-    .with_context(|| format!("failed to run {NETWORKSETUP}"))?;
-  if !result.status.success() {
-    bail!(
-      "networksetup {} failed: {}",
-      args.join(" "),
-      String::from_utf8_lossy(&result.stderr).trim()
-    );
-  }
-  Ok(String::from_utf8_lossy(&result.stdout).into_owned())
+  Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn network_services() -> Result<Vec<String>> {
-  let text = output(&["-listallnetworkservices"])?;
+  let text = networksetup(&["-listallnetworkservices"])?;
   Ok(
     text
       .lines()
@@ -57,6 +42,31 @@ fn field(text: &str, name: &str) -> Option<String> {
     .map(str::to_owned)
 }
 
+fn set_proxy(
+  service: &str,
+  set_flag: &str,
+  state_flag: &str,
+  endpoint: &Endpoint,
+) -> Result<()> {
+  let port = endpoint.port.to_string();
+  networksetup(&[set_flag, service, &endpoint.host, &port])?;
+  networksetup(&[state_flag, service, "on"])?;
+  Ok(())
+}
+
+fn read_proxy(service: &str, get_flag: &str) -> Result<Option<Endpoint>> {
+  let text = networksetup(&[get_flag, service])?;
+  if field(&text, "Enabled:").as_deref() != Some("Yes") {
+    return Ok(None);
+  }
+  let (Some(host), Some(port)) =
+    (field(&text, "Server:"), field(&text, "Port:"))
+  else {
+    return Ok(None);
+  };
+  Ok(Some(Endpoint::new(host, port.parse()?)?))
+}
+
 pub fn apply(config: &ProxyConfig) -> Result<()> {
   if config.is_empty() {
     bail!("no proxy endpoints provided");
@@ -64,19 +74,23 @@ pub fn apply(config: &ProxyConfig) -> Result<()> {
 
   for service in network_services()? {
     if let Some(endpoint) = &config.http {
-      let port = endpoint.port.to_string();
-      run(&["-setwebproxy", &service, &endpoint.host, &port])?;
-      run(&["-setwebproxystate", &service, "on"])?;
+      set_proxy(&service, "-setwebproxy", "-setwebproxystate", endpoint)?;
     }
     if let Some(endpoint) = &config.https {
-      let port = endpoint.port.to_string();
-      run(&["-setsecurewebproxy", &service, &endpoint.host, &port])?;
-      run(&["-setsecurewebproxystate", &service, "on"])?;
+      set_proxy(
+        &service,
+        "-setsecurewebproxy",
+        "-setsecurewebproxystate",
+        endpoint,
+      )?;
     }
     if let Some(endpoint) = &config.socks {
-      let port = endpoint.port.to_string();
-      run(&["-setsocksfirewallproxy", &service, &endpoint.host, &port])?;
-      run(&["-setsocksfirewallproxystate", &service, "on"])?;
+      set_proxy(
+        &service,
+        "-setsocksfirewallproxy",
+        "-setsocksfirewallproxystate",
+        endpoint,
+      )?;
     }
   }
   Ok(())
@@ -84,9 +98,9 @@ pub fn apply(config: &ProxyConfig) -> Result<()> {
 
 pub fn clear() -> Result<()> {
   for service in network_services()? {
-    let _ = run(&["-setwebproxystate", &service, "off"]);
-    let _ = run(&["-setsecurewebproxystate", &service, "off"]);
-    let _ = run(&["-setsocksfirewallproxystate", &service, "off"]);
+    let _ = networksetup(&["-setwebproxystate", &service, "off"]);
+    let _ = networksetup(&["-setsecurewebproxystate", &service, "off"]);
+    let _ = networksetup(&["-setsocksfirewallproxystate", &service, "off"]);
   }
   Ok(())
 }
@@ -97,34 +111,9 @@ pub fn show() -> Result<ProxyConfig> {
     .first()
     .ok_or_else(|| anyhow!("no enabled network service found"))?;
 
-  let mut config = ProxyConfig::default();
-
-  let web = output(&["-getwebproxy", service])?;
-  if field(&web, "Enabled:").as_deref() == Some("Yes") {
-    if let (Some(host), Some(port)) =
-      (field(&web, "Server:"), field(&web, "Port:"))
-    {
-      config.http = Some(Endpoint::new(host, port.parse()?)?);
-    }
-  }
-
-  let secure = output(&["-getsecurewebproxy", service])?;
-  if field(&secure, "Enabled:").as_deref() == Some("Yes") {
-    if let (Some(host), Some(port)) =
-      (field(&secure, "Server:"), field(&secure, "Port:"))
-    {
-      config.https = Some(Endpoint::new(host, port.parse()?)?);
-    }
-  }
-
-  let socks = output(&["-getsocksfirewallproxy", service])?;
-  if field(&socks, "Enabled:").as_deref() == Some("Yes") {
-    if let (Some(host), Some(port)) =
-      (field(&socks, "Server:"), field(&socks, "Port:"))
-    {
-      config.socks = Some(Endpoint::new(host, port.parse()?)?);
-    }
-  }
-
-  Ok(config)
+  Ok(ProxyConfig {
+    http: read_proxy(service, "-getwebproxy")?,
+    https: read_proxy(service, "-getsecurewebproxy")?,
+    socks: read_proxy(service, "-getsocksfirewallproxy")?,
+  })
 }

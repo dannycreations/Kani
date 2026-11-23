@@ -8,17 +8,24 @@ const ENV_FILE: &str = "90-kani-proxy.conf";
 
 fn env_file() -> Result<PathBuf> {
   let home = env::var("HOME").context("HOME is not set")?;
-  let directory = PathBuf::from(home).join(".config").join("environment.d");
-  fs::create_dir_all(&directory).context("failed to create environment.d")?;
-  Ok(directory.join(ENV_FILE))
+  Ok(
+    PathBuf::from(home)
+      .join(".config")
+      .join("environment.d")
+      .join(ENV_FILE),
+  )
 }
 
-fn gsettings(schema: &str, key: &str, value: &str) -> Result<()> {
-  Command::new("gsettings")
+fn gsettings(schema: &str, key: &str, value: &str) {
+  let _ = Command::new("gsettings")
     .args(["set", schema, key, value])
-    .status()
-    .with_context(|| format!("failed to set {schema} {key}"))?;
-  Ok(())
+    .status();
+}
+
+fn set_gnome_proxy(protocol: &str, endpoint: &Endpoint) {
+  let schema = format!("org.gnome.system.proxy.{protocol}");
+  gsettings(&schema, "host", &endpoint.host);
+  gsettings(&schema, "port", &endpoint.port.to_string());
 }
 
 pub fn apply(config: &ProxyConfig) -> Result<()> {
@@ -27,47 +34,37 @@ pub fn apply(config: &ProxyConfig) -> Result<()> {
   }
 
   if let Some(endpoint) = &config.http {
-    let _ = gsettings("org.gnome.system.proxy.http", "host", &endpoint.host);
-    let _ = gsettings(
-      "org.gnome.system.proxy.http",
-      "port",
-      &endpoint.port.to_string(),
-    );
+    set_gnome_proxy("http", endpoint);
   }
   if let Some(endpoint) = &config.https {
-    let _ = gsettings("org.gnome.system.proxy.https", "host", &endpoint.host);
-    let _ = gsettings(
-      "org.gnome.system.proxy.https",
-      "port",
-      &endpoint.port.to_string(),
-    );
+    set_gnome_proxy("https", endpoint);
   }
   if let Some(endpoint) = &config.socks {
-    let _ = gsettings("org.gnome.system.proxy.socks", "host", &endpoint.host);
-    let _ = gsettings(
-      "org.gnome.system.proxy.socks",
-      "port",
-      &endpoint.port.to_string(),
-    );
+    set_gnome_proxy("socks", endpoint);
   }
-  let _ = gsettings("org.gnome.system.proxy", "mode", "manual");
+  gsettings("org.gnome.system.proxy", "mode", "manual");
+
+  let path = env_file()?;
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).context("failed to create environment.d")?;
+  }
 
   let mut content = String::new();
   for (key, value) in config.to_env_vars() {
     content.push_str(&format!("{key}={value}\n"));
   }
-  fs::write(env_file()?, content)
-    .context("failed to write proxy environment file")?;
+  fs::write(path, content).context("failed to write proxy environment file")?;
   Ok(())
 }
 
 pub fn clear() -> Result<()> {
-  let _ = gsettings("org.gnome.system.proxy", "mode", "none");
+  gsettings("org.gnome.system.proxy", "mode", "none");
   let path = env_file()?;
-  if path.exists() {
-    fs::remove_file(path).context("failed to remove proxy environment file")?;
+  match fs::remove_file(path) {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error).context("failed to remove proxy environment file"),
   }
-  Ok(())
 }
 
 pub fn show() -> Result<ProxyConfig> {

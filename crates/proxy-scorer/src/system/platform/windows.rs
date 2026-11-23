@@ -146,7 +146,7 @@ pub fn apply(config: &ProxyConfig) -> Result<()> {
   }
 
   let proxy_string = config.to_proxy_string();
-  with_settings_key(KEY_READ | KEY_WRITE, |key| {
+  with_settings_key(KEY_WRITE, |key| {
     set_string(key, VALUE_PROXY_SERVER, &proxy_string)?;
     set_string(key, VALUE_PROXY_OVERRIDE, "<local>")?;
     set_dword(key, VALUE_PROXY_ENABLE, 1)
@@ -157,9 +157,7 @@ pub fn apply(config: &ProxyConfig) -> Result<()> {
 }
 
 pub fn clear() -> Result<()> {
-  with_settings_key(KEY_READ | KEY_WRITE, |key| {
-    set_dword(key, VALUE_PROXY_ENABLE, 0)
-  })?;
+  with_settings_key(KEY_WRITE, |key| set_dword(key, VALUE_PROXY_ENABLE, 0))?;
 
   refresh();
   Ok(())

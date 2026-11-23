@@ -22,11 +22,14 @@ pub fn fetch(url: &str, timeout: Duration) -> Result<Vec<Proxy>> {
 
 pub fn parse_list(text: &str) -> Vec<Proxy> {
   let mut seen = HashSet::new();
-  text
-    .lines()
-    .filter_map(Proxy::parse)
-    .filter(|proxy| seen.insert(proxy.url()))
-    .collect()
+  let mut proxies = Vec::new();
+  for proxy in text.lines().filter_map(Proxy::parse) {
+    if !seen.contains(&proxy) {
+      seen.insert(proxy.clone());
+      proxies.push(proxy);
+    }
+  }
+  proxies
 }
 
 #[cfg(test)]

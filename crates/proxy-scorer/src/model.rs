@@ -13,9 +13,6 @@ pub enum Scheme {
 }
 
 impl Scheme {
-  pub const ALL: [Scheme; 4] =
-    [Scheme::Http, Scheme::Https, Scheme::Socks4, Scheme::Socks5];
-
   pub fn as_str(self) -> &'static str {
     match self {
       Scheme::Http => "http",
@@ -50,7 +47,7 @@ impl fmt::Display for Scheme {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 pub struct Proxy {
   pub scheme: Scheme,
   pub host: String,
@@ -83,27 +80,25 @@ impl Proxy {
   }
 
   pub fn url(&self) -> String {
-    let host = if self.host.contains(':') && !self.host.starts_with('[') {
-      format!("[{}]", self.host)
-    } else {
-      self.host.clone()
-    };
-    format!("{}://{}:{}", self.scheme, host, self.port)
+    format!("{}://{}", self.scheme, self.endpoint())
   }
 
   pub fn endpoint(&self) -> String {
-    let host = if self.host.contains(':') && !self.host.starts_with('[') {
-      format!("[{}]", self.host)
+    if self.host.contains(':') && !self.host.starts_with('[') {
+      format!("[{}]:{}", self.host, self.port)
     } else {
-      self.host.clone()
-    };
-    format!("{host}:{}", self.port)
+      format!("{}:{}", self.host, self.port)
+    }
   }
 }
 
 impl fmt::Display for Proxy {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "{}", self.url())
+    if self.host.contains(':') && !self.host.starts_with('[') {
+      write!(f, "{}://[{}]:{}", self.scheme, self.host, self.port)
+    } else {
+      write!(f, "{}://{}:{}", self.scheme, self.host, self.port)
+    }
   }
 }
 

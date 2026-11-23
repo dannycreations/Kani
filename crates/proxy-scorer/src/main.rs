@@ -1,10 +1,10 @@
 use std::{fs, path::PathBuf, time::Duration};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use proxy_scorer::{
   fetch,
-  model::{Proxy, Scheme, ScoredProxy},
+  model::{Proxy, Scheme},
   report, scorer,
   scorer::ScoringConfig,
   system::{self, Endpoint, ProxyConfig},
@@ -92,17 +92,18 @@ enum OutputFormat {
 
 fn to_system_config(proxy: &Proxy) -> Result<ProxyConfig> {
   let endpoint = Endpoint::new(proxy.host.clone(), proxy.port)?;
-  Ok(match proxy.scheme {
-    Scheme::Http | Scheme::Https => ProxyConfig {
-      http: Some(endpoint.clone()),
-      https: Some(endpoint),
-      socks: None,
-    },
-    Scheme::Socks4 | Scheme::Socks5 => ProxyConfig {
+  Ok(if proxy.scheme.is_socks() {
+    ProxyConfig {
       http: None,
       https: None,
       socks: Some(endpoint),
-    },
+    }
+  } else {
+    ProxyConfig {
+      http: Some(endpoint.clone()),
+      https: Some(endpoint),
+      socks: None,
+    }
   })
 }
 
@@ -126,9 +127,9 @@ fn main() -> Result<()> {
   }
 
   let direct = ProxyConfig {
-    http: args.set_http.clone(),
-    https: args.set_https.clone(),
-    socks: args.set_socks.clone(),
+    http: args.set_http,
+    https: args.set_https,
+    socks: args.set_socks,
   };
   if !direct.is_empty() {
     system::apply(&direct)?;
@@ -137,7 +138,11 @@ fn main() -> Result<()> {
   }
 
   let mut proxies = match &args.input {
-    Some(path) => fetch::parse_list(&fs::read_to_string(path)?),
+    Some(path) => {
+      let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+      fetch::parse_list(&content)
+    }
     None => fetch::fetch(&args.url, Duration::from_millis(args.fetch_timeout))?,
   };
 
@@ -156,29 +161,28 @@ fn main() -> Result<()> {
     tries: args.tries,
     connect_timeout: Duration::from_millis(args.connect_timeout),
     timeout: Duration::from_millis(args.timeout),
-    test_url: args.test_url.clone(),
+    test_url: args.test_url,
     show_progress: !args.no_progress,
-    ..ScoringConfig::default()
   };
 
   let scored = scorer::score_all(proxies, &config);
-  let visible: Vec<ScoredProxy> = scored
+  let visible_len = scored
     .iter()
-    .filter(|item| item.score.value >= args.min_score)
-    .take(args.top)
-    .cloned()
-    .collect();
+    .take_while(|item| item.score.value >= args.min_score)
+    .count()
+    .min(args.top);
+  let visible = &scored[..visible_len];
 
   match args.format {
     OutputFormat::Table => {
-      report::print_table(&visible);
+      report::print_table(visible);
       if let Some(path) = &args.output {
-        report::write_file(path, &report::to_json(&visible)?)?;
+        report::write_file(path, &report::to_json(visible)?)?;
         println!("Wrote {}", path.display());
       }
     }
     OutputFormat::Json => {
-      let json = report::to_json(&visible)?;
+      let json = report::to_json(visible)?;
       if let Some(path) = &args.output {
         report::write_file(path, &json)?;
       } else {
